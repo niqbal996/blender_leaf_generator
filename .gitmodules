@@ -1,0 +1,3 @@
+[submodule "Uni-MS-PS"]
+	path = Uni-MS-PS
+	url = git@github.com:Clement-Hardy/Uni-MS-PS.git

@@ -6,7 +6,6 @@ from glob import glob
 import numpy as np
 np.float_ = np.float64
 np.complex_ = np.complex128
-from hi3dgen.pipelines import Hi3DGenPipeline
 from torchvision import transforms
 from PIL import Image
 import tempfile
@@ -144,7 +143,42 @@ def get_birefnet_mask(image: Image.Image, model) -> np.ndarray:
 
     return (mask_np > 128).astype(np.uint8)
 
-def align_leaf_orientation(crop_img, crop_mask):
+def apply_leaf_orientation(img, mask):
+    """Rotate and flip img and mask so the leaf is upright and stem is at the bottom."""
+    from skimage.measure import regionprops, label
+    # 1. Align major axis vertically
+    mask_bool = mask > 0
+    lbl = label(mask_bool)
+    props = regionprops(lbl)
+    if not props:
+        return img, mask
+    angle = np.rad2deg(props[0].orientation)
+    rotate_angle = 90 - angle
+    img = np.array(Image.fromarray(img).rotate(rotate_angle, expand=True))
+    mask = np.array(Image.fromarray(mask).rotate(rotate_angle, expand=True))
+
+    # 2. If major axis is vertical but broad side is on left/right, rotate 90°
+    h, w = mask.shape
+    left_sum = np.count_nonzero(mask[:, :w//2])
+    right_sum = np.count_nonzero(mask[:, w//2:])
+    if right_sum > left_sum:
+        img = np.array(Image.fromarray(img).rotate(90, expand=True))
+        mask = np.array(Image.fromarray(mask).rotate(90, expand=True))
+    elif left_sum > right_sum:
+        img = np.array(Image.fromarray(img).rotate(-90, expand=True))
+        mask = np.array(Image.fromarray(mask).rotate(-90, expand=True))
+
+    # 3. Ensure stem is at the bottom (narrowest part at bottom)
+    h, w = mask.shape
+    vertical_profile = mask.sum(axis=1)
+    top_sum = vertical_profile[:h//10].sum()
+    bottom_sum = vertical_profile[-h//10:].sum()
+    if top_sum < bottom_sum:
+        img = np.array(Image.fromarray(img).transpose(Image.FLIP_TOP_BOTTOM))
+        mask = np.array(Image.fromarray(mask).transpose(Image.FLIP_TOP_BOTTOM))
+    return img, mask
+
+def align_leaf_orientation(crop_img, crop_mask, crop_normal):
     # 1. Align major axis vertically
     mask_bool = crop_mask > 0
     lbl = label(mask_bool)
@@ -163,9 +197,11 @@ def align_leaf_orientation(crop_img, crop_mask):
     if right_sum > left_sum:
         crop_img = np.array(Image.fromarray(crop_img).rotate(90, expand=True))
         crop_mask = np.array(Image.fromarray(crop_mask).rotate(90, expand=True))
+        crop_normal = np.array(Image.fromarray(crop_normal).rotate(90, expand=True))
     elif left_sum > right_sum:
         crop_img = np.array(Image.fromarray(crop_img).rotate(-90, expand=True))
         crop_mask = np.array(Image.fromarray(crop_mask).rotate(-90, expand=True))
+        crop_normal = np.array(Image.fromarray(crop_normal).rotate(-90, expand=True))
 
     # 3. Ensure stem is at the bottom (narrowest part at bottom)
     h, w = crop_mask.shape
@@ -176,9 +212,9 @@ def align_leaf_orientation(crop_img, crop_mask):
     if top_sum < bottom_sum:
         crop_img = np.array(Image.fromarray(crop_img).transpose(Image.FLIP_TOP_BOTTOM))
         crop_mask = np.array(Image.fromarray(crop_mask).transpose(Image.FLIP_TOP_BOTTOM))
-
-    return crop_img, crop_mask
-
+        crop_normal = np.array(Image.fromarray(crop_normal).transpose(Image.FLIP_TOP_BOTTOM))
+        
+    return crop_img, crop_mask, crop_normal
 
 def get_long_axis_angle(mask):
     """Returns angle (in degrees) to rotate so the longest axis is vertical."""
@@ -211,7 +247,13 @@ def find_stem_side(mask):
     else:
         return 'none'
 
-def extract_leaves_and_masks(input_image: Image.Image, mask_model, resolution=1024, out_dir='./output'):
+def extract_leaves_and_masks(
+    input_image: Image.Image,
+    mask_model,
+    resolution=1024,
+    out_dir='./output',
+    normal_map_path: str = None
+):
     import skimage.transform
     os.makedirs(out_dir, exist_ok=True)
     mask = get_birefnet_mask(input_image.convert('RGB'), mask_model)
@@ -219,6 +261,12 @@ def extract_leaves_and_masks(input_image: Image.Image, mask_model, resolution=10
     slices = find_objects(labeled)
     input_rgba = input_image.convert('RGBA')
     np_img = np.array(input_rgba)
+
+    # --- Load and resize normal map if provided ---
+    normal_np = None
+    if normal_map_path is not None:
+        normal_img = Image.open(normal_map_path).convert('RGBA')
+        normal_np = np.array(normal_img)
 
     # --- Find the largest leaf's bounding box size ---
     max_h, max_w = 0, 0
@@ -233,7 +281,6 @@ def extract_leaves_and_masks(input_image: Image.Image, mask_model, resolution=10
             max_h = h
         if w > max_w:
             max_w = w
-    # Use the longer dimension for scaling
     max_dim = max(max_h, max_w)
 
     for idx, slc in enumerate(slices):
@@ -244,24 +291,18 @@ def extract_leaves_and_masks(input_image: Image.Image, mask_model, resolution=10
             continue
         crop_img = np_img[slc].copy()
         crop_mask = leaf_mask
+        crop_normal = normal_np[slc].copy() if normal_np is not None else None
 
         # Set alpha channel to mask
         crop_img[..., 3] = crop_mask
 
-        # --- Rotate so stem is at the bottom ---
-        # stem_side = find_stem_side(crop_mask > 0)
-        # if stem_side == 'right':
-        #     crop_img = np.array(Image.fromarray(crop_img).rotate(90, expand=True))
-        #     crop_mask = np.array(Image.fromarray(crop_mask).rotate(90, expand=True))
-        # elif stem_side == 'left':
-        #     crop_img = np.array(Image.fromarray(crop_img).rotate(-90, expand=True))
-        #     crop_mask = np.array(Image.fromarray(crop_mask).rotate(-90, expand=True))
-        
-        crop_img, crop_mask = align_leaf_orientation(crop_img, crop_mask)
+        # --- Rotate so stem is at the bottom (mask drives all transforms) ---
+        # If normal map is present, pass it to align_leaf_orientation, but only mask is used for logic
+        crop_img, crop_mask, crop_normal = align_leaf_orientation(crop_img, crop_mask, crop_normal)
+
         # --- Maintain relative size on fixed-size canvas ---
         leaf_h, leaf_w = crop_mask.shape
-        leaf_dim = max(leaf_h, leaf_w)
-        scale = min(resolution / max_dim, 1.0)  # Largest leaf fits canvas, others smaller
+        scale = min(resolution / max_dim, 1.0)
         new_size = (int(leaf_w * scale), int(leaf_h * scale))
         leaf_img = Image.fromarray(crop_img).resize(new_size, Image.Resampling.LANCZOS)
         leaf_mask_img = Image.fromarray(crop_mask).resize(new_size, Image.Resampling.NEAREST)
@@ -272,9 +313,17 @@ def extract_leaves_and_masks(input_image: Image.Image, mask_model, resolution=10
         offset = ((resolution - new_size[0]) // 2, (resolution - new_size[1]) // 2)
         canvas.paste(leaf_img, offset, leaf_mask_img)
         mask_canvas.paste(leaf_mask_img, offset)
-        # Save
+        # Save RGB and mask
         canvas.save(os.path.join(out_dir, f'leaf_{idx+1}.png'))
         mask_canvas.save(os.path.join(out_dir, f'leaf_{idx+1}_mask.png'))
+
+        # --- Save normal map for this leaf if available ---
+        if crop_normal is not None:
+            # Apply the same transformation as mask (already done above)
+            crop_normal_img = Image.fromarray(crop_normal).resize(new_size, Image.Resampling.LANCZOS)
+            normal_canvas = Image.new('RGB', (resolution, resolution), (0, 0, 0))
+            normal_canvas.paste(crop_normal_img, offset)
+            normal_canvas.save(os.path.join(out_dir, f'leaf_{idx+1}_normal.png'))
 
     # --- Save the complete image with background removed ---
     full_mask = (mask * 255).astype(np.uint8)
@@ -283,48 +332,39 @@ def extract_leaves_and_masks(input_image: Image.Image, mask_model, resolution=10
     full_img = Image.fromarray(full_rgba, mode='RGBA')
     full_img.save(os.path.join(out_dir, 'all_leaves_no_bg.png'))
 
-def extract_and_save_leaves_from_pool(image_pool: List[Image.Image], mask_model, resolution=1024, out_dir='./output'):
-    """
-    For each leaf in the first image, apply its mask to all images in the pool (pixel-aligned),
-    crop, and save the results.
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    base_image = image_pool[0]
-    mask = get_birefnet_mask(base_image.convert('RGB'), mask_model)
-    labeled, num_features = label(mask)
-    slices = find_objects(labeled)
+    # --- Save the binary mask of the entire image ---
+    mask_img = Image.fromarray(full_mask, mode='L')
+    mask_img.save(os.path.join(out_dir, 'all_leaves_mask.png'))
 
-    # Convert all images to RGBA and numpy arrays
-    np_imgs = [np.array(img.convert('RGBA')) for img in image_pool]
-
-    for idx, slc in enumerate(slices):
-        if slc is None:
-            continue
-        leaf_mask = (labeled[slc] == (idx + 1)).astype(np.uint8) * 255
-        if leaf_mask.sum() < 100:
-            continue
-        for img_idx, np_img in enumerate(np_imgs):
-            crop_img = np_img[slc].copy()
-            # Mask out everything except the current leaf
-            mask_bool = (leaf_mask > 0)
-            # Set background to black in RGB channels
-            for c in range(3):
-                crop_img[..., c][~mask_bool] = 0
-            # Optionally, set alpha to 255 (opaque) for leaf, 0 for background if you want RGBA
-            # crop_img[..., 3] = leaf_mask
-            # Save as RGB
-            leaf_img_rgb = Image.fromarray(crop_img[..., :3], mode='RGB')
-            leaf_img_rgb.save(os.path.join(out_dir, f'leaf_{idx+1}_img_{img_idx+1}.png'))
-        # Save the binary mask for this leaf
-        Image.fromarray(leaf_mask, mode='L').save(os.path.join(out_dir, f'leaf_{idx+1}_mask.png'))
+def resize_and_pad_to_match(img: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
+    """Resize img to fit inside target_size, keeping aspect ratio, and pad with black."""
+    img_ratio = img.width / img.height
+    target_ratio = target_size[0] / target_size[1]
+    if img_ratio > target_ratio:
+        # Fit width
+        new_w = target_size[0]
+        new_h = int(new_w / img_ratio)
+    else:
+        # Fit height
+        new_h = target_size[1]
+        new_w = int(new_h * img_ratio)
+    img_resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    new_img = Image.new('RGB', target_size, (0, 0, 0))
+    offset = ((target_size[0] - new_w) // 2, (target_size[1] - new_h) // 2)
+    new_img.paste(img_resized, offset)
+    return new_img
 
 def leaves():
-    image = Image.open('image_pool/IMG_9728_diffused.JPEG')
+    image = Image.open('/home/niqbal/git/aa_blender/leaf_data/plant_1/blender_assets/IMG_9728_diffused.JPEG')
     image_paths = glob('./image_pool/*.JPEG')  # Adjust the path to your image pool
     image_pool = [Image.open(p) for p in image_paths]
     model = lazy_load_birefnet()
-    extract_leaves_and_masks(image, mask_model=model, resolution=1024, out_dir='./leaves_output')
-    # extract_and_save_leaves_from_pool(image_pool, mask_model=model, resolution=1024, out_dir='./leaves_output')
+    extract_leaves_and_masks(image, 
+                             mask_model=model, 
+                             resolution=1024, 
+                             out_dir='/home/niqbal/git/aa_blender/leaf_data/plant_1/leaf_assets/',
+                             normal_map_path='/home/niqbal/git/aa_blender/leaf_data/plant_1/blender_assets/IMG_9728_normal.png'
+                             )
 
 def main():
     image = Image.open('image_pool/IMG_9728_diffused.JPEG')  # Replace with your input image path

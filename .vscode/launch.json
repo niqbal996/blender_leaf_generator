@@ -6,14 +6,33 @@
     "configurations": [
     
         {
-            "name": "Python Debugger: Current File",
+            "name": "Generate leaf instance masks",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "program": "get_mask.py",
             "console": "integratedTerminal",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/hi3dgen",
             },
+        },
+        {
+            "name": "Generate Normal maps",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "Uni-MS-PS/inference_folder.py",
+            "args": [
+                "--path_obj", "/home/niqbal/git/aa_blender/leaf_data",
+                "--nb_img", "4",
+                "--folder_save", "/home/niqbal/git/aa_blender/leaf_data",
+                "--cuda",
+                "--weights", "Uni-MS-PS/weights",
+                "--res", "1024",
+            ],
+            "env": {
+                "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION":"python",
+                "PYTHONPATH": "${workspaceFolder}/Uni-MS-PS",
+            },
+            "console": "integratedTerminal"
         }
     ]
 }
