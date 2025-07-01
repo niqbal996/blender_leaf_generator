@@ -4,6 +4,7 @@ from mathutils import Vector
 import numpy as np
 from PIL import Image
 import os
+import json 
 from glob import glob
 
 def create_leaf_material(name, diffuse_path, normal_path, mask_path):
@@ -91,7 +92,7 @@ def create_contour_based_mesh(image_path, subdivisions=10, mesh_name="ContourMes
         return None
 
     largest_contour = max(contours, key=cv2.contourArea)
-    epsilon = 0.01 * cv2.arcLength(largest_contour, True)
+    epsilon = 0.002 * cv2.arcLength(largest_contour, True)
     simplified_contour = cv2.approxPolyDP(largest_contour, epsilon, True)
 
     mesh = bpy.data.meshes.new(mesh_name)
@@ -114,20 +115,26 @@ def create_contour_based_mesh(image_path, subdivisions=10, mesh_name="ContourMes
         vert = bm.verts.new((x_world, y_world, z_world))
         contour_verts.append(vert)
 
+    bm.verts.ensure_lookup_table()
+
+    # Create a face from the outer contour
     if len(contour_verts) >= 3:
         try:
-            bm.faces.new(contour_verts)
-        except:
-            pass
-    bm.normal_update()
+            face = bm.faces.new(contour_verts)
+        except ValueError:
+            print("Face creation failed; likely non-manifold or intersecting edges.")
+
+    # Triangulate to get inner structure
+    bmesh.ops.triangulate(bm, faces=bm.faces[:])
+
+    # Subdivide all edges to add internal vertices
     bmesh.ops.subdivide_edges(
-    bm,
-    edges=[e for e in bm.edges if abs(e.verts[0].co.y - e.verts[1].co.y) > 0.01],
-    cuts=3,  # was 8, reduce or skip entirely
-    use_grid_fill=True
+        bm,
+        edges=bm.edges[:],
+        cuts=3,  # Increase for more resolution
+        use_grid_fill=True
     )
 
-    bm.to_mesh(mesh)
     bm.normal_update()
     bm.to_mesh(mesh)
     bm.free()
@@ -167,6 +174,10 @@ image_dir = r"\\wsl.localhost\Ubuntu-20.04\home\niqbal\git\aa_blender\leaf_data\
 mask_images = sorted(glob(os.path.join(image_dir, 'leaf_*_mask.png')))
 diffuse_images = sorted(glob(os.path.join(image_dir, 'leaf_*_diffuse.png')))
 normal_images = sorted(glob(os.path.join(image_dir, 'leaf_*_normal.png')))
+leaf_scales = os.path.join(image_dir, 'leaf_scales.json')
+# Load leaf physical sizes from JSON once before the loop
+with open(leaf_scales, 'r') as f:
+    leaf_physical_sizes = json.load(f)
 bpy.context.scene.render.engine = 'CYCLES'
 
 collection_name = "LeafMeshes"
@@ -199,13 +210,7 @@ for idx, mask_path in enumerate(mask_images):
     for area in bpy.context.screen.areas:
         if area.type == 'IMAGE_EDITOR':
             area.spaces.active.image = img
-
     if obj:
-        # Subdivide mesh via modifier
-#        subdiv = obj.modifiers.new(name="Subsurf", type='SUBSURF')
-#        subdiv.levels = 2
-#        subdiv.render_levels = 2
-
         # Assign material
         if idx < len(diffuse_images) and idx < len(normal_images):
             material = create_leaf_material(
@@ -224,15 +229,29 @@ for idx, mask_path in enumerate(mask_images):
             bpy.ops.uv.smart_project(angle_limit=66)
             bpy.ops.object.mode_set(mode='OBJECT')
 
-    # Arrange horizontally
     bbox = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
     width = max(v.x for v in bbox) - min(v.x for v in bbox)
     height = max(v.y for v in bbox) - min(v.y for v in bbox)
+    
     if width > height:
         obj.rotation_euler[2] = np.radians(90)
+    bpy.context.view_layer.update()
+
+    # --- SCALE TO REAL WORLD SIZE ---
+    # Convert physical size from cm to meters
+    leaf_data = leaf_physical_sizes.get(f'leaf_{idx+1}', {"height_cm": 10.0, "width_cm": 10.0})
+    target_size_cm = max(leaf_data.get("height_cm", 10.0), leaf_data.get("width_cm", 10.0))
+    target_size_m = target_size_cm / 100.0  # convert cm to meters
+
+    # Get bounding box in world coordinates
+    bbox = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+
+    # Calculate max dimension of the mesh bounding box
+    dims = [max(v[i] for v in bbox) - min(v[i] for v in bbox) for i in range(3)]
+    max_mesh_dim = max(dims)
+
+    # Calculate scale factor and apply
+    scale_factor = target_size_m / max_mesh_dim
+    obj.scale = (scale_factor,) * 3
 
     bpy.context.view_layer.update()
-    bbox = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
-    width = max(v.x for v in bbox) - min(v.x for v in bbox)
-    obj.location.x = x_offset
-    x_offset += width + spacing

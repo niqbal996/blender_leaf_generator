@@ -1,4 +1,5 @@
 import os
+import json
 os.environ['SPCONV_ALGO'] = 'native'
 from typing import *
 import torch
@@ -252,10 +253,12 @@ def extract_leaves_and_masks(
     mask_model,
     resolution=1024,
     out_dir='./output',
-    normal_map_path: str = None
+    normal_map_path: str = None,
+    pixels_per_cm: float = 60.14, # 0.01663 sampling distance cm/pixels i.e. 60.14 pixels per cm
 ):
     import skimage.transform
     os.makedirs(out_dir, exist_ok=True)
+    leaf_physical_sizes = {}
     mask = get_birefnet_mask(input_image.convert('RGB'), mask_model)
     labeled, num_features = label(mask)
     slices = find_objects(labeled)
@@ -302,6 +305,7 @@ def extract_leaves_and_masks(
 
         # --- Maintain relative size on fixed-size canvas ---
         leaf_h, leaf_w = crop_mask.shape
+        max_physical_dim_cm = max(leaf_h, leaf_w) / pixels_per_cm
         scale = min(resolution / max_dim, 1.0)
         new_size = (int(leaf_w * scale), int(leaf_h * scale))
         leaf_img = Image.fromarray(crop_img).resize(new_size, Image.Resampling.LANCZOS)
@@ -314,7 +318,12 @@ def extract_leaves_and_masks(
         canvas.paste(leaf_img, offset, leaf_mask_img)
         mask_canvas.paste(leaf_mask_img, offset)
         # Save RGB and mask
-        canvas.save(os.path.join(out_dir, f'leaf_{idx+1}.png'))
+        # Save scale factor to text
+        leaf_physical_sizes[f'leaf_{idx+1}'] = {
+            "height_cm": leaf_h / pixels_per_cm,
+            "width_cm": leaf_w / pixels_per_cm
+        }
+        canvas.save(os.path.join(out_dir, f'leaf_{idx+1}_diffuse.png'))
         mask_canvas.save(os.path.join(out_dir, f'leaf_{idx+1}_mask.png'))
 
         # --- Save normal map for this leaf if available ---
@@ -328,6 +337,8 @@ def extract_leaves_and_masks(
     # --- Save the complete image with background removed ---
     full_mask = (mask * 255).astype(np.uint8)
     full_rgba = np.array(input_image.convert('RGBA'))
+    with open(os.path.join(out_dir, f'leaf_scales.json'), 'w') as f:
+        json.dump(leaf_physical_sizes, f, indent=2)
     full_rgba[..., 3] = full_mask
     full_img = Image.fromarray(full_rgba, mode='RGBA')
     full_img.save(os.path.join(out_dir, 'all_leaves_no_bg.png'))
