@@ -232,10 +232,6 @@ for idx, mask_path in enumerate(mask_images):
     bbox = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
     width = max(v.x for v in bbox) - min(v.x for v in bbox)
     height = max(v.y for v in bbox) - min(v.y for v in bbox)
-    
-    if width > height:
-        obj.rotation_euler[2] = np.radians(90)
-    bpy.context.view_layer.update()
 
     # --- SCALE TO REAL WORLD SIZE ---
     # Convert physical size from cm to meters
@@ -244,7 +240,9 @@ for idx, mask_path in enumerate(mask_images):
     target_size_m = target_size_cm / 100.0  # convert cm to meters
 
     # Get bounding box in world coordinates
-    bbox = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj = obj.evaluated_get(depsgraph)
+    bbox = [eval_obj.matrix_world @ Vector(corner) for corner in eval_obj.bound_box]
 
     # Calculate max dimension of the mesh bounding box
     dims = [max(v[i] for v in bbox) - min(v[i] for v in bbox) for i in range(3)]
@@ -254,4 +252,19 @@ for idx, mask_path in enumerate(mask_images):
     scale_factor = target_size_m / max_mesh_dim
     obj.scale = (scale_factor,) * 3
 
+    bpy.context.view_layer.update()
+    # Apply -90° X rotation
+    obj.rotation_euler[0] = np.radians(-90)
+    bpy.context.view_layer.update()
+
+    # Evaluate object with all transforms
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj = obj.evaluated_get(depsgraph)
+
+    # Get actual world-space Z values of bounding box corners
+    bbox = [eval_obj.matrix_world @ Vector(corner) for corner in eval_obj.bound_box]
+    z_min = min(v.z for v in bbox)
+
+    # Shift object up so lowest point sits at z = 0
+    obj.location.z -= z_min
     bpy.context.view_layer.update()
