@@ -10,8 +10,8 @@ np.complex_ = np.complex128
 from torchvision import transforms
 from PIL import Image
 import tempfile
-from scipy.ndimage import label, find_objects
-from skimage.measure import regionprops
+from scipy.ndimage import find_objects  # Only import find_objects from scipy
+from skimage.measure import regionprops, label  # Import label from skimage.measure
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -24,7 +24,7 @@ def save_binary_mask(image_with_alpha: Image.Image, save_path: str):
     mask_img = Image.fromarray(binary_mask, mode='L')
     mask_img.save(save_path)
 
-def preprocess_image(input, mask_model='birefnet', resolution=1024):
+def preprocess_image(input, mask_model='birefnet', resolution=1024, keep_original=False):
     # if has alpha channel, use it directly
     has_alpha = False
     if input.mode == 'RGBA':
@@ -52,7 +52,11 @@ def preprocess_image(input, mask_model='birefnet', resolution=1024):
         input_array[:, :, 3] = mask * 255  # Apply mask to alpha channel
         output = Image.fromarray(input_array)
 
-    # Process the output image
+    # If keep_original is True, return the image with mask applied but no cropping/resizing
+    if keep_original:
+        return output
+
+    # Process the output image (original behavior)
     output_np = np.array(output)
     alpha = output_np[:, :, 3]
     
@@ -179,41 +183,51 @@ def apply_leaf_orientation(img, mask):
         mask = np.array(Image.fromarray(mask).transpose(Image.FLIP_TOP_BOTTOM))
     return img, mask
 
-def align_leaf_orientation(crop_img, crop_mask, crop_normal):
+def align_leaf_orientation(crop_img, crop_mask, crop_normal=None):
     # 1. Align major axis vertically
     mask_bool = crop_mask > 0
-    lbl = label(mask_bool)
-    props = regionprops(lbl[0])
+    lbl = label(mask_bool)  # This now returns just the labeled array, not a tuple
+    props = regionprops(lbl)
     if not props:
-        return crop_img, crop_mask  # fallback
+        return crop_img, crop_mask, crop_normal  # fallback
+    
     angle = np.rad2deg(props[0].orientation)
     rotate_angle = 90 - angle
+    
+    # Apply rotation to all images
     crop_img = np.array(Image.fromarray(crop_img).rotate(rotate_angle, expand=True))
     crop_mask = np.array(Image.fromarray(crop_mask).rotate(rotate_angle, expand=True))
+    if crop_normal is not None:
+        crop_normal = np.array(Image.fromarray(crop_normal).rotate(rotate_angle, expand=True))
 
     # 2. If major axis is vertical but broad side is on left/right, rotate 90°
     h, w = crop_mask.shape
     left_sum = np.count_nonzero(crop_mask[:, :w//2])
     right_sum = np.count_nonzero(crop_mask[:, w//2:])
+    
     if right_sum > left_sum:
         crop_img = np.array(Image.fromarray(crop_img).rotate(90, expand=True))
         crop_mask = np.array(Image.fromarray(crop_mask).rotate(90, expand=True))
-        crop_normal = np.array(Image.fromarray(crop_normal).rotate(90, expand=True))
+        if crop_normal is not None:
+            crop_normal = np.array(Image.fromarray(crop_normal).rotate(90, expand=True))
     elif left_sum > right_sum:
         crop_img = np.array(Image.fromarray(crop_img).rotate(-90, expand=True))
         crop_mask = np.array(Image.fromarray(crop_mask).rotate(-90, expand=True))
-        crop_normal = np.array(Image.fromarray(crop_normal).rotate(-90, expand=True))
+        if crop_normal is not None:
+            crop_normal = np.array(Image.fromarray(crop_normal).rotate(-90, expand=True))
 
     # 3. Ensure stem is at the bottom (narrowest part at bottom)
     h, w = crop_mask.shape
     vertical_profile = crop_mask.sum(axis=1)
     top_sum = vertical_profile[:h//10].sum()
     bottom_sum = vertical_profile[-h//10:].sum()
+    
     # Flip if stem is at the top (top_sum < bottom_sum)
     if top_sum < bottom_sum:
         crop_img = np.array(Image.fromarray(crop_img).transpose(Image.FLIP_TOP_BOTTOM))
         crop_mask = np.array(Image.fromarray(crop_mask).transpose(Image.FLIP_TOP_BOTTOM))
-        crop_normal = np.array(Image.fromarray(crop_normal).transpose(Image.FLIP_TOP_BOTTOM))
+        if crop_normal is not None:
+            crop_normal = np.array(Image.fromarray(crop_normal).transpose(Image.FLIP_TOP_BOTTOM))
         
     return crop_img, crop_mask, crop_normal
 
@@ -260,15 +274,18 @@ def extract_leaves_and_masks(
     os.makedirs(out_dir, exist_ok=True)
     leaf_physical_sizes = {}
     mask = get_birefnet_mask(input_image.convert('RGB'), mask_model)
-    labeled, num_features = label(mask)
+    labeled = label(mask)
     slices = find_objects(labeled)
     input_rgba = input_image.convert('RGBA')
     np_img = np.array(input_rgba)
 
-    # --- Load and resize normal map if provided ---
+    # --- Load normal map if provided (same size as input image) ---
     normal_np = None
     if normal_map_path is not None:
-        normal_img = Image.open(normal_map_path).convert('RGBA')
+        normal_img = Image.open(normal_map_path).convert('RGB')
+        # Ensure normal map is same size as input image
+        if normal_img.size != input_image.size:
+            normal_img = normal_img.resize(input_image.size, Image.Resampling.LANCZOS)
         normal_np = np.array(normal_img)
 
     # --- Find the largest leaf's bounding box size ---
@@ -300,7 +317,7 @@ def extract_leaves_and_masks(
         crop_img[..., 3] = crop_mask
 
         # --- Rotate so stem is at the bottom (mask drives all transforms) ---
-        # If normal map is present, pass it to align_leaf_orientation, but only mask is used for logic
+        # Apply same transformations to all images
         crop_img, crop_mask, crop_normal = align_leaf_orientation(crop_img, crop_mask, crop_normal)
 
         # --- Maintain relative size on fixed-size canvas ---
@@ -317,7 +334,7 @@ def extract_leaves_and_masks(
         offset = ((resolution - new_size[0]) // 2, (resolution - new_size[1]) // 2)
         canvas.paste(leaf_img, offset, leaf_mask_img)
         mask_canvas.paste(leaf_mask_img, offset)
-        # Save RGB and mask
+        
         # Save scale factor to text
         leaf_physical_sizes[f'leaf_{idx+1}'] = {
             "height_cm": leaf_h / pixels_per_cm,
@@ -328,10 +345,23 @@ def extract_leaves_and_masks(
 
         # --- Save normal map for this leaf if available ---
         if crop_normal is not None:
-            # Apply the same transformation as mask (already done above)
+            # Resize normal map with same transformations applied
             crop_normal_img = Image.fromarray(crop_normal).resize(new_size, Image.Resampling.LANCZOS)
-            normal_canvas = Image.new('RGB', (resolution, resolution), (0, 0, 0))
-            normal_canvas.paste(crop_normal_img, offset)
+            
+            # Create normal canvas with blue background (neutral normal pointing towards viewer)
+            normal_canvas = Image.new('RGB', (resolution, resolution), (128, 128, 255))  # Blue background
+            
+            # Create a mask to only paste normal map where the leaf is
+            leaf_mask_resized = np.array(leaf_mask_img)
+            crop_normal_array = np.array(crop_normal_img)
+            
+            # Set areas outside the mask to blue (neutral normal)
+            mask_3d = np.stack([leaf_mask_resized, leaf_mask_resized, leaf_mask_resized], axis=2) > 128
+            crop_normal_masked = np.where(mask_3d, crop_normal_array, [128, 128, 255])
+            crop_normal_masked_img = Image.fromarray(crop_normal_masked.astype(np.uint8))
+            
+            # Paste only the masked normal map
+            normal_canvas.paste(crop_normal_masked_img, offset)
             normal_canvas.save(os.path.join(out_dir, f'leaf_{idx+1}_normal.png'))
 
     # --- Save the complete image with background removed ---
@@ -366,26 +396,172 @@ def resize_and_pad_to_match(img: Image.Image, target_size: Tuple[int, int]) -> I
     return new_img
 
 def leaves():
-    image = Image.open('/home/niqbal/git/aa_blender/leaf_data/plant_1/blender_assets/IMG_9728_diffused.JPEG')
-    image_paths = glob('./image_pool/*.JPEG')  # Adjust the path to your image pool
-    image_pool = [Image.open(p) for p in image_paths]
+    # import rawpy 
+    # with rawpy.imread('/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/weed_ampfer_1/DSC_0337.png') as raw:
+        # rgb = raw.postprocess(use_camera_wb=True, half_size=False, no_auto_bright=True)
+    # image = Image.fromarray(rgb)
+    # image = image.convert('RGB')
+    image = Image.open('/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/weed_ampfer_1/DSC_0337.png')
+    # image_paths = glob('./image_pool/*.JPEG')  # Adjust the path to your image pool
+    # image_pool = [Image.open(p) for p in image_paths]
     model = lazy_load_birefnet()
     extract_leaves_and_masks(image, 
                              mask_model=model, 
                              resolution=1024, 
-                             out_dir='/home/niqbal/git/aa_blender/leaf_data/plant_1/leaf_assets/',
-                             normal_map_path='/home/niqbal/git/aa_blender/leaf_data/plant_1/blender_assets/IMG_9728_normal.png'
+                             out_dir='/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/weed_ampfer_1/',
+                             normal_map_path='/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/weed_ampfer_1/8_normal.png'
                              )
 
 def main():
-    image = Image.open('image_pool/IMG_9728_diffused.JPEG')  # Replace with your input image path
+    image = Image.open('/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/leaf_8/processed/DSC_0309_diffuse.png')  # Replace with your input image path
     model = lazy_load_birefnet()
-    mask_image = preprocess_image(image, mask_model=model, resolution=1024)
-    # mask_image.save('/mnt/e/projects/raw_datasets/lalweco/sugarbeets/leaves/IMG_9728_mask.png')  # Save the output image
+    mask_image = preprocess_image(image, mask_model=model, keep_original=True)
+    mask_image.save('/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/leaf_8/processed/DSC_0309_mask.png')  # Save the output image
     save_binary_mask(
         mask_image,
-        '/mnt/e/projects/raw_datasets/lalweco/sugarbeets/leaves/IMG_9728_mask.png'
+        '/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/leaf_8/processed/DSC_0309_mask.JPG'
     )
+
+def process_folder_native_resolution(
+    input_folder: str,
+    output_folder: str,
+    mask_model,
+    target_resolution: int = 1024,
+    image_extensions: tuple = ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG')
+):
+    """
+    Process all images in a folder at native resolution, extract foreground objects,
+    and resize to target resolution.
+    """
+    import os
+    from glob import glob
+    
+    os.makedirs(output_folder, exist_ok=True)
+    
+    # Find all image files in the input folder
+    image_files = []
+    for ext in image_extensions:
+        image_files.extend(glob(os.path.join(input_folder, f'*{ext}')))
+    
+    print(f"Found {len(image_files)} images to process")
+    
+    for img_path in image_files:
+        try:
+            print(f"Processing: {os.path.basename(img_path)}")
+            
+            # Load image at native resolution
+            image = Image.open(img_path)
+            original_size = image.size
+            print(f"  Original size: {original_size}")
+            
+            # Generate mask at native resolution
+            mask = get_birefnet_mask(image.convert('RGB'), mask_model)
+            
+            # Find bounding box of foreground objects
+            mask_coords = np.argwhere(mask > 0)
+            if len(mask_coords) == 0:
+                print(f"  No foreground detected in {os.path.basename(img_path)}")
+                continue
+                
+            # Get bounding box coordinates (y_min, y_max, x_min, x_max)
+            y_min, x_min = mask_coords.min(axis=0)
+            y_max, x_max = mask_coords.max(axis=0)
+            
+            # Add some padding around the bounding box
+            padding = 50  # pixels
+            y_min = max(0, y_min - padding)
+            x_min = max(0, x_min - padding)
+            y_max = min(image.height, y_max + padding)
+            x_max = min(image.width, x_max + padding)
+            
+            # Crop the image and mask to bounding box
+            bbox = (x_min, y_min, x_max, y_max)
+            cropped_image = image.crop(bbox)
+            cropped_mask = mask[y_min:y_max, x_min:x_max]
+            
+            # Apply mask to RGB image (set background to white/black)
+            cropped_rgb = cropped_image.convert('RGB')
+            cropped_array = np.array(cropped_rgb)
+            mask_3d = np.stack([cropped_mask, cropped_mask, cropped_mask], axis=2)
+            # Set background to white where mask is 0
+            cropped_array[mask_3d == 0] = 255  # White background
+            # Or use this for black background:
+            # cropped_array[mask_3d == 0] = 0  # Black background
+            cropped_with_mask = Image.fromarray(cropped_array)
+            
+            # Resize to target resolution while maintaining aspect ratio
+            resized_image = resize_to_square_rgb(cropped_with_mask, target_resolution)
+            
+            # Create resized mask
+            cropped_mask_img = Image.fromarray((cropped_mask * 255).astype(np.uint8), mode='L')
+            resized_mask = resize_to_square_rgb(cropped_mask_img, target_resolution)
+            
+            # Generate output filenames
+            base_name = os.path.splitext(os.path.basename(img_path))[0]
+            output_image_path = os.path.join(output_folder, f'{base_name}_resized.png')
+            output_mask_path = os.path.join(output_folder, f'{base_name}_mask.png')
+            
+            # Save resized image and mask (both as RGB/L without alpha)
+            resized_image.save(output_image_path)
+            resized_mask.save(output_mask_path)
+            
+            print(f"  Saved: {os.path.basename(output_image_path)} and {os.path.basename(output_mask_path)}")
+            
+        except Exception as e:
+            print(f"  Error processing {os.path.basename(img_path)}: {str(e)}")
+            continue
+
+def resize_to_square_rgb(image: Image.Image, target_size: int) -> Image.Image:
+    """
+    Resize image to square target size while maintaining aspect ratio.
+    Adds white padding if needed (for RGB images without alpha).
+    """
+    # Calculate scaling factor to fit the image within target size
+    scale = min(target_size / image.width, target_size / image.height)
+    
+    # Calculate new size
+    new_width = int(image.width * scale)
+    new_height = int(image.height * scale)
+    
+    # Resize the image
+    resized = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    
+    # Create square canvas with white background for RGB or black for grayscale
+    if image.mode == 'RGB':
+        canvas = Image.new('RGB', (target_size, target_size), (255, 255, 255))  # White background
+    else:
+        canvas = Image.new('L', (target_size, target_size), 0)  # Black background for mask
+    
+    # Calculate position to center the resized image
+    x_offset = (target_size - new_width) // 2
+    y_offset = (target_size - new_height) // 2
+    
+    # Paste the resized image onto the canvas
+    canvas.paste(resized, (x_offset, y_offset))
+    
+    return canvas
+
+def process_folder():
+    """
+    Example usage function to process a folder of images
+    """
+    input_folder = '/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/leaf_8/'
+    output_folder = '/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/leaf_8/processed/'
+
+    # Load the model once
+    model = lazy_load_birefnet()
+    
+    # Process all images in the folder
+    process_folder_native_resolution(
+        input_folder=input_folder,
+        output_folder=output_folder,
+        mask_model=model,
+        target_resolution=1024
+    )
+    
+    print("Processing complete!")
+    
 if __name__ == "__main__":
     # main()
     leaves()
+    # process_folder()
