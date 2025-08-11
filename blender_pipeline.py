@@ -168,56 +168,132 @@ def create_contour_based_mesh(image_path, subdivisions=10, mesh_name="ContourMes
 
     return obj
 
+def load_leaf_size_data(asset_folder_path):
+    """Load leaf size data from JSON file in asset folder"""
+    json_files = glob(os.path.join(asset_folder_path, '*_leaves_data.json'))
+    if json_files:
+        with open(json_files[0], 'r') as f:
+            return json.load(f)
+    return None
+
 # === Main Execution ===
 
-image_dir = r"\\wsl.localhost\Ubuntu-20.04\home\niqbal\git\aa_blender\leaf_data\plant_1\leaf_assets"
-mask_images = sorted(glob(os.path.join(image_dir, 'leaf_*_mask.png')))
-diffuse_images = sorted(glob(os.path.join(image_dir, 'leaf_*_diffuse.png')))
-normal_images = sorted(glob(os.path.join(image_dir, 'leaf_*_normal.png')))
-leaf_scales = os.path.join(image_dir, 'leaf_scales.json')
-# Load leaf physical sizes from JSON once before the loop
-with open(leaf_scales, 'r') as f:
-    leaf_physical_sizes = json.load(f)
+# UPDATE THIS PATH TO YOUR DATASET
+base_folder = r"F:\projects\raw_datasets\lalweco\sugarbeets\nikon_camera\test_dataset"
+
+# Find all asset folders (containing leaf_ subfolders)
+asset_folders = [d for d in os.listdir(base_folder) 
+                if os.path.isdir(os.path.join(base_folder, d))]
+
 bpy.context.scene.render.engine = 'CYCLES'
 
+# Create main collection for all leaf meshes
 collection_name = "LeafMeshes"
 if collection_name not in bpy.data.collections:
-    leaf_collection = bpy.data.collections.new(collection_name)
-    bpy.context.scene.collection.children.link(leaf_collection)
+    main_leaf_collection = bpy.data.collections.new(collection_name)
+    bpy.context.scene.collection.children.link(main_leaf_collection)
 else:
-    leaf_collection = bpy.data.collections[collection_name]
+    main_leaf_collection = bpy.data.collections[collection_name]
 
-x_offset = 0.0
-spacing = 0.5  # space between leaves
+y_offset = 0.0
+spacing = 0.5  # space between leaves along Y-axis
+total_leaf_count = 0
 
-for idx, mask_path in enumerate(mask_images):
-    mesh_name = f"Leaf_{idx+1}_mesh"
-    print(f"Creating mesh {mesh_name} from {mask_path}")
+print(f"Found {len(asset_folders)} asset folders to process")
 
-    obj = create_contour_based_mesh(
-        image_path=mask_path,
-        subdivisions=3,
-        mesh_name=mesh_name,
-        scale=2.0,
-        collection=leaf_collection
-    )
-    # Ensure active object
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
+for asset_idx, asset_folder_name in enumerate(sorted(asset_folders)):
+    asset_folder_path = os.path.join(base_folder, asset_folder_name)
     
-    # Load and show image in UV/Image Editor
-    img = bpy.data.images.load(diffuse_images[idx])
-    for area in bpy.context.screen.areas:
-        if area.type == 'IMAGE_EDITOR':
-            area.spaces.active.image = img
-    if obj:
-        # Assign material
-        if idx < len(diffuse_images) and idx < len(normal_images):
+    # Find all leaf_ folders in this asset folder
+    leaf_folders = [d for d in os.listdir(asset_folder_path) 
+                   if os.path.isdir(os.path.join(asset_folder_path, d)) and d.startswith('leaf_')]
+    
+    if not leaf_folders:
+        print(f"No leaf folders found in {asset_folder_name}, skipping...")
+        continue
+    
+    print(f"\nProcessing asset: {asset_folder_name} with {len(leaf_folders)} leaves")
+    
+    # Create a collection for this asset's leaves
+    asset_collection_name = f"Asset_{asset_idx+1}_{asset_folder_name}"
+    if asset_collection_name not in bpy.data.collections:
+        asset_collection = bpy.data.collections.new(asset_collection_name)
+        main_leaf_collection.children.link(asset_collection)
+    else:
+        asset_collection = bpy.data.collections[asset_collection_name]
+    
+    # Load leaf size data for this asset (optional - for physical scaling)
+    leaf_size_data = load_leaf_size_data(asset_folder_path)
+    
+    for leaf_idx, leaf_folder_name in enumerate(sorted(leaf_folders)):
+        leaf_folder_path = os.path.join(asset_folder_path, leaf_folder_name)
+        
+        # Find the processed images in the leaf folder
+        processed_folder = os.path.join(leaf_folder_path, 'processed')
+        
+        if os.path.exists(processed_folder):
+            # Look for images in the processed folder
+            mask_files = glob(os.path.join(processed_folder, '*_mask.png'))
+            diffuse_files = glob(os.path.join(processed_folder, '*_diffuse.png'))
+            normal_files = glob(os.path.join(processed_folder, '*_normal.png'))
+        else:
+            # Fallback: look directly in the leaf folder
+            mask_files = glob(os.path.join(leaf_folder_path, '*_mask.png'))
+            diffuse_files = glob(os.path.join(leaf_folder_path, '*_diffuse.png'))
+            normal_files = glob(os.path.join(leaf_folder_path, '*_normal.png'))
+        
+        if not (mask_files and diffuse_files and normal_files):
+            print(f"  Missing files for {leaf_folder_name}, skipping...")
+            continue
+        
+        # Use the first found file (should only be one of each type)
+        mask_path = mask_files[0]
+        diffuse_path = diffuse_files[0]
+        normal_path = normal_files[0]
+        
+        # Extract leaf number for naming
+        leaf_number = leaf_folder_name.replace('leaf_', '')
+        
+        # Create unique mesh name: asset_folder_numeric_leaf_numeric
+        mesh_name = f"{asset_folder_name}_{asset_idx+1}_{leaf_folder_name}_{leaf_number}"
+        
+        total_leaf_count += 1
+        
+        print(f"  Creating mesh {mesh_name}")
+        print(f"    Mask: {os.path.basename(mask_path)}")
+        print(f"    Diffuse: {os.path.basename(diffuse_path)}")
+        print(f"    Normal: {os.path.basename(normal_path)}")
+        
+        # Create the mesh object
+        obj = create_contour_based_mesh(
+            image_path=mask_path,
+            subdivisions=3,
+            mesh_name=mesh_name,
+            scale=2.0,
+            collection=asset_collection
+        )
+        
+        if obj:
+            # Ensure active object
+            bpy.context.view_layer.objects.active = obj
+            obj.select_set(True)
+            
+            # Load and show image in UV/Image Editor
+            try:
+                img = bpy.data.images.load(diffuse_path)
+                for area in bpy.context.screen.areas:
+                    if area.type == 'IMAGE_EDITOR':
+                        area.spaces.active.image = img
+            except:
+                print(f"    Warning: Could not load image for UV editor")
+            
+            # Create and assign material
+            material_name = f"Material_{asset_folder_name}_{leaf_folder_name}"
             material = create_leaf_material(
-                name=f"LeafMaterial_{idx+1}",
-                diffuse_path=diffuse_images[idx],
-                normal_path=normal_images[idx],
-                mask_path=mask_images[idx]
+                name=material_name,
+                diffuse_path=diffuse_path,
+                normal_path=normal_path,
+                mask_path=mask_path
             )
 
             obj.data.materials.clear()
@@ -229,42 +305,62 @@ for idx, mask_path in enumerate(mask_images):
             bpy.ops.uv.smart_project(angle_limit=66)
             bpy.ops.object.mode_set(mode='OBJECT')
 
-    bbox = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
-    width = max(v.x for v in bbox) - min(v.x for v in bbox)
-    height = max(v.y for v in bbox) - min(v.y for v in bbox)
+            # --- POSITIONING AND ROTATION ---
+            # 1. Rotate 180° around X-axis
+            obj.rotation_euler[0] = np.radians(180)
+            bpy.context.view_layer.update()
 
-    # --- SCALE TO REAL WORLD SIZE ---
-    # Convert physical size from cm to meters
-    leaf_data = leaf_physical_sizes.get(f'leaf_{idx+1}', {"height_cm": 10.0, "width_cm": 10.0})
-    target_size_cm = max(leaf_data.get("height_cm", 10.0), leaf_data.get("width_cm", 10.0))
-    target_size_m = target_size_cm / 100.0  # convert cm to meters
+            # 2. Get bounding box after rotation to calculate dimensions
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            eval_obj = obj.evaluated_get(depsgraph)
+            bbox = [eval_obj.matrix_world @ Vector(corner) for corner in eval_obj.bound_box]
+            
+            # Calculate dimensions
+            y_min = min(v.y for v in bbox)
+            y_max = max(v.y for v in bbox)
+            z_min = min(v.z for v in bbox)
+            
+            leaf_height = y_max - y_min  # Height along Y-axis
+            
+            # 3. Apply physical scaling if size data is available
+#            if leaf_size_data and 'leaves' in leaf_size_data and leaf_folder_name in leaf_size_data['leaves']:
+#                leaf_data = leaf_size_data['leaves'][leaf_folder_name]
+#                physical_height_cm = leaf_data['dimensions']['height_cm']
+#                
+#                # Convert cm to Blender units (assuming 1 Blender unit = 1 meter)
+#                physical_height_blender = physical_height_cm / 100.0
+#                
+#                # Calculate scale factor
+#                scale_factor = physical_height_blender / leaf_height
+#                obj.scale = (scale_factor, scale_factor, scale_factor)
+#                bpy.context.view_layer.update()
+#                
+#                # Recalculate dimensions after scaling
+#                eval_obj = obj.evaluated_get(depsgraph)
+#                bbox = [eval_obj.matrix_world @ Vector(corner) for corner in eval_obj.bound_box]
+#                y_min = min(v.y for v in bbox)
+#                y_max = max(v.y for v in bbox)
+#                z_min = min(v.z for v in bbox)
+#                leaf_height = y_max - y_min
+#                
+#                print(f"    Scaled to physical size: {physical_height_cm}cm ({physical_height_blender:.3f}m)")
+            
+            # 4. Position the object
+            obj.location.x = 0.0  # Keep at X=0
+            obj.location.y = y_offset + (leaf_height / 2)  # Center leaf at current Y offset
+            obj.location.z = -z_min  # Move so lowest point is at Z=0
+            
+            bpy.context.view_layer.update()
+            
+            # 5. Update Y offset for next leaf
+            y_offset += leaf_height + spacing
+            
+            print(f"    Positioned at Y={obj.location.y:.3f}, height: {leaf_height:.3f}")
+        
+        else:
+            print(f"    Failed to create mesh for {leaf_folder_name}")
 
-    # Get bounding box in world coordinates
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    eval_obj = obj.evaluated_get(depsgraph)
-    bbox = [eval_obj.matrix_world @ Vector(corner) for corner in eval_obj.bound_box]
-
-    # Calculate max dimension of the mesh bounding box
-    dims = [max(v[i] for v in bbox) - min(v[i] for v in bbox) for i in range(3)]
-    max_mesh_dim = max(dims)
-
-    # Calculate scale factor and apply
-    scale_factor = target_size_m / max_mesh_dim
-    obj.scale = (scale_factor,) * 3
-
-    bpy.context.view_layer.update()
-    # Apply -90° X rotation
-    obj.rotation_euler[0] = np.radians(-90)
-    bpy.context.view_layer.update()
-
-    # Evaluate object with all transforms
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    eval_obj = obj.evaluated_get(depsgraph)
-
-    # Get actual world-space Z values of bounding box corners
-    bbox = [eval_obj.matrix_world @ Vector(corner) for corner in eval_obj.bound_box]
-    z_min = min(v.z for v in bbox)
-
-    # Shift object up so lowest point sits at z = 0
-    obj.location.z -= z_min
-    bpy.context.view_layer.update()
+print(f"\nCompleted processing!")
+print(f"Total assets processed: {len(asset_folders)}")
+print(f"Total leaf meshes created: {total_leaf_count}")
+print(f"Collections created under '{collection_name}'")
