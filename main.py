@@ -14,6 +14,10 @@ from utils import resize_with_padding, get_nb_stage
 sys.path.append('./Uni-MS-PS')  # Add the Uni-MS-PS folder to path
 from utils import load_model
 from run import run
+import json
+import rawpy
+import exifread
+from datetime import datetime
 
 def compress_raw_data(base_folder: str, leaf_resolution=1920):
     """
@@ -542,6 +546,298 @@ def load_imgs_mask_custom(path, nb_img, max_size=None, calibrated=False, exclude
     
     return imgs, mask, padding, [x_min, x_max_pad, y_min, y_max_pad], original_shape
 
+def calculate_leaf_sizes(base_folder: str):
+    """
+    Step 5: Calculate leaf sizes in cm and save as JSON files
+    
+    - Read camera parameters from NEF files (focal length)
+    - Load and convert NEF to full-resolution PNG for measurements
+    - Calculate pixel to cm conversion factor using focal length and distance
+    - Measure leaf sizes from original full-resolution masks
+    - Save leaf size data as JSON files in each object folder
+    
+    Args:
+        base_folder: Path to folder containing object asset folders
+    """
+    
+    # Find all subdirectories in the base folder
+    object_folders = [d for d in os.listdir(base_folder) 
+                     if os.path.isdir(os.path.join(base_folder, d))]
+    
+    if not object_folders:
+        print(f"No subfolders found in {base_folder}")
+        return
+    
+    print(f"Found {len(object_folders)} object folders to calculate leaf sizes")
+    
+    # Initialize summary data for the entire dataset
+    dataset_summary = {
+        "dataset_info": {
+            "base_folder": base_folder,
+            "processing_date": str(datetime.now()),
+            "total_objects": len(object_folders),
+            "total_leaves": 0
+        },
+        "objects": {}
+    }
+    
+    for folder_name in object_folders:
+        folder_path = os.path.join(base_folder, folder_name)
+        raw_folder = os.path.join(folder_path, 'raw')
+        compressed_folder = os.path.join(folder_path, 'compressed')
+        
+        if not os.path.exists(raw_folder) or not os.path.exists(compressed_folder):
+            print(f"  Missing raw or compressed folder in {folder_name}, skipping...")
+            continue
+            
+        print(f"\nCalculating leaf sizes for: {folder_name}")
+        
+        # Initialize object data
+        object_data = {
+            "object_name": folder_name,
+            "camera_parameters": {},
+            "leaves": {},
+            "leaf_count": 0
+        }
+        
+        try:
+            # Get NEF files
+            nef_files = glob(os.path.join(raw_folder, '*.NEF')) + glob(os.path.join(raw_folder, '*.nef'))
+            if not nef_files:
+                print(f"  No NEF files found in {folder_name}/raw, skipping...")
+                continue
+            
+            # Find the diffuse NEF file (matching the compressed diffuse PNG name)
+            diffuse_files = glob(os.path.join(compressed_folder, '*_diffuse.png'))
+            if not diffuse_files:
+                print(f"  No _diffuse.png file found in {folder_name}/compressed, skipping...")
+                continue
+            
+            # Get the base name of the diffuse file to find corresponding NEF
+            diffuse_basename = os.path.basename(diffuse_files[0]).replace('_diffuse.png', '')
+            diffuse_nef = None
+            
+            for nef_file in nef_files:
+                nef_basename = os.path.splitext(os.path.basename(nef_file))[0]
+                if nef_basename == diffuse_basename:
+                    diffuse_nef = nef_file
+                    break
+            
+            if diffuse_nef is None:
+                print(f"  Could not find NEF file matching {diffuse_basename}, using first NEF file")
+                diffuse_nef = nef_files[0]
+            
+            print(f"  Using NEF file for measurements: {os.path.basename(diffuse_nef)}")
+            
+            # Read EXIF data from NEF file for focal length
+            print(f"  Reading focal length from: {os.path.basename(diffuse_nef)}")
+            
+            with open(diffuse_nef, 'rb') as f:
+                tags = exifread.process_file(f)
+                
+                # Get focal length
+                if 'EXIF FocalLength' in tags:
+                    f_mm = float(tags['EXIF FocalLength'].printable)
+                else:
+                    print(f"  Warning: No focal length found, using default 85mm")
+                    f_mm = 85.0
+            
+            print(f"  Converting NEF to full-resolution image...")
+            with rawpy.imread(diffuse_nef) as raw:
+                # Process RAW to RGB without downscaling
+                rgb = raw.postprocess(
+                    gamma=(1, 1),  # Linear gamma
+                    no_auto_bright=True,  # Don't auto-adjust brightness
+                    output_bps=8,  # 8-bit output
+                    use_camera_wb=True,  # Use camera white balance
+                    half_size=False,  # IMPORTANT: Full resolution
+                    four_color_rgb=False,
+                    dcb_enhance=False,
+                    fbdd_noise_reduction=rawpy.FBDDNoiseReductionMode.Off,
+                    noise_thr=None
+                )
+            
+            # Convert to PIL Image
+            diffuse_image = Image.fromarray(rgb)
+            res_w, res_h = diffuse_image.size  # This gives us the actual full resolution
+            
+            print(f"  Full resolution from NEF: {res_w}x{res_h}")
+            print(f"  Camera focal length: {f_mm}mm")
+            
+            # Camera sensor specifications (Nikon D750/D850 typical values)
+            sensor_w_mm = 23.5  # Full frame sensor width
+            sensor_h_mm = 15.6  # Full frame sensor height
+            z_mm = 280.0        # Distance to subject (28 cm as specified)
+            
+            # Determine orientation and map sensor dimensions correctly
+            if res_w > res_h:  # Landscape orientation
+                print("  Image orientation: Landscape")
+                # Standard: width maps to sensor width, height to sensor height
+                px_w_mm = sensor_w_mm / res_w  # Width pixel pitch
+                px_h_mm = sensor_h_mm / res_h  # Height pixel pitch
+            else:  # Portrait orientation
+                print("  Image orientation: Portrait")
+                # Rotated: width maps to sensor height, height to sensor width
+                px_w_mm = sensor_h_mm / res_w  # Width pixel pitch (rotated)
+                px_h_mm = sensor_w_mm / res_h  # Height pixel pitch (rotated)
+            
+            # Calculate pixels per cm for both dimensions using focal length method
+            def pixels_per_cm(f_mm, z_mm, px_mm):
+                return (f_mm * 10.0) / ((z_mm - f_mm) * px_mm)
+            
+            ppcm_w = pixels_per_cm(f_mm, z_mm, px_w_mm)  # Horizontal
+            ppcm_h = pixels_per_cm(f_mm, z_mm, px_h_mm)  # Vertical
+            
+            print(f"  Pixel size: width={px_w_mm:.6f}mm/px, height={px_h_mm:.6f}mm/px")
+            print(f"  Pixels per cm: horizontal={ppcm_w:.2f}, vertical={ppcm_h:.2f}")
+            
+            # Store camera parameters in object data
+            object_data["camera_parameters"] = {
+                "focal_length_mm": f_mm,
+                "distance_mm": z_mm,
+                "sensor_width_mm": sensor_w_mm,
+                "sensor_height_mm": sensor_h_mm,
+                "image_width": res_w,
+                "image_height": res_h,
+                "orientation": "landscape" if res_w > res_h else "portrait",
+                "pixel_size_w_mm": round(px_w_mm, 6),
+                "pixel_size_h_mm": round(px_h_mm, 6),
+                "pixels_per_cm_horizontal": round(ppcm_w, 2),
+                "pixels_per_cm_vertical": round(ppcm_h, 2)
+            }
+            
+            # Load BiRefNet model if not already loaded
+            mask_model = lazy_load_birefnet()
+            
+            # Generate mask at FULL resolution (using the full NEF resolution)
+            print(f"  Generating mask from full-resolution image...")
+            mask = get_birefnet_mask(diffuse_image.convert('RGB'), mask_model)
+            labeled = label(mask)
+            slices = find_objects(labeled)
+            
+            if not slices:
+                print(f"  No leaves detected in full resolution image")
+                continue
+            
+            # Find all leaf folders to match with detected leaves
+            leaf_folders = [d for d in os.listdir(folder_path) 
+                           if os.path.isdir(os.path.join(folder_path, d)) and d.startswith('leaf_')]
+            
+            if not leaf_folders:
+                print(f"  No leaf folders found in {folder_name}, skipping...")
+                continue
+            
+            print(f"  Found {len(leaf_folders)} leaf folders and {len([s for s in slices if s is not None])} detected leaves")
+            
+            # Process each detected leaf
+            leaf_count = 0
+            for idx, slc in enumerate(slices):
+                if slc is None:
+                    continue
+                    
+                leaf_mask = (labeled[slc] == (idx + 1)).astype(np.uint8) * 255
+                if leaf_mask.sum() < 100:
+                    continue
+                
+                leaf_count += 1
+                leaf_folder_name = f'leaf_{leaf_count}'
+                leaf_folder_path = os.path.join(folder_path, leaf_folder_name)
+                
+                if not os.path.exists(leaf_folder_path):
+                    print(f"    Warning: {leaf_folder_name} folder not found, skipping...")
+                    continue
+                
+                # Calculate leaf dimensions from mask at FULL resolution
+                # Apply the same orientation transformation to get accurate measurements
+                crop_mask_original = leaf_mask.copy()
+                
+                # Get the cropped region from FULL resolution image
+                diffuse_rgba = diffuse_image.convert('RGBA')
+                diffuse_np = np.array(diffuse_rgba)
+                crop_diffuse = diffuse_np[slc].copy()
+                crop_diffuse[..., 3] = crop_mask_original
+                
+                # Apply same transformations to get final oriented mask
+                crop_diffuse_transformed, crop_mask_transformed, _ = align_leaf_orientation(
+                    crop_diffuse, crop_mask_original, None
+                )
+                
+                # Calculate dimensions from transformed mask
+                mask_coords = np.argwhere(crop_mask_transformed > 128)
+                if len(mask_coords) == 0:
+                    print(f"    Warning: No valid mask found for {leaf_folder_name}")
+                    continue
+                
+                # Get bounding box in pixels
+                y_min, x_min = mask_coords.min(axis=0)
+                y_max, x_max = mask_coords.max(axis=0)
+                
+                # Calculate dimensions in pixels
+                width_pixels = x_max - x_min
+                height_pixels = y_max - y_min
+                
+                # Convert to cm using focal length-based pixel per cm ratios
+                width_cm = width_pixels / ppcm_w
+                height_cm = height_pixels / ppcm_h
+                
+                # Calculate area (precise count of mask pixels)
+                area_pixels = np.sum(crop_mask_transformed > 128)
+                area_cm2 = area_pixels / (ppcm_w * ppcm_h)
+                
+                # Create leaf data
+                leaf_data = {
+                    "leaf_id": leaf_folder_name,
+                    "object_name": folder_name,
+                    "dimensions": {
+                        "width_cm": round(width_cm, 3),
+                        "height_cm": round(height_cm, 3),
+                        "area_cm2": round(area_cm2, 3)
+                    },
+                    "pixels": {
+                        "width_pixels": int(width_pixels),
+                        "height_pixels": int(height_pixels),
+                        "area_pixels": int(area_pixels)
+                    },
+                    "processing_info": {
+                        "measured_at_full_resolution": True,
+                        "original_image_size": [res_w, res_h],
+                        "transformations_applied": ["cropping", "orientation_alignment"],
+                        "measurement_method": "focal_length_distance_based",
+                        "source": "full_resolution_NEF"
+                    }
+                }
+                
+                # Add leaf to object data
+                object_data["leaves"][leaf_folder_name] = leaf_data
+                
+                print(f"    {leaf_folder_name}: {width_cm:.2f}cm x {height_cm:.2f}cm (area: {area_cm2:.2f}cm²)")
+            
+            object_data["leaf_count"] = leaf_count
+            dataset_summary["objects"][folder_name] = object_data
+            dataset_summary["dataset_info"]["total_leaves"] += leaf_count
+            
+            # Save individual object JSON file in the object folder
+            object_json_path = os.path.join(folder_path, f'{folder_name}_leaves_data.json')
+            with open(object_json_path, 'w') as f:
+                json.dump(object_data, f, indent=2)
+            
+            print(f"  ✓ Completed size calculations for {folder_name} ({leaf_count} leaves)")
+            print(f"  ✓ Saved: {folder_name}_leaves_data.json")
+            
+        except Exception as e:
+            print(f"  ✗ Error calculating sizes for {folder_name}: {str(e)}")
+            continue
+    
+    # Also save a summary for the entire dataset in the base folder
+    summary_json_path = os.path.join(base_folder, 'dataset_summary.json')
+    with open(summary_json_path, 'w') as f:
+        json.dump(dataset_summary, f, indent=2)
+    
+    print(f"\n✓ Saved dataset summary to: dataset_summary.json")
+    print(f"Total objects processed: {dataset_summary['dataset_info']['total_objects']}")
+    print(f"Total leaves measured: {dataset_summary['dataset_info']['total_leaves']}")
+
+
 def main():
     """
     Main function - specify your base folder path here
@@ -564,6 +860,9 @@ def main():
     
     # Step 4: Organize final structure
     organize_final_structure(base_folder)
+    
+    # Step 5: Calculate leaf sizes in cm
+    calculate_leaf_sizes(base_folder)
     
     print("\nAll processing complete!")
 

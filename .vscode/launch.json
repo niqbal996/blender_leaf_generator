@@ -4,7 +4,13 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-    
+        {
+            "name": "Get leaf size in cm",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "leaf_size_in_cm.py",
+            "console": "integratedTerminal"
+        },
         {
             "name": "Generate leaf instance masks",
             "type": "debugpy",
@@ -21,15 +27,20 @@
             "request": "launch",
             "program": "Uni-MS-PS/inference_folder.py",
             "args": [
-                "--path_obj", "/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/weed_ampfer_1/processed",
-                "--nb_img", "8",
-                "--folder_save", "/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/weed_ampfer_1/",
+                "--path_obj",
+                "/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/weed_ampfer_1/processed",
+                "--nb_img",
+                "8",
+                "--folder_save",
+                "/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/weed_ampfer_1/",
                 "--cuda",
-                "--weights", "Uni-MS-PS/weights",
-                "--res", "1024",
+                "--weights",
+                "Uni-MS-PS/weights",
+                "--res",
+                "1024",
             ],
             "env": {
-                "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION":"python",
+                "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python",
                 "PYTHONPATH": "${workspaceFolder}/Uni-MS-PS",
             },
             "console": "integratedTerminal"
@@ -40,7 +51,7 @@
             "request": "launch",
             "program": "preprocess_NEF.py",
             "env": {
-                "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION":"python",
+                "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python",
                 "PYTHONPATH": "${workspaceFolder}/Uni-MS-PS",
             },
             "console": "integratedTerminal"
@@ -51,7 +62,7 @@
             "request": "launch",
             "program": "main.py",
             "env": {
-                "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION":"python",
+                "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python",
                 "PYTHONPATH": "${workspaceFolder}/Uni-MS-PS",
             },
             "console": "integratedTerminal"
