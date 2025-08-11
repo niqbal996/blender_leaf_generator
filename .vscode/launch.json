@@ -21,9 +21,9 @@
             "request": "launch",
             "program": "Uni-MS-PS/inference_folder.py",
             "args": [
-                "--path_obj", "/home/niqbal/git/aa_blender/leaf_data",
-                "--nb_img", "4",
-                "--folder_save", "/home/niqbal/git/aa_blender/leaf_data",
+                "--path_obj", "/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/weed_ampfer_1/processed",
+                "--nb_img", "8",
+                "--folder_save", "/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/weed_ampfer_1/",
                 "--cuda",
                 "--weights", "Uni-MS-PS/weights",
                 "--res", "1024",
@@ -33,6 +33,28 @@
                 "PYTHONPATH": "${workspaceFolder}/Uni-MS-PS",
             },
             "console": "integratedTerminal"
-        }
+        },
+        {
+            "name": "Process RAW NEF files",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "preprocess_NEF.py",
+            "env": {
+                "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION":"python",
+                "PYTHONPATH": "${workspaceFolder}/Uni-MS-PS",
+            },
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Process ALL camera data",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "env": {
+                "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION":"python",
+                "PYTHONPATH": "${workspaceFolder}/Uni-MS-PS",
+            },
+            "console": "integratedTerminal"
+        },
     ]
 }
