@@ -24,11 +24,13 @@ def compress_raw_data(base_folder: str, leaf_resolution=1920):
     Process all subfolders in base_folder, each representing a blender object asset.
     
     Step 1: 
-    - Create 'raw' folder and move NEF files there
+    - Look for existing 'raw' folders in each asset folder
     - Create 'compressed' folder and convert NEF files to PNG
+    - If no 'raw' folder exists, look for NEF files in root and create 'raw' folder
     
     Args:
         base_folder: Path to folder containing object asset folders
+        leaf_resolution: Target resolution for compressed images
     """
     
     # Find all subdirectories in the base folder
@@ -43,44 +45,92 @@ def compress_raw_data(base_folder: str, leaf_resolution=1920):
     
     for folder_name in object_folders:
         folder_path = os.path.join(base_folder, folder_name)
+        raw_folder = os.path.join(folder_path, 'raw')
+        compressed_folder = os.path.join(folder_path, 'compressed')
+        
         print(f"\nProcessing object folder: {folder_name}")
         
-        # Find NEF files in the current folder
-        nef_files = glob(os.path.join(folder_path, '*.NEF'))
-        nef_files.extend(glob(os.path.join(folder_path, '*.nef')))
+        # Check if 'raw' folder already exists
+        if os.path.exists(raw_folder):
+            print(f"  Found existing 'raw' folder")
+            
+            # Find NEF files in the raw folder
+            nef_files = glob(os.path.join(raw_folder, '*.NEF'))
+            nef_files.extend(glob(os.path.join(raw_folder, '*.nef')))
+            
+            if not nef_files:
+                print(f"  No NEF files found in {folder_name}/raw, skipping...")
+                continue
+            
+            print(f"  Found {len(nef_files)} NEF files in raw folder")
+            
+        else:
+            print(f"  No 'raw' folder found, looking for NEF files in root...")
+            
+            # Find NEF files in the current folder root
+            nef_files = glob(os.path.join(folder_path, '*.NEF'))
+            nef_files.extend(glob(os.path.join(folder_path, '*.nef')))
+            
+            if not nef_files:
+                print(f"  No NEF files found in {folder_name}, skipping...")
+                continue
+            
+            print(f"  Found {len(nef_files)} NEF files in root")
+            
+            # Create 'raw' folder and move NEF files there
+            os.makedirs(raw_folder, exist_ok=True)
+            print(f"  Creating 'raw' folder and moving NEF files...")
+            
+            for nef_file in nef_files:
+                destination = os.path.join(raw_folder, os.path.basename(nef_file))
+                shutil.move(nef_file, destination)
+                print(f"    Moved: {os.path.basename(nef_file)}")
+            
+            # Update nef_files list to point to new locations
+            nef_files = glob(os.path.join(raw_folder, '*.NEF'))
+            nef_files.extend(glob(os.path.join(raw_folder, '*.nef')))
         
-        if not nef_files:
-            print(f"  No NEF files found in {folder_name}, skipping...")
-            continue
+        # Check if compressed folder already exists and has content
+        if os.path.exists(compressed_folder):
+            existing_png_files = glob(os.path.join(compressed_folder, '*.png'))
+            if existing_png_files:
+                print(f"  Compressed folder already exists with {len(existing_png_files)} PNG files")
+                
+                # Check if we need to reprocess (compare counts)
+                if len(existing_png_files) >= len(nef_files):
+                    print(f"  Skipping compression - already processed")
+                    continue
+                else:
+                    print(f"  Incomplete processing detected, reprocessing...")
         
-        print(f"  Found {len(nef_files)} NEF files")
-        
-        # Step 1a: Create 'raw' folder and move NEF files there
-        raw_folder = os.path.join(folder_path, 'raw')
-        os.makedirs(raw_folder, exist_ok=True)
-        
-        print(f"  Moving NEF files to 'raw' folder...")
-        for nef_file in nef_files:
-            destination = os.path.join(raw_folder, os.path.basename(nef_file))
-            shutil.move(nef_file, destination)
-            print(f"    Moved: {os.path.basename(nef_file)}")
-        
-        # Step 1b: Create 'compressed' folder and convert NEF to PNG
-        compressed_folder = os.path.join(folder_path, 'compressed')
+        # Create 'compressed' folder if it doesn't exist
         os.makedirs(compressed_folder, exist_ok=True)
         
         print(f"  Converting NEF files to PNG in 'compressed' folder...")
+        print(f"  Using target resolution: {leaf_resolution}px")
+        
         try:
             # Use the preprocess_NEF function to convert files
+            # The function expects the output folder to be relative to input folder
             process_nef_folder(
                 input_folder=raw_folder,
                 target_resolution=leaf_resolution,
                 output_subfolder='../compressed'  # Relative path to go up and into compressed
             )
-            print(f"  ✓ Successfully processed {folder_name}")
+            
+            # Verify the output
+            output_files = glob(os.path.join(compressed_folder, '*.png'))
+            print(f"  ✓ Successfully processed {folder_name} - created {len(output_files)} PNG files")
+            
+            # List the created files for verification
+            for png_file in sorted(output_files):
+                print(f"    Created: {os.path.basename(png_file)}")
+                
         except Exception as e:
             print(f"  ✗ Error processing {folder_name}: {str(e)}")
             continue
+        
+        print(f"  ✓ Completed processing {folder_name}")
 
 def extract_leaves_from_compressed(base_folder: str):
     """
@@ -843,7 +893,7 @@ def main():
     Main function - specify your base folder path here
     """
     # UPDATE THIS PATH TO YOUR FOLDER
-    base_folder = '/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/test_dataset'
+    base_folder = '/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/unprocessed/08-08-2025'
     # Larger image size slows down the NORMAL generation process. 
     single_leaf_image_size = 1920
     
