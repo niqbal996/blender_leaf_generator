@@ -55,17 +55,19 @@ def process_nef_folder(
             # Read NEF file using rawpy
             with rawpy.imread(nef_path) as raw:
                 # Process the raw image
-                rgb = raw.postprocess(no_auto_bright=True, use_camera_wb=True)
-            
+                rgb = raw.postprocess(no_auto_bright=False, 
+                                      use_camera_wb=True,
+                                      output_bps=8)
+
             # Convert numpy array to PIL Image
             image = Image.fromarray(rgb)
             original_size = image.size
-            print(f"  Original size: {original_size}")
+            # print(f"  Original size: {original_size}")
             
             # Resize while maintaining aspect ratio
             resized_image = resize_to_fit(image, target_resolution)
             new_size = resized_image.size
-            print(f"  Resized to: {new_size}")
+            # print(f"  Resized to: {new_size}")
             
             # Generate output filename
             base_name = os.path.splitext(os.path.basename(nef_path))[0]
