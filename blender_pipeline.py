@@ -168,6 +168,29 @@ def create_contour_based_mesh(image_path, subdivisions=10, mesh_name="ContourMes
 
     return obj
 
+def parse_asset_name(asset_folder_name):
+    """Parse asset folder name to extract category and subcategory"""
+    parts = asset_folder_name.split('_')
+    
+    if len(parts) >= 3:
+        # Handle cases like sugarbeet_small_1 or weed_A_1
+        category = parts[0]  # sugarbeet or weed
+        subcategory = parts[1]  # small or A
+        instance = '_'.join(parts[2:])  # 1 or remaining parts
+        return category, subcategory, instance
+    else:
+        # Fallback for unexpected naming
+        return parts[0] if parts else "unknown", "default", asset_folder_name
+
+def get_or_create_collection(parent_collection, collection_name):
+    """Get existing collection or create new one under parent"""
+    if collection_name not in bpy.data.collections:
+        new_collection = bpy.data.collections.new(collection_name)
+        parent_collection.children.link(new_collection)
+        return new_collection
+    else:
+        return bpy.data.collections[collection_name]
+
 def load_leaf_size_data(asset_folder_path):
     """Load leaf size data from JSON file in asset folder"""
     json_files = glob(os.path.join(asset_folder_path, '*_leaves_data.json'))
@@ -199,10 +222,17 @@ y_offset = 0.0
 spacing = 0.5  # space between leaves along Y-axis
 total_leaf_count = 0
 
+# Dictionary to track created category collections
+category_collections = {}
+subcategory_collections = {}
+
 print(f"Found {len(asset_folders)} asset folders to process")
 
 for asset_idx, asset_folder_name in enumerate(sorted(asset_folders)):
     asset_folder_path = os.path.join(base_folder, asset_folder_name)
+    
+    # Parse asset name to get category and subcategory
+    category, subcategory, instance = parse_asset_name(asset_folder_name)
     
     # Find all leaf_ folders in this asset folder
     leaf_folders = [d for d in os.listdir(asset_folder_path) 
@@ -212,15 +242,20 @@ for asset_idx, asset_folder_name in enumerate(sorted(asset_folders)):
         print(f"No leaf folders found in {asset_folder_name}, skipping...")
         continue
     
-    print(f"\nProcessing asset: {asset_folder_name} with {len(leaf_folders)} leaves")
+    print(f"\nProcessing asset: {asset_folder_name} ({category} > {subcategory}) with {len(leaf_folders)} leaves")
     
-    # Create a collection for this asset's leaves
-    asset_collection_name = f"Asset_{asset_idx+1}_{asset_folder_name}"
-    if asset_collection_name not in bpy.data.collections:
-        asset_collection = bpy.data.collections.new(asset_collection_name)
-        main_leaf_collection.children.link(asset_collection)
-    else:
-        asset_collection = bpy.data.collections[asset_collection_name]
+    # Create hierarchical collection structure
+    # 1. Get or create category collection (e.g., "sugarbeet", "weed")
+    category_key = category
+    if category_key not in category_collections:
+        category_collections[category_key] = get_or_create_collection(main_leaf_collection, category)
+    category_collection = category_collections[category_key]
+    
+    # 2. Get or create subcategory collection (e.g., "small", "A")
+    subcategory_key = f"{category}_{subcategory}"
+    if subcategory_key not in subcategory_collections:
+        subcategory_collections[subcategory_key] = get_or_create_collection(category_collection, subcategory)
+    subcategory_collection = subcategory_collections[subcategory_key]
     
     # Load leaf size data for this asset (optional - for physical scaling)
     leaf_size_data = load_leaf_size_data(asset_folder_path)
@@ -254,8 +289,8 @@ for asset_idx, asset_folder_name in enumerate(sorted(asset_folders)):
         # Extract leaf number for naming
         leaf_number = leaf_folder_name.replace('leaf_', '')
         
-        # Create unique mesh name: asset_folder_numeric_leaf_numeric
-        mesh_name = f"{asset_folder_name}_{asset_idx+1}_{leaf_folder_name}_{leaf_number}"
+        # Create unique mesh name: asset_folder_leaf_numeric
+        mesh_name = f"{asset_folder_name}_{leaf_folder_name}"
         
         total_leaf_count += 1
         
@@ -270,7 +305,7 @@ for asset_idx, asset_folder_name in enumerate(sorted(asset_folders)):
             subdivisions=3,
             mesh_name=mesh_name,
             scale=2.0,
-            collection=asset_collection
+            collection=subcategory_collection
         )
         
         if obj:
@@ -288,7 +323,7 @@ for asset_idx, asset_folder_name in enumerate(sorted(asset_folders)):
                 print(f"    Warning: Could not load image for UV editor")
             
             # Create and assign material
-            material_name = f"Material_{asset_folder_name}_{leaf_folder_name}"
+            material_name = f"{asset_folder_name}_{leaf_folder_name}_material"
             material = create_leaf_material(
                 name=material_name,
                 diffuse_path=diffuse_path,
