@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "leaf-generator"
+version = "0.1.0"
+description = "Pipeline for capturing, processing, and assembling procedural leaf assets (masks, PBR maps, keypoints) for Blender."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "pillow",
+    "scipy",
+    "scikit-image",
+    "tqdm",
+    "rawpy",
+    "exifread",
+    "imageio",
+]
+
+[project.optional-dependencies]
+# Needed by main.py / get_mask.py for BiRefNet masking and the Uni-MS-PS
+# normal-map estimation submodule.
+capture = [
+    "torch",
+    "torchvision",
+]
+dev = [
+    "pytest",
+    "debugpy",
+    # Stub package for bpy/bmesh/mathutils IDE autocompletion outside Blender.
+    "fake-bpy-module-latest",
+]
+# Experimental: estimate_plant_skeleton.py (video -> plant stem/branch/leaf
+# skeleton). pycolmap is a large, self-contained wheel (bundles COLMAP);
+# kept out of the base install since most of this repo doesn't need it.
+skeleton = [
+    "pycolmap",
+    "matplotlib",
+]
+# train_gaussian_splat.py -- trains a 3D Gaussian Splat from a "skeleton"
+# capture's COLMAP reconstruction, via gsplat. Needs the "skeleton" extra
+# too (reads its sparse/best + images/) plus a GPU: install a CUDA-matching
+# torch build first, e.g. `pip install torch --index-url
+# https://download.pytorch.org/whl/cu118`, since the default PyPI torch
+# wheel may target a different CUDA version than what's on the machine --
+# gsplat JIT-compiles its CUDA kernels via nvcc against whatever torch/CUDA
+# is present at first use.
+splat = [
+    "torch",
+    "gsplat",
+    "pytorch-msssim",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

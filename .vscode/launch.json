@@ -28,11 +28,11 @@
             "program": "Uni-MS-PS/inference_folder.py",
             "args": [
                 "--path_obj",
-                "/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/weed_ampfer_1/processed",
+                "/mnt/e/Camera_rig_data/leaf_2/processed/parallel",
                 "--nb_img",
-                "8",
+                "11",
                 "--folder_save",
-                "/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/weed_ampfer_1/",
+                "/mnt/e/Camera_rig_data/leaf_2/processed/parallel",
                 "--cuda",
                 "--weights",
                 "Uni-MS-PS/weights",
@@ -66,6 +66,21 @@
                 "PYTHONPATH": "${workspaceFolder}/Uni-MS-PS",
             },
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Attach to Blender (debugpy)",
+            "type": "debugpy",
+            "request": "attach",
+            "connect": {
+                "host": "localhost",
+                "port": 5678
+            }
+            // Requires: `pip install debugpy` into Blender's bundled Python,
+            // and blender_pipeline.py run with DEBUG = True (see README).
+            // If breakpoints don't bind because Blender reports a different
+            // path for the script (e.g. a \\wsl.localhost\... UNC path),
+            // add a "pathMappings" entry here mapping that path back to
+            // ${workspaceFolder}.
         },
     ]
 }

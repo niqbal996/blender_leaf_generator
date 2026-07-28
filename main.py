@@ -625,30 +625,14 @@ def calculate_leaf_sizes(base_folder: str):
             }
             
             try:
-                # Get NEF files
-                nef_files = glob(os.path.join(raw_folder, '*.NEF')) + glob(os.path.join(raw_folder, '*.nef'))
-                if not nef_files:
-                    pbar.set_postfix_str(f"{folder_name}: No NEF files")
+                # Find the diffuse NEF file directly
+                diffuse_nef_files = glob(os.path.join(raw_folder, '*_diffuse.NEF')) + glob(os.path.join(raw_folder, '*_diffuse.nef'))
+                if not diffuse_nef_files:
+                    pbar.set_postfix_str(f"{folder_name}: No _diffuse.NEF file")
                     continue
                 
-                # Find the diffuse NEF file
-                diffuse_files = glob(os.path.join(compressed_folder, '*_diffuse.png'))
-                if not diffuse_files:
-                    pbar.set_postfix_str(f"{folder_name}: No diffuse image")
-                    continue
-                
-                # Get the base name of the diffuse file to find corresponding NEF
-                diffuse_basename = os.path.basename(diffuse_files[0]).replace('_diffuse.png', '')
-                diffuse_nef = None
-                
-                for nef_file in nef_files:
-                    nef_basename = os.path.splitext(os.path.basename(nef_file))[0]
-                    if nef_basename == diffuse_basename:
-                        diffuse_nef = nef_file
-                        break
-                
-                if diffuse_nef is None:
-                    diffuse_nef = nef_files[0]
+                # Use the first diffuse NEF file found
+                diffuse_nef = diffuse_nef_files[0]
                 
                 pbar.set_postfix_str(f"{folder_name}: Reading EXIF data")
                 
@@ -854,16 +838,16 @@ def main():
     print(f"Starting processing of folders in: {base_folder}")
     
     # Step 1: Compress raw data
-    compress_raw_data(base_folder, leaf_resolution=single_leaf_image_size)
+    # compress_raw_data(base_folder, leaf_resolution=single_leaf_image_size)
     
-    # Step 2: Extract leaves from compressed images
-    extract_leaves_from_compressed(base_folder)
+    # # Step 2: Extract leaves from compressed images
+    # extract_leaves_from_compressed(base_folder)
     
-    # Step 3: Generate normal maps for each leaf
-    generate_normal_maps(base_folder)
+    # # Step 3: Generate normal maps for each leaf
+    # generate_normal_maps(base_folder)
     
-    # Step 4: Organize final structure
-    organize_final_structure(base_folder)
+    # # Step 4: Organize final structure
+    # organize_final_structure(base_folder)
     
     # Step 5: Calculate leaf sizes in cm
     calculate_leaf_sizes(base_folder)

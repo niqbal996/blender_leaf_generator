@@ -503,7 +503,7 @@ def process_folder_native_resolution(
             
             # Save resized image and mask (both as RGB/L without alpha)
             resized_image.save(output_image_path)
-            resized_mask.save(output_mask_path)
+            # resized_mask.save(output_mask_path)
             
             print(f"  Saved: {os.path.basename(output_image_path)} and {os.path.basename(output_mask_path)}")
             
@@ -545,8 +545,8 @@ def process_folder():
     """
     Example usage function to process a folder of images
     """
-    input_folder = '/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/leaf_8/'
-    output_folder = '/mnt/e/projects/raw_datasets/lalweco/sugarbeets/nikon_camera/leaf_8/processed/'
+    input_folder = '/mnt/e/Camera_rig_data/leaf_2/processed/parallel'
+    output_folder = '/mnt/e/Camera_rig_data/leaf_2/processed'
 
     # Load the model once
     model = lazy_load_birefnet()
@@ -563,5 +563,5 @@ def process_folder():
     
 if __name__ == "__main__":
     # main()
-    leaves()
-    # process_folder()
+    # leaves()
+    process_folder()
