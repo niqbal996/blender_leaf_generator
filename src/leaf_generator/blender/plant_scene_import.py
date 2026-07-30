@@ -18,6 +18,7 @@ import bpy
 
 _TIP_DISPLAY_TYPE = "SPHERE"
 _BRANCH_DISPLAY_TYPE = "CUBE"
+_ROOT_DISPLAY_TYPE = "CONE"
 
 
 def run(
@@ -68,10 +69,11 @@ def _get_or_create_collection(parent: bpy.types.Collection, name: str) -> bpy.ty
 
 def _create_keypoint_empties(skeleton: dict, collection: bpy.types.Collection) -> List[bpy.types.Object]:
     empties = []
+    display_types = {"tip": _TIP_DISPLAY_TYPE, "branch": _BRANCH_DISPLAY_TYPE, "root": _ROOT_DISPLAY_TYPE}
     for kp in skeleton["keypoints"]:
         empty = bpy.data.objects.new(f"{kp['kind']}_{kp['index']}", None)
-        empty.empty_display_type = _TIP_DISPLAY_TYPE if kp["kind"] == "tip" else _BRANCH_DISPLAY_TYPE
-        empty.empty_display_size = 0.01
+        empty.empty_display_type = display_types.get(kp["kind"], _BRANCH_DISPLAY_TYPE)
+        empty.empty_display_size = 0.02 if kp["kind"] == "root" else 0.01
         empty.location = kp["xyz"]
         collection.objects.link(empty)
         empties.append(empty)

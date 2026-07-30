@@ -43,19 +43,14 @@ def remove_statistical_outliers(
     return xyz[keep], (rgb[keep] if rgb is not None else None)
 
 
-def filter_by_vegetation_color(
-    xyz: np.ndarray, rgb: np.ndarray, exg_threshold: float = 0.12, min_brightness: float = 30.0
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Keep only points whose color looks like vegetation (Excess Green
-    Index > threshold), same idea as `masking.vegetation_mask` but applied
-    post-hoc to already-triangulated 3D points instead of to 2D pixels.
-
-    Prefer this over masking *before* SIFT matching when the background is
-    cluttered/textured (e.g. a hand holding the plant): masking away
-    everything but the plant *before* matching starves COLMAP of the
-    texture it needs for camera pose estimation in the first place. Here,
-    pose estimation gets the benefit of every textured pixel (fingers
-    included), and only the resulting points get filtered by color.
+def vegetation_color_mask(
+    rgb: np.ndarray, exg_threshold: float = 0.12, min_brightness: float = 30.0
+) -> np.ndarray:
+    """Boolean mask of points whose color looks like vegetation (Excess
+    Green Index > threshold). Split out from `filter_by_vegetation_color`
+    so callers that need *both* halves of the split (e.g. root detection,
+    which uses the non-vegetation/soil points too) don't have to
+    recompute it.
 
     `min_brightness` (sum of R+G+B, out of 765) guards against near-black
     pixels (e.g. dark soil): ExG is a *ratio*, so for a near-black color
@@ -68,14 +63,113 @@ def filter_by_vegetation_color(
     raw_total = r + g + b
     total = raw_total + 1e-6
     exg = 2 * (g / total) - (r / total) - (b / total)
-    keep = (exg > exg_threshold) & (raw_total > min_brightness)
+    return (exg > exg_threshold) & (raw_total > min_brightness)
+
+
+def filter_by_vegetation_color(
+    xyz: np.ndarray, rgb: np.ndarray, exg_threshold: float = 0.12, min_brightness: float = 30.0
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Keep only points whose color looks like vegetation, same idea as
+    `masking.vegetation_mask` but applied post-hoc to already-triangulated
+    3D points instead of to 2D pixels.
+
+    Prefer this over masking *before* SIFT matching when the background is
+    cluttered/textured (e.g. a hand holding the plant): masking away
+    everything but the plant *before* matching starves COLMAP of the
+    texture it needs for camera pose estimation in the first place. Here,
+    pose estimation gets the benefit of every textured pixel (fingers
+    included), and only the resulting points get filtered by color.
+    """
+    keep = vegetation_color_mask(rgb, exg_threshold=exg_threshold, min_brightness=min_brightness)
     return xyz[keep], rgb[keep]
 
 
-def keep_largest_cluster(xyz: np.ndarray, rgb: Optional[np.ndarray] = None, radius: Optional[float] = None):
-    """Keep only the largest spatially-connected cluster of points (radius
-    graph connected components) -- drops small floating groups of
-    mismatched points that survive outlier removal.
+def voxel_downsample(
+    xyz: np.ndarray, rgb: Optional[np.ndarray] = None, voxel_size: float = 0.01
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Keep one point per occupied voxel of size `voxel_size` -- a standard
+    point-cloud thinning step, used by `skeletonize.build_skeleton_graph`
+    to bring a densely-sampled cloud (many points spread over each leaf's
+    full surface) down to a sparser one before skeletonization: an MST
+    over every raw surface point zigzags across that surface and reports
+    the zigzags as spurious branches, no matter how the spur-pruning
+    threshold is tuned, because at that density the noise and the real
+    structure are the same physical size. Thinning removes the surface
+    detail an MST-based skeleton was never meant to resolve, instead of
+    fighting it with a different pruning threshold per point count.
+    """
+    if len(xyz) == 0:
+        return xyz, rgb
+    keys = np.floor(xyz / voxel_size).astype(np.int64)
+    _, first_index = np.unique(keys, axis=0, return_index=True)
+    first_index.sort()
+    return xyz[first_index], (rgb[first_index] if rgb is not None else None)
+
+
+def find_root_point(
+    xyz_plant: np.ndarray, xyz_soil: np.ndarray, max_soil_distance: Optional[float] = None
+) -> Optional[int]:
+    """Index into `xyz_plant` of the point closest to the growing medium
+    (soil/pot) -- i.e. the base of the stem, where the plant "starts".
+
+    Works in any orientation/frame (no up-axis needed): `xyz_soil` is
+    whatever 3D points got reconstructed but filtered out as non-vegetation
+    (soil, pot, background) -- COLMAP already triangulates them, they're
+    just discarded by `filter_by_vegetation_color`. The plant point nearest
+    to *any* soil point is, by definition, wherever the plant touches the
+    ground it's growing out of.
+
+    `max_soil_distance` restricts candidate soil points to ones actually
+    near the plant (default: 3x the plant cloud's own bounding-box
+    diagonal), so a far-away wall/table point that happened to survive
+    upstream filtering doesn't get treated as "the ground right under this
+    plant". Returns None if no soil points are within range (falls back to
+    an unrooted skeleton upstream).
+    """
+    if len(xyz_plant) == 0 or len(xyz_soil) == 0:
+        return None
+
+    if max_soil_distance is None:
+        plant_extent = np.linalg.norm(xyz_plant.max(axis=0) - xyz_plant.min(axis=0))
+        max_soil_distance = max(float(plant_extent) * 3.0, 1e-6)
+
+    soil_tree = cKDTree(xyz_soil)
+    dists, _ = soil_tree.query(xyz_plant, k=1)
+
+    if dists.min() > max_soil_distance:
+        return None
+    return int(np.argmin(dists))
+
+
+def keep_plant_clusters(
+    xyz: np.ndarray,
+    rgb: Optional[np.ndarray] = None,
+    radius: Optional[float] = None,
+    merge_distance_factor: float = 1.5,
+    min_cluster_size: int = 2,
+):
+    """Keep the largest spatially-connected cluster of points, *plus* any
+    other cluster close enough to plausibly be another part of the same
+    plant (a separate leaf that just didn't triangulate densely enough to
+    stay radius-connected to the rest) -- drops only clusters that are both
+    small and far away, which is what real background/mismatch noise looks
+    like.
+
+    A plant with several leaves often doesn't reconstruct as one single
+    blob: thin, sparsely-textured leaf surfaces can end up as separate
+    connected components at a tight radius even though they're all the
+    same plant. The previous version of this function (`keep_largest_
+    cluster`) kept only the single largest component, which silently
+    discarded every other leaf as if it were noise.
+
+    `radius` (default: 4x median nearest-neighbor distance) defines the
+    *fine* clustering used to find individual components. `merge_distance_
+    factor`, relative to the largest cluster's own bounding-box diagonal,
+    then decides which of those components are "close enough to the main
+    plant body" to keep -- using the plant's own size as the distance
+    scale (not the fine radius, which reflects point *density*, not plant
+    *size*, and is usually too tight to bridge a real gap between separate
+    leaves).
     """
     if len(xyz) == 0:
         return xyz, rgb
@@ -108,6 +202,22 @@ def keep_largest_cluster(xyz: np.ndarray, rgb: Optional[np.ndarray] = None, radi
     roots = np.array([find(i) for i in range(n)])
     labels, counts = np.unique(roots, return_counts=True)
     largest_label = labels[np.argmax(counts)]
+    largest_points = xyz[roots == largest_label]
+
+    if len(labels) == 1:
+        return xyz, rgb
+
+    largest_extent = np.linalg.norm(largest_points.max(axis=0) - largest_points.min(axis=0))
+    merge_distance = max(float(largest_extent) * merge_distance_factor, radius)
+
+    largest_tree = cKDTree(largest_points)
     keep = roots == largest_label
+    for label, count in zip(labels, counts):
+        if label == largest_label or count < min_cluster_size:
+            continue
+        component_points = xyz[roots == label]
+        dists, _ = largest_tree.query(component_points, k=1)
+        if dists.min() <= merge_distance:
+            keep |= roots == label
 
     return xyz[keep], (rgb[keep] if rgb is not None else None)

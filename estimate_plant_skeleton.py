@@ -6,8 +6,9 @@ an already-captured folder of still images.
 
 Pipeline: extract frames from video, or use a still-image folder as-is ->
 COLMAP sparse reconstruction (unmasked, by default -- see --mask-mode) ->
-filter 3D points by color -> point-cloud cleanup -> MST-based skeleton graph
--> render + JSON summary.
+solve the turntable's axis/soil plane and crop the plant out geometrically
+-> filter 3D points by color -> point-cloud cleanup -> trace organs outward
+from the stem base -> render + JSON summary.
 
 This is a research prototype (see src/leaf_generator/skeleton/__init__.py
 and the README's "Plant skeleton from video" section) -- inspect the point
@@ -32,13 +33,21 @@ from leaf_generator.skeleton.frames import extract_frames  # noqa: E402
 from leaf_generator.skeleton.masking import write_colmap_masks  # noqa: E402
 from leaf_generator.skeleton.pointcloud import (  # noqa: E402
     extract_xyz_rgb,
-    filter_by_vegetation_color,
-    keep_largest_cluster,
+    keep_plant_clusters,
     remove_statistical_outliers,
+    vegetation_color_mask,
 )
 from leaf_generator.skeleton.ply_io import write_ply_vertices  # noqa: E402
-from leaf_generator.skeleton.reconstruction import build_sparse_reconstruction  # noqa: E402
-from leaf_generator.skeleton.skeletonize import build_skeleton_graph  # noqa: E402
+from leaf_generator.skeleton.reconstruction import (  # noqa: E402
+    build_sparse_reconstruction,
+    get_registered_camera_poses,
+)
+from leaf_generator.skeleton.turntable import (  # noqa: E402
+    crop_to_plant,
+    find_root_point_on_ground,
+    solve_turntable_frame,
+)
+from leaf_generator.skeleton.skeletonize import build_skeleton_graph, smooth_polyline  # noqa: E402
 from leaf_generator.skeleton.visualize import plot_skeleton  # noqa: E402
 
 
@@ -51,10 +60,13 @@ def run(
     color_filter: str = "vegetation",
     color_filter_threshold: float = 0.12,
     k_neighbors: int = 8,
-    min_branch_fraction: float = 0.03,
+    min_branch_fraction: float = 0.25,
+    cover_radius_fraction: float = 0.08,
+    voxel_downsample_fraction: Optional[float] = None,
     num_threads: int = 4,
     max_image_size: int = 2000,
     use_gpu: bool = False,
+    reuse_sparse: bool = False,
 ) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     masks_dir = workdir / "masks"
@@ -78,15 +90,28 @@ def run(
         print(f"  wrote {n_masks} masks to {masks_dir}")
         mask_dir_arg = masks_dir
 
-    print("Running COLMAP sparse reconstruction (this can take a couple minutes)...")
-    reconstruction = build_sparse_reconstruction(
-        images_dir,
-        workdir,
-        mask_dir=mask_dir_arg,
-        num_threads=num_threads,
-        max_image_size=max_image_size,
-        use_gpu=use_gpu,
-    )
+    # Everything after this point is seconds of work, while the
+    # reconstruction is minutes-to-hours -- and the skeleton's two tuning
+    # knobs usually need a few passes to settle on a given plant. Reloading
+    # the model the last run already saved makes that loop practical.
+    sparse_best = workdir / "sparse" / "best"
+    if reuse_sparse and sparse_best.is_dir():
+        import pycolmap
+
+        print(f"Reusing existing sparse reconstruction from {sparse_best}...")
+        reconstruction = pycolmap.Reconstruction(str(sparse_best))
+    else:
+        if reuse_sparse:
+            print(f"(--reuse-sparse given, but {sparse_best} does not exist yet)")
+        print("Running COLMAP sparse reconstruction (this can take a couple minutes)...")
+        reconstruction = build_sparse_reconstruction(
+            images_dir,
+            workdir,
+            mask_dir=mask_dir_arg,
+            num_threads=num_threads,
+            max_image_size=max_image_size,
+            use_gpu=use_gpu,
+        )
     print(
         f"  registered {reconstruction.num_reg_images()} / {num_images} images, "
         f"{reconstruction.num_points3D()} 3D points, "
@@ -95,14 +120,49 @@ def run(
 
     xyz, rgb = extract_xyz_rgb(reconstruction)
 
+    # Geometry before color: the turntable's own axis and soil plane say
+    # which points are "the plant standing on the pot" far more reliably
+    # than greenness does. On both turntable test captures roughly half the
+    # points passing the ExG threshold sat *below* the soil plane --
+    # background foliage and green-cast highlights that no color threshold
+    # or outlier filter separates, but a cylinder crop removes outright.
+    camera_centers, viewing_dirs, _ = get_registered_camera_poses(reconstruction)
+    # The vegetation mask is computed here only to keep leaves out of the
+    # substrate fit; the actual color filtering still happens after cropping.
+    frame = solve_turntable_frame(
+        xyz,
+        camera_centers,
+        viewing_dirs,
+        is_plant=vegetation_color_mask(rgb, exg_threshold=color_filter_threshold),
+    )
+    print(
+        f"  turntable axis {frame.up.round(3).tolist()}, footprint radius "
+        f"{frame.radius:.3f} (COLMAP units)"
+    )
+    print(
+        f"  substrate top face tilted {frame.substrate_tilt_degrees:.1f} deg "
+        "from the turntable plane"
+    )
+
+    xyz, rgb = crop_to_plant(xyz, rgb, frame)
+    print(f"  {len(xyz)} points above the substrate and inside the turntable footprint")
+
     if color_filter == "vegetation":
-        print(f"Filtering points by color (ExG > {color_filter_threshold})...")
-        xyz, rgb = filter_by_vegetation_color(xyz, rgb, exg_threshold=color_filter_threshold)
+        print(f"Filtering the cropped points by color (ExG > {color_filter_threshold})...")
+        veg_mask = vegetation_color_mask(rgb, exg_threshold=color_filter_threshold)
+        xyz, rgb = xyz[veg_mask], rgb[veg_mask]
         print(f"  {len(xyz)} vegetation-colored points kept")
 
     xyz_clean, rgb_clean = remove_statistical_outliers(xyz, rgb)
-    xyz_clean, rgb_clean = keep_largest_cluster(xyz_clean, rgb_clean)
+    xyz_clean, rgb_clean = keep_plant_clusters(xyz_clean, rgb_clean)
     print(f"  point cloud after cleanup: {len(xyz_clean)} / {len(xyz)} points kept")
+
+    root_index = find_root_point_on_ground(xyz_clean, frame) if len(xyz_clean) else None
+    root_xyz = xyz_clean[root_index] if root_index is not None else None
+    if root_xyz is not None:
+        print(f"  root at {frame.heights(root_xyz[None])[0]:.4f} above the substrate top face")
+    else:
+        print("  no root point found -- skeleton will be unrooted (and will start at a leaf tip)")
 
     pointcloud_path = workdir / "pointcloud.ply"
     write_ply_vertices(
@@ -120,9 +180,15 @@ def run(
 
     print("Estimating skeleton graph...")
     skeleton = build_skeleton_graph(
-        xyz_clean, k_neighbors=k_neighbors, min_branch_length_fraction=min_branch_fraction
+        xyz_clean,
+        k_neighbors=k_neighbors,
+        root_xyz=root_xyz,
+        voxel_downsample_fraction=voxel_downsample_fraction,
+        min_branch_fraction=min_branch_fraction,
+        cover_radius_fraction=cover_radius_fraction,
     )
-    print(f"  {skeleton.num_tips} tip(s), {skeleton.num_branch_points} branch point(s)")
+    root_note = "rooted" if skeleton.root_index is not None else "unrooted"
+    print(f"  {skeleton.num_tips} tip(s), {skeleton.num_branch_points} branch point(s), {root_note}")
 
     render_path = workdir / "skeleton.png"
     plot_skeleton(skeleton, render_path, background_xyz=xyz_clean, background_rgb=rgb_clean)
@@ -138,6 +204,7 @@ def run(
         "mean_reprojection_error_px": reconstruction.compute_mean_reprojection_error(),
         "num_tips": skeleton.num_tips,
         "num_branch_points": skeleton.num_branch_points,
+        "root_index": skeleton.root_index,
         "keypoints": [
             {"index": int(idx), "kind": kind, "xyz": skeleton.points[idx].tolist()}
             for idx, kind in skeleton.keypoint_kinds.items()
@@ -150,11 +217,29 @@ def run(
                 "from_index": edge[0],
                 "to_index": edge[1],
                 "point_indices": path,
-                "points_xyz": skeleton.points[path].tolist(),
+                # Smoothed (see smooth_polyline) -- the raw MST path zigzags
+                # across the real points' scatter width instead of running
+                # down the middle; point_indices above still names exactly
+                # which raw points contributed, if needed.
+                "points_xyz": smooth_polyline(skeleton.points[path]).tolist(),
             }
             for edge, path in skeleton.branch_polylines.items()
         ],
         "pointcloud_centroid_colmap": xyz_clean.mean(axis=0).tolist(),
+        # Rig geometry, raw COLMAP frame -- `up` here is the same axis
+        # align_plant_skeleton.py solves for, recorded so the crop and root
+        # choice can be audited without re-deriving them.
+        "turntable": {
+            "up": frame.up.tolist(),
+            "axis_point": frame.axis_point.tolist(),
+            "substrate_normal": frame.substrate_normal.tolist(),
+            "substrate_point": frame.substrate_point.tolist(),
+            "substrate_tilt_degrees": frame.substrate_tilt_degrees,
+            "footprint_radius": frame.radius,
+            "root_height_above_substrate": (
+                float(frame.heights(root_xyz[None])[0]) if root_xyz is not None else None
+            ),
+        },
     }
     summary_path = workdir / "skeleton.json"
     with open(summary_path, "w") as f:
@@ -198,7 +283,33 @@ if __name__ == "__main__":
     )
     parser.add_argument("--k-neighbors", type=int, default=8, help="k for the skeleton's k-NN graph")
     parser.add_argument(
-        "--min-branch-fraction", type=float, default=0.03, help="Prune spurs shorter than this fraction of total skeleton length"
+        "--min-branch-fraction",
+        type=float,
+        default=0.25,
+        help="Shortest organ to accept, as a fraction of the longest root-to-tip distance "
+        "along the plant. Main sensitivity knob: raise it if leaf blades split into extra "
+        "branches, lower it if small leaves are missed. Because a tiny real leaf and a "
+        "fragment of a big one are the same length, this cannot go arbitrarily low.",
+    )
+    parser.add_argument(
+        "--cover-radius-fraction",
+        type=float,
+        default=0.08,
+        help="How wide a swath around each traced branch is claimed as that organ's, as a "
+        "fraction of the point cloud's bounding-box diagonal -- roughly a leaf half-width. "
+        "Too small and one blade is re-extracted as several parallel branches; too large "
+        "and a real leaf gets swallowed by its neighbor.",
+    )
+    parser.add_argument(
+        "--voxel-downsample-fraction",
+        type=float,
+        default=None,
+        help="Before skeletonizing, thin the point cloud to one point per voxel of this "
+        "fraction of the cloud's own bounding-box diagonal. Off by default: it existed to "
+        "stop the old MST skeletonizer wandering across leaf surfaces, but the level-set "
+        "skeletonizer wants dense surface coverage -- that is what puts each distance "
+        "shell's centroid on the organ's real midline. Only worth enabling for very large "
+        "clouds, where it trades midline accuracy for speed.",
     )
     parser.add_argument(
         "--num-threads",
@@ -213,6 +324,14 @@ if __name__ == "__main__":
         default=2000,
         help="Downscale images to this max dimension before SIFT extraction (COLMAP's own "
         "default is unbounded, which is a common OOM cause on phone-camera-sized photos).",
+    )
+    parser.add_argument(
+        "--reuse-sparse",
+        action="store_true",
+        help="Skip COLMAP and reload the model saved at <workdir>/sparse/best by a previous "
+        "run. The reconstruction is the slow part while everything after it takes seconds, so "
+        "use this when re-tuning --min-branch-fraction/--cover-radius-fraction on a capture "
+        "you have already reconstructed. Ignored (with a note) if that folder is absent.",
     )
     parser.add_argument(
         "--use-gpu",
@@ -236,7 +355,10 @@ if __name__ == "__main__":
         color_filter_threshold=args.color_filter_threshold,
         k_neighbors=args.k_neighbors,
         min_branch_fraction=args.min_branch_fraction,
+        cover_radius_fraction=args.cover_radius_fraction,
+        voxel_downsample_fraction=args.voxel_downsample_fraction,
         num_threads=args.num_threads,
         max_image_size=args.max_image_size,
         use_gpu=args.use_gpu,
+        reuse_sparse=args.reuse_sparse,
     )

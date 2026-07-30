@@ -30,7 +30,7 @@ from leaf_generator.skeleton.gaussian_splat import (  # noqa: E402
 )
 from leaf_generator.skeleton.pointcloud import (  # noqa: E402
     extract_xyz_rgb,
-    keep_largest_cluster,
+    keep_plant_clusters,
     remove_statistical_outliers,
 )
 
@@ -60,7 +60,7 @@ def run(
     # bits, etc.), not the skeleton-optimized green-only subset.
     xyz, rgb = extract_xyz_rgb(reconstruction)
     xyz, rgb = remove_statistical_outliers(xyz, rgb)
-    xyz, rgb = keep_largest_cluster(xyz, rgb)
+    xyz, rgb = keep_plant_clusters(xyz, rgb)
     print(f"  seeding {len(xyz)} Gaussians from the cleaned point cloud")
 
     gaussians = init_gaussians_from_pointcloud(xyz, rgb, sh_degree=sh_degree)
