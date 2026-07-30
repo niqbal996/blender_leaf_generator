@@ -34,6 +34,7 @@ from leaf_generator.skeleton.masking import write_colmap_masks  # noqa: E402
 from leaf_generator.skeleton.pointcloud import (  # noqa: E402
     extract_xyz_rgb,
     keep_plant_clusters,
+    remove_sparse_points,
     remove_statistical_outliers,
     vegetation_color_mask,
 )
@@ -62,6 +63,7 @@ def run(
     k_neighbors: int = 8,
     min_branch_fraction: float = 0.25,
     cover_radius_fraction: float = 0.08,
+    min_point_density: float = 0.30,
     voxel_downsample_fraction: Optional[float] = None,
     num_threads: int = 4,
     max_image_size: int = 2000,
@@ -155,7 +157,14 @@ def run(
 
     xyz_clean, rgb_clean = remove_statistical_outliers(xyz, rgb)
     xyz_clean, rgb_clean = keep_plant_clusters(xyz_clean, rgb_clean)
-    print(f"  point cloud after cleanup: {len(xyz_clean)} / {len(xyz)} points kept")
+    before_density = len(xyz_clean)
+    xyz_clean, rgb_clean = remove_sparse_points(
+        xyz_clean, rgb_clean, density_fraction=min_point_density
+    )
+    print(
+        f"  point cloud after cleanup: {len(xyz_clean)} / {len(xyz)} points kept "
+        f"({before_density - len(xyz_clean)} dropped as substrate debris)"
+    )
 
     root_index = find_root_point_on_ground(xyz_clean, frame) if len(xyz_clean) else None
     root_xyz = xyz_clean[root_index] if root_index is not None else None
@@ -301,6 +310,15 @@ if __name__ == "__main__":
         "and a real leaf gets swallowed by its neighbor.",
     )
     parser.add_argument(
+        "--min-point-density",
+        type=float,
+        default=0.30,
+        help="Drop points whose neighbor count is below this fraction of the cloud's median "
+        "neighbor count -- substrate grit and root hairs that pass the color filter. Worth "
+        "raising if branches still crawl along the substrate before climbing a leaf, lowering "
+        "if sparsely-reconstructed real leaves disappear.",
+    )
+    parser.add_argument(
         "--voxel-downsample-fraction",
         type=float,
         default=None,
@@ -356,6 +374,7 @@ if __name__ == "__main__":
         k_neighbors=args.k_neighbors,
         min_branch_fraction=args.min_branch_fraction,
         cover_radius_fraction=args.cover_radius_fraction,
+        min_point_density=args.min_point_density,
         voxel_downsample_fraction=args.voxel_downsample_fraction,
         num_threads=args.num_threads,
         max_image_size=args.max_image_size,

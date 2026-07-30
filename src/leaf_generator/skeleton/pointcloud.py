@@ -106,6 +106,52 @@ def voxel_downsample(
     return xyz[first_index], (rgb[first_index] if rgb is not None else None)
 
 
+def remove_sparse_points(
+    xyz: np.ndarray,
+    rgb: Optional[np.ndarray] = None,
+    radius_factor: float = 4.0,
+    density_fraction: float = 0.30,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Drop points whose local neighbor count is far below the cloud's own
+    typical density -- grit, root hairs and stray specks scattered over the
+    substrate, which a color threshold cannot reject because they genuinely
+    are slightly green.
+
+    This matters more than "a few stray points" suggests, because of *what
+    the skeletonizer does with them*. Geodesic distance is measured over a
+    k-NN graph, and a thin trail of debris across the substrate is a
+    perfectly good path through that graph -- so a leaf whose base is not
+    directly connected to the stem gets reached by routing out across the
+    ground and back, and the resulting branch crawls along the substrate
+    for a third of its length before climbing. Rejecting such branches
+    afterwards does not work: the crawl is the *shared prefix* of an
+    otherwise real leaf, so its support density averages out to something
+    respectable. The trail has to be gone before paths are computed.
+
+    `radius_factor` is in units of the cloud's median nearest-neighbor
+    distance, and the threshold is `density_fraction` of the *median*
+    neighbor count, so both adapt to how densely a given capture
+    reconstructed -- the two test captures differ by a factor of ~2.3 in
+    typical neighbor count, and any absolute cutoff that cleaned one
+    stripped real leaves off the other.
+    """
+    if len(xyz) < 4:
+        return xyz, rgb
+
+    tree = cKDTree(xyz)
+    spacing = float(np.median(tree.query(xyz, k=2)[0][:, 1]))
+    if spacing <= 0:
+        return xyz, rgb
+
+    counts = np.array([len(n) for n in tree.query_ball_point(xyz, r=radius_factor * spacing)])
+    threshold = max(int(round(density_fraction * float(np.median(counts)))), 2)
+    keep = counts >= threshold
+    if keep.sum() < 3:
+        return xyz, rgb
+
+    return xyz[keep], (rgb[keep] if rgb is not None else None)
+
+
 def find_root_point(
     xyz_plant: np.ndarray, xyz_soil: np.ndarray, max_soil_distance: Optional[float] = None
 ) -> Optional[int]:

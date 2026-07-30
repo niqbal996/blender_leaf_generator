@@ -76,6 +76,7 @@ def build_skeleton_graph(
     voxel_downsample_fraction: Optional[float] = None,
     min_branch_fraction: float = 0.25,
     cover_radius_fraction: float = 0.08,
+    min_support_density: float = 0.8,
 ) -> SkeletonGraph:
     """`root_xyz` (see `turntable.find_root_point_on_ground`) is the (3,)
     coordinate where the plant emerges from the soil, and every branch is
@@ -99,6 +100,13 @@ def build_skeleton_graph(
     Roughly a leaf's half-width. Too small and one blade is re-extracted as
     several parallel branches; too large and a real leaf is swallowed by
     its neighbor.
+
+    `min_support_density` -- how many cloud points, within the cover
+    radius, a branch must have per unit of point spacing along its length.
+    This is what rejects branches that are a handful of stray points
+    bridged across empty space (substrate grit, stray green-cast specks)
+    rather than a real organ. Lower it if sparsely-reconstructed real
+    leaves vanish; raise it if debris trails still get traced.
 
     `voxel_downsample_fraction` (a fraction of the bounding-box diagonal)
     thins the cloud first. Off by default: it existed to fight the older
@@ -127,7 +135,9 @@ def build_skeleton_graph(
     extent = float(np.linalg.norm(xyz.max(axis=0) - xyz.min(axis=0)))
     cover_radius = max(extent * cover_radius_fraction, 1e-9)
 
-    paths = _trace_branches(xyz, geodesic, predecessors, min_branch_fraction, cover_radius)
+    paths = _trace_branches(
+        xyz, geodesic, predecessors, min_branch_fraction, cover_radius, min_support_density
+    )
     nodes, adjacency, root_index = _branches_to_nodes(xyz, paths, source, cover_radius)
     xyz = nodes
 
@@ -196,6 +206,7 @@ def _trace_branches(
     predecessors: np.ndarray,
     min_branch_fraction: float,
     cover_radius: float,
+    min_support_density: float = 0.8,
 ) -> List[List[int]]:
     """Extract one path per organ, farthest point first: take the point
     geodesically farthest from the root, trace the shortest-path tree back
@@ -224,6 +235,7 @@ def _trace_branches(
     max_distance = float(geodesic.max())
     covered = np.zeros(len(xyz), dtype=bool)
     tree = cKDTree(xyz)
+    spacing = float(np.median(tree.query(xyz, k=min(2, len(xyz)))[0][:, -1])) or 1.0
     paths: List[List[int]] = []
 
     for seed in np.argsort(-geodesic):
@@ -246,12 +258,51 @@ def _trace_branches(
 
         # The new part is everything out beyond the already-claimed region.
         claimed = [i for i, point in enumerate(path) if covered[point]]
-        junction = path[claimed[0]] if claimed else path[-1]
+        junction_at = claimed[0] if claimed else len(path) - 1
+        junction = path[junction_at]
         new_length = geodesic[seed] - geodesic[junction]
         if new_length < min_branch_fraction * max_distance:
             continue
 
-        paths.append(path[::-1])  # junction (or root) -> tip
+        # A real organ is *made of* points along its whole length; a
+        # spurious branch is a few stray points bridged across empty space.
+        # Measured on the sparse test capture, the branch that crawled
+        # sideways along the substrate and the two others that looked wrong
+        # in Blender carried 0.36-0.40 supporting points per point-spacing
+        # step, against 1.23-1.89 for the three real leaves -- while on the
+        # dense capture every real branch scored above 5.9. Neither height
+        # above the substrate nor branch length separates those cases (that
+        # crawler was one of the *longest* branches, and real leaves splay
+        # down to substrate level), but support density does.
+        segment = path[: junction_at + 1]
+        supported = set()
+        for neighbors in tree.query_ball_point(xyz[segment], r=cover_radius):
+            supported.update(neighbors)
+        steps = max(new_length / spacing, 1e-9)
+        if len(supported) / steps < min_support_density:
+            continue
+
+        # Trim the branch at its true tip. The seed is the geodesically
+        # farthest point, but geodesic distance keeps growing as a path
+        # wraps around a blade's edge, so on a wide leaf the farthest point
+        # is out on the margin *past* the tip -- the traced curve then runs
+        # up the midrib, reaches the tip, and carries on hooking around the
+        # edge and back down the side. The anatomical tip is instead where
+        # straight-line distance from the leaf's attachment stops growing,
+        # since wrapping around the margin no longer takes you further from
+        # the base. Measured on the one leaf that showed this, the path ran
+        # 2.27x its own chord and reached 0.397 from its start against a
+        # 0.265 chord; every well-behaved branch sat at 1.02-1.37.
+        # Trimming drops only the overshoot beyond the tip; the path still
+        # runs back to the root, because sibling branches sharing a prefix
+        # node-for-node is what creates the branch points at all.
+        distances = np.linalg.norm(xyz[segment] - xyz[junction], axis=1)
+        trimmed = path[int(np.argmax(distances)) :]
+
+        # Claiming still uses the full traced path, not the trimmed one, so
+        # the wrapped-around margin stays claimed and cannot come back as a
+        # branch of its own.
+        paths.append(trimmed[::-1])  # root -> tip
         for neighbors in tree.query_ball_point(xyz[path], r=cover_radius):
             covered[neighbors] = True
 
