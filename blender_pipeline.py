@@ -17,7 +17,7 @@ from pathlib import Path
 # expose __file__ when a script is run via Alt+P/Run Script (e.g. for
 # unsaved or pasted text blocks), so the repo location is set explicitly
 # here rather than guessed from __file__.
-REPO_ROOT = Path(r"\\wsl.localhost\Ubuntu-20.04\home\niqbal\git\aa_blender\blender_leaf_generator")
+REPO_ROOT = Path(r"\\wsl.localhost\Ubuntu-22.04\home\niqbal\git\blender_leaf_generator")
 
 SRC_DIR = REPO_ROOT / "src"
 if not (SRC_DIR / "leaf_generator").is_dir():
@@ -61,7 +61,7 @@ from leaf_generator.blender.pipeline import run  # noqa: E402
 # viewed from inside WSL, so this reaches the same files:
 MAPS_FOLDER = os.environ.get(
     "LEAF_MAPS_PATH",
-    r"\\wsl.localhost\Ubuntu-20.04\mnt\e\Camera_rig_data\2026-07-20-Naeem\weed1\maps",
+    r"E:\Camera_rig_data\2026-07-20-Naeem\weed1\maps",
 )
 
 run(MAPS_FOLDER)

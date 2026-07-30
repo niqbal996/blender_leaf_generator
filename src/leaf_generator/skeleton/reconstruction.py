@@ -29,6 +29,9 @@ def build_sparse_reconstruction(
     output_dir: Union[str, Path],
     mask_dir: Optional[Union[str, Path]] = None,
     database_path: Optional[Union[str, Path]] = None,
+    num_threads: int = 4,
+    max_image_size: int = 2000,
+    use_gpu: bool = False,
 ):
     """Run SIFT extraction + exhaustive matching + incremental mapping.
 
@@ -36,6 +39,15 @@ def build_sparse_reconstruction(
     split a scene into multiple disconnected models if matching fails to
     fully connect it -- for a single rotating subject, one model spanning
     most/all frames is what you want).
+
+    `num_threads`/`max_image_size` default to conservative values -- COLMAP's
+    own defaults extract at full resolution with one thread per CPU core,
+    which for phone-camera-sized images (4000px+) is enough to OOM-kill the
+    process on a 32GB machine. `use_gpu` needs a CUDA-enabled pycolmap build
+    (e.g. `pip install pycolmap-cuda`, plus `nvidia-cuda-runtime-cu12` and
+    that package's lib/ dir on LD_LIBRARY_PATH if `import pycolmap` raises
+    `libcudart.so.12: cannot open shared object file`); `num_threads` is
+    ignored on the GPU path.
     """
     import pycolmap
 
@@ -51,7 +63,18 @@ def build_sparse_reconstruction(
     if mask_dir is not None:
         reader_options.mask_path = str(mask_dir)
 
-    pycolmap.extract_features(db_path, image_dir, reader_options=reader_options)
+    extraction_options = pycolmap.FeatureExtractionOptions()
+    extraction_options.num_threads = num_threads
+    extraction_options.max_image_size = max_image_size
+    extraction_options.use_gpu = use_gpu
+
+    pycolmap.extract_features(
+        db_path,
+        image_dir,
+        reader_options=reader_options,
+        extraction_options=extraction_options,
+        device=pycolmap.Device.cuda if use_gpu else pycolmap.Device.cpu,
+    )
     pycolmap.match_exhaustive(db_path)
 
     sparse_dir = output_dir / "sparse"
@@ -103,7 +126,7 @@ def get_camera_data(reconstruction, images_dir: Union[str, Path]) -> List[Camera
         camera = reconstruction.cameras[image.camera_id]
 
         world_to_camera = np.eye(4)
-        world_to_camera[:3, :] = image.cam_from_world.matrix()
+        world_to_camera[:3, :] = image.cam_from_world().matrix()
 
         views.append(
             CameraView(

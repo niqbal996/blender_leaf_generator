@@ -44,7 +44,7 @@ def remove_statistical_outliers(
 
 
 def filter_by_vegetation_color(
-    xyz: np.ndarray, rgb: np.ndarray, exg_threshold: float = 0.12
+    xyz: np.ndarray, rgb: np.ndarray, exg_threshold: float = 0.12, min_brightness: float = 30.0
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Keep only points whose color looks like vegetation (Excess Green
     Index > threshold), same idea as `masking.vegetation_mask` but applied
@@ -56,11 +56,19 @@ def filter_by_vegetation_color(
     texture it needs for camera pose estimation in the first place. Here,
     pose estimation gets the benefit of every textured pixel (fingers
     included), and only the resulting points get filtered by color.
+
+    `min_brightness` (sum of R+G+B, out of 765) guards against near-black
+    pixels (e.g. dark soil): ExG is a *ratio*, so for a near-black color
+    like (1, 2, 0) a single count of sensor/JPEG noise swings the ratio
+    wildly, letting soil-colored points randomly pass the threshold. Real
+    vegetation is never this dark, so points below `min_brightness` are
+    dropped before the ratio is even trusted.
     """
     r, g, b = rgb[:, 0].astype(np.float32), rgb[:, 1].astype(np.float32), rgb[:, 2].astype(np.float32)
-    total = r + g + b + 1e-6
+    raw_total = r + g + b
+    total = raw_total + 1e-6
     exg = 2 * (g / total) - (r / total) - (b / total)
-    keep = exg > exg_threshold
+    keep = (exg > exg_threshold) & (raw_total > min_brightness)
     return xyz[keep], rgb[keep]
 
 

@@ -111,8 +111,23 @@ def load_training_views(workdir: Union[str, Path], downsample_factor: int = 1) -
     sparse_best = workdir / "sparse" / "best"
     images_dir = workdir / "images"
     undistorted_dir = workdir / "undistorted"
+    undistorted_sparse = undistorted_dir / "sparse"
 
-    if not (undistorted_dir / "sparse").exists():
+    # Cache is only valid for the `sparse_best` it was built from -- if
+    # estimate_plant_skeleton.py was re-run (new mask mode, more images,
+    # etc.), sparse_best is newer than the stale undistorted/ cache, which
+    # would otherwise silently pair new camera poses with old undistorted
+    # images (or vice versa).
+    cache_is_stale = undistorted_sparse.exists() and any(
+        sparse_best.stat().st_mtime > f.stat().st_mtime for f in undistorted_sparse.iterdir()
+    )
+    if cache_is_stale:
+        import shutil
+
+        print(f"[gaussian_splat] {undistorted_dir} is stale (sparse_best changed) -- regenerating")
+        shutil.rmtree(undistorted_dir)
+
+    if not undistorted_sparse.exists():
         undistorted_dir.mkdir(parents=True, exist_ok=True)
         pycolmap.undistort_images(
             str(undistorted_dir), str(sparse_best), str(images_dir), output_type="COLMAP"
@@ -241,6 +256,7 @@ def train(
             width=view.width,
             height=view.height,
             sh_degree=current_sh_degree,
+            packed=False,  # must match the (also-default) packed=False the strategy below assumes
         )
         rendered = rendered[0]  # (H, W, 3)
 

@@ -22,7 +22,7 @@ from pathlib import Path
 # expose __file__ when a script is run via Alt+P/Run Script (e.g. for
 # unsaved or pasted text blocks), so the repo location is set explicitly
 # here rather than guessed from __file__.
-REPO_ROOT = Path(r"\\wsl.localhost\Ubuntu-20.04\home\niqbal\git\aa_blender\blender_leaf_generator")
+REPO_ROOT = Path(r"\\wsl.localhost\Ubuntu-22.04\home\niqbal\git\blender_leaf_generator")
 
 SRC_DIR = REPO_ROOT / "src"
 if not (SRC_DIR / "leaf_generator").is_dir():
@@ -57,7 +57,7 @@ from leaf_generator.blender.plant_scene_import import run  # noqa: E402
 # \\wsl.localhost UNC paths if a drive letter isn't visible to Blender).
 PLANT_WORKDIR = os.environ.get(
     "PLANT_WORKDIR",
-    r"\\wsl.localhost\Ubuntu-20.04\mnt\e\Camera_rig_data\2026-07-20-Naeem\weed1\skeleton_out",
+    r"E:\Camera_rig_data\turn_table_datasets\plant_1",
 )
 
 collection = run(PLANT_WORKDIR)

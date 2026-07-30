@@ -20,6 +20,7 @@ dependencies = [
     "rawpy",
     "exifread",
     "imageio",
+    "matplotlib",
 ]
 
 [project.optional-dependencies]
@@ -40,6 +41,23 @@ dev = [
 # kept out of the base install since most of this repo doesn't need it.
 skeleton = [
     "pycolmap",
+    "matplotlib",
+]
+# Same as "skeleton", but with GPU-accelerated SIFT feature extraction
+# (pycolmap-cuda instead of pycolmap -- CPU SIFT on phone-camera-sized
+# images is easy to OOM-kill with the default thread-per-core extraction).
+# After installing, `import pycolmap` may raise "libcudart.so.12: cannot
+# open shared object file" if no CUDA runtime is on the system already;
+# nvidia-cuda-runtime-cu12 provides one, but its lib/ dir still needs to be
+# on LD_LIBRARY_PATH, e.g.:
+#   conda env config vars set LD_LIBRARY_PATH=$(python -c \
+#     "import nvidia.cuda_runtime as m, os; print(os.path.join(m.__path__[0], 'lib'))")
+# Mutually exclusive with "skeleton"/"splat" (or plain "pycolmap") in the
+# same environment -- both packages install into the same `pycolmap`
+# importable module, so whichever installs last wins.
+skeleton-gpu = [
+    "pycolmap-cuda",
+    "nvidia-cuda-runtime-cu12",
     "matplotlib",
 ]
 # train_gaussian_splat.py -- trains a 3D Gaussian Splat from a "skeleton"

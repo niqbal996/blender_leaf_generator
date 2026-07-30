@@ -52,6 +52,9 @@ def run(
     color_filter_threshold: float = 0.12,
     k_neighbors: int = 8,
     min_branch_fraction: float = 0.03,
+    num_threads: int = 4,
+    max_image_size: int = 2000,
+    use_gpu: bool = False,
 ) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     masks_dir = workdir / "masks"
@@ -76,7 +79,14 @@ def run(
         mask_dir_arg = masks_dir
 
     print("Running COLMAP sparse reconstruction (this can take a couple minutes)...")
-    reconstruction = build_sparse_reconstruction(images_dir, workdir, mask_dir=mask_dir_arg)
+    reconstruction = build_sparse_reconstruction(
+        images_dir,
+        workdir,
+        mask_dir=mask_dir_arg,
+        num_threads=num_threads,
+        max_image_size=max_image_size,
+        use_gpu=use_gpu,
+    )
     print(
         f"  registered {reconstruction.num_reg_images()} / {num_images} images, "
         f"{reconstruction.num_points3D()} 3D points, "
@@ -190,6 +200,28 @@ if __name__ == "__main__":
     parser.add_argument(
         "--min-branch-fraction", type=float, default=0.03, help="Prune spurs shorter than this fraction of total skeleton length"
     )
+    parser.add_argument(
+        "--num-threads",
+        type=int,
+        default=4,
+        help="Threads for COLMAP SIFT feature extraction. Lower this (or --max-image-size) if "
+        "extraction gets OOM-killed -- each thread holds a full decoded image in memory.",
+    )
+    parser.add_argument(
+        "--max-image-size",
+        type=int,
+        default=2000,
+        help="Downscale images to this max dimension before SIFT extraction (COLMAP's own "
+        "default is unbounded, which is a common OOM cause on phone-camera-sized photos).",
+    )
+    parser.add_argument(
+        "--use-gpu",
+        action="store_true",
+        help="Run SIFT feature extraction on the GPU instead of CPU threads (--num-threads is "
+        "then ignored). Requires a CUDA-enabled pycolmap build, e.g. `pip install pycolmap-cuda` "
+        "plus `pip install nvidia-cuda-runtime-cu12` if `import pycolmap` complains about "
+        "libcudart.so.12.",
+    )
     args = parser.parse_args()
     if (args.video is None) == (args.images is None):
         parser.error("Provide exactly one of --video or --images")
@@ -204,4 +236,7 @@ if __name__ == "__main__":
         color_filter_threshold=args.color_filter_threshold,
         k_neighbors=args.k_neighbors,
         min_branch_fraction=args.min_branch_fraction,
+        num_threads=args.num_threads,
+        max_image_size=args.max_image_size,
+        use_gpu=args.use_gpu,
     )

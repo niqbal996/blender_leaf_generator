@@ -113,6 +113,20 @@ def _import_pointcloud(ply_path: Path, collection: bpy.types.Collection) -> None
     _reparent_new_objects(before, collection)
 
 
+def _find_kiri_import_ply_op():
+    """The KIRI 3DGS Render add-on's import operator lives under the `sna`
+    namespace with an auto-generated hash suffix on its bl_idname (e.g.
+    `sna.dgs_render_import_ply_e0a3a`) that has changed across the add-on's
+    own releases -- so match by prefix instead of hardcoding one hash.
+    """
+    if not hasattr(bpy.ops, "sna"):
+        return None
+    for name in dir(bpy.ops.sna):
+        if name.startswith("dgs_render_import_ply"):
+            return getattr(bpy.ops.sna, name)
+    return None
+
+
 def _import_splat(splat_ply_path: Path, collection: bpy.types.Collection) -> None:
     if not splat_ply_path.exists():
         print(
@@ -121,7 +135,8 @@ def _import_splat(splat_ply_path: Path, collection: bpy.types.Collection) -> Non
         )
         return
 
-    if not hasattr(bpy.ops.import_scene, "kiri_gaussian_splat"):
+    import_op = _find_kiri_import_ply_op()
+    if import_op is None:
         print(
             "[leaf_generator] KIRI 3DGS Render add-on not installed -- skipping splat import. "
             f"Install it (https://github.com/Kiri-Innovation/3dgs-render-blender-addon), then "
@@ -129,10 +144,18 @@ def _import_splat(splat_ply_path: Path, collection: bpy.types.Collection) -> Non
         )
         return
 
+    # The add-on's import operator defaults to "Verts" mode, which imports
+    # the raw mesh points only (looks like a plain point cloud). "Faces"
+    # mode is what actually appends its KIRI_3DGS_Render_GN geometry-nodes
+    # setup that turns each point into a shaded, oriented Gaussian splat.
+    if hasattr(bpy.context.scene, "sna_dgs_scene_properties"):
+        bpy.context.scene.sna_dgs_scene_properties.import_face_vert = "Faces"
+
     before = set(bpy.data.objects)
-    # auto_center must be False -- splat_blender.ply is already aligned/scaled by
-    # align_plant_skeleton.py; auto-centering here would undo that.
-    bpy.ops.import_scene.kiri_gaussian_splat(filepath=str(splat_ply_path), auto_center=False)
+    # No auto-center option on this operator (unlike some older 3DGS Blender
+    # importers) -- splat_blender.ply is already aligned/scaled by
+    # align_plant_skeleton.py, so there's nothing to disable here.
+    import_op(filepath=str(splat_ply_path))
     _reparent_new_objects(before, collection)
 
 
