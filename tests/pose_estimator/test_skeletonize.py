@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from leaf_generator.skeleton.skeletonize import build_skeleton_graph
+from pose_estimator.skeletonize import build_skeleton_graph
 
 
 def _sample_segment(p0, p1, n, rng, noise=0.02):
@@ -20,14 +20,19 @@ def _y_shaped_plant(rng):
     return np.vstack([stem, branch_a, branch_b])
 
 
-def test_y_shaped_plant_has_one_branch_and_three_tips():
+def test_y_shaped_plant_has_one_branch_and_three_endpoints():
+    """3 degree-1 endpoints, but only 2 are "tips": with no `root_xyz` given,
+    the skeletonizer still picks one endpoint as the root and labels it
+    "root", so `num_tips` is endpoints-minus-one by design.
+    """
     rng = np.random.default_rng(0)
     xyz = _y_shaped_plant(rng)
 
     skeleton = build_skeleton_graph(xyz, k_neighbors=6)
 
     assert skeleton.num_branch_points == 1
-    assert skeleton.num_tips == 3
+    assert skeleton.num_tips == 2
+    assert sum(1 for k in skeleton.keypoint_kinds.values() if k == "root") == 1
 
 
 def test_y_shaped_plant_branch_point_near_junction():
@@ -42,14 +47,15 @@ def test_y_shaped_plant_branch_point_near_junction():
     assert np.linalg.norm(branch_point - np.array([0, 0, 5])) < 0.5
 
 
-def test_straight_line_has_two_tips_no_branch():
+def test_straight_line_has_root_and_one_tip_no_branch():
     rng = np.random.default_rng(2)
     xyz = _sample_segment([0, 0, 0], [0, 0, 10], 50, rng)
 
     skeleton = build_skeleton_graph(xyz, k_neighbors=6)
 
     assert skeleton.num_branch_points == 0
-    assert skeleton.num_tips == 2
+    assert skeleton.num_tips == 1
+    assert sum(1 for k in skeleton.keypoint_kinds.values() if k == "root") == 1
 
 
 def test_short_spur_gets_pruned():
@@ -61,10 +67,10 @@ def test_short_spur_gets_pruned():
     tiny_spur = _sample_segment([0, 0, 5], [0.15, 0, 5.05], 4, rng, noise=0.005)
     xyz = np.vstack([stem, tiny_spur])
 
-    skeleton = build_skeleton_graph(xyz, k_neighbors=6, min_branch_length_fraction=0.03)
+    skeleton = build_skeleton_graph(xyz, k_neighbors=6, min_branch_fraction=0.03)
 
     assert skeleton.num_branch_points == 0
-    assert skeleton.num_tips == 2
+    assert skeleton.num_tips == 1
 
 
 def test_too_few_points_raises():

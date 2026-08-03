@@ -2,7 +2,7 @@
 plant capture, and bake it into Blender-ready copies of the skeleton, point
 cloud, and (if trained) Gaussian Splat.
 
-    python align_plant_skeleton.py --workdir out/plant1/ \\
+    pose-align-skeleton --workdir out/plant1/ \\
         --scale-ref-a 3 --scale-ref-b 9 --scale-ref-distance-m 0.084
 
 `--scale-ref-a`/`--scale-ref-b` are `skeleton.json` keypoint indices (the
@@ -13,7 +13,7 @@ those same two plant features (calipers, ruler) and pass it as
 solves rotation/recentering but leaves scale at 1.0 (not metric) with a
 loud warning.
 
-This step reuses `estimate_plant_skeleton.py`'s `sparse/best/` (no COLMAP
+This step reuses `pose-estimate-skeleton`'s `sparse/best/` (no COLMAP
 rerun) and is cheap -- safe to re-run any time a better scale reference is
 found, without retraining the splat.
 
@@ -23,20 +23,14 @@ Writes into --workdir: `alignment.json`, `skeleton_blender.json`,
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parent
-SRC_DIR = REPO_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-from leaf_generator.skeleton.alignment import solve_alignment, solve_scale_from_reference  # noqa: E402
-from leaf_generator.skeleton.ply_io import read_ply_vertices, write_ply_vertices  # noqa: E402
-from leaf_generator.skeleton.reconstruction import get_registered_camera_poses  # noqa: E402
+from pose_estimator.alignment import solve_alignment, solve_scale_from_reference
+from pose_estimator.ply_io import read_ply_vertices, write_ply_vertices
+from pose_estimator.reconstruction import get_registered_camera_poses
 
 
 def run(
@@ -145,7 +139,7 @@ def _bake_pointcloud(workdir: Path, alignment) -> None:
 def _bake_splat(workdir: Path, alignment) -> None:
     splat_path = workdir / "splat.ply"
     if not splat_path.exists():
-        print(f"  (skipping splat bake -- {splat_path} not found; run train_gaussian_splat.py first if you want one)")
+        print(f"  (skipping splat bake -- {splat_path} not found; run pose-train-splat first if you want one)")
         return
 
     fields = read_ply_vertices(splat_path)
@@ -172,15 +166,15 @@ def _bake_splat(workdir: Path, alignment) -> None:
     print(f"  aligned splat ({n} Gaussians) saved to {out_path}")
 
 
-if __name__ == "__main__":
+def main(argv: Optional[list] = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--workdir", required=True, type=Path, help="Same --workdir used by estimate_plant_skeleton.py")
+    parser.add_argument("--workdir", required=True, type=Path, help="Same --workdir used by pose-estimate-skeleton")
     parser.add_argument("--scale-factor", type=float, help="Precomputed meters-per-COLMAP-unit scale")
     parser.add_argument("--scale-ref-a", type=int, help="First skeleton.json keypoint index for a scale reference")
     parser.add_argument("--scale-ref-b", type=int, help="Second skeleton.json keypoint index for a scale reference")
     parser.add_argument("--scale-ref-distance-m", type=float, help="Measured real-world distance between the two reference points, in meters")
     parser.add_argument("--no-recenter", action="store_true", help="Don't translate the point cloud centroid to the origin")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     scale_ref_args = [args.scale_ref_a, args.scale_ref_b, args.scale_ref_distance_m]
     if any(a is not None for a in scale_ref_args) and not all(a is not None for a in scale_ref_args):
@@ -195,3 +189,7 @@ if __name__ == "__main__":
         scale_ref=scale_ref,
         recenter=not args.no_recenter,
     )
+
+
+if __name__ == "__main__":
+    main()

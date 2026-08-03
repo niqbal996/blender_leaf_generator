@@ -231,7 +231,7 @@ def solve_turntable_frame(
     """Recover the full rig geometry from the reconstruction.
 
     `up` reuses the same camera-orbit-plane-normal estimate that
-    `align_plant_skeleton.py` already solves for (see `alignment.
+    `pose-align-skeleton` already solves for (see `alignment.
     estimate_up_axis`/`orient_up_axis`), so the skeleton is built in the
     same orientation it will later be aligned into, rather than in an
     orientation-free frame that has to be reconciled afterwards.

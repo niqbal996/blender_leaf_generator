@@ -1,11 +1,11 @@
 """CLI: train a 3D Gaussian Splat from a plant capture already processed by
-`estimate_plant_skeleton.py` (needs that script's `sparse/best/` + `images/`
+`pose-estimate-skeleton` (needs that script's `sparse/best/` + `images/`
 in the same --workdir).
 
-    python train_gaussian_splat.py --workdir out/plant1/ --iterations 30000
+    pose-train-splat --workdir out/plant1/ --iterations 30000
 
 Writes `splat.ply` into --workdir, in the same raw COLMAP frame as
-`skeleton.json`/`pointcloud.ply` -- see `align_plant_skeleton.py` to bake in
+`skeleton.json`/`pointcloud.ply` -- see `pose-align-skeleton` to bake in
 real-world scale/orientation before viewing it in Blender.
 
 Requires the "skeleton" extra (for the COLMAP reconstruction) and the
@@ -14,21 +14,16 @@ CUDA-matching torch build -- see the README.
 """
 
 import argparse
-import sys
 from pathlib import Path
+from typing import Optional
 
-REPO_ROOT = Path(__file__).resolve().parent
-SRC_DIR = REPO_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-from leaf_generator.skeleton.gaussian_splat import (  # noqa: E402
+from pose_estimator.gaussian_splat import (
     init_gaussians_from_pointcloud,
     load_training_views,
     train,
     write_gaussian_ply,
 )
-from leaf_generator.skeleton.pointcloud import (  # noqa: E402
+from pose_estimator.pointcloud import (
     extract_xyz_rgb,
     keep_plant_clusters,
     remove_statistical_outliers,
@@ -47,7 +42,7 @@ def run(
     sparse_best = workdir / "sparse" / "best"
     if not sparse_best.exists():
         raise FileNotFoundError(
-            f"{sparse_best} not found -- run estimate_plant_skeleton.py on this "
+            f"{sparse_best} not found -- run pose-estimate-skeleton on this "
             "--workdir first (this trainer reuses its COLMAP reconstruction)."
         )
 
@@ -75,13 +70,13 @@ def run(
     splat_path = workdir / "splat.ply"
     write_gaussian_ply(splat_path, trained)
     print(f"  splat saved to {splat_path} (raw COLMAP frame -- not yet aligned/scaled)")
-    print("  run align_plant_skeleton.py next to bake in real-world scale/orientation.")
+    print("  run pose-align-skeleton next to bake in real-world scale/orientation.")
 
 
-if __name__ == "__main__":
+def main(argv: Optional[list] = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--workdir", required=True, type=Path, help="Same --workdir passed to estimate_plant_skeleton.py"
+        "--workdir", required=True, type=Path, help="Same --workdir passed to pose-estimate-skeleton"
     )
     parser.add_argument("--iterations", type=int, default=30000, help="Training iterations")
     parser.add_argument(
@@ -98,7 +93,7 @@ if __name__ == "__main__":
         help="Train against images downsampled by this factor (2-4 speeds up training substantially "
         "with modest quality loss -- mirrors gsplat's own examples' --data_factor)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     run(
         workdir=args.workdir,
@@ -107,3 +102,7 @@ if __name__ == "__main__":
         sh_degree=args.sh_degree,
         image_downsample_factor=args.image_downsample_factor,
     )
+
+
+if __name__ == "__main__":
+    main()

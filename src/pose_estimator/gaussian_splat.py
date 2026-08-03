@@ -114,7 +114,7 @@ def load_training_views(workdir: Union[str, Path], downsample_factor: int = 1) -
     undistorted_sparse = undistorted_dir / "sparse"
 
     # Cache is only valid for the `sparse_best` it was built from -- if
-    # estimate_plant_skeleton.py was re-run (new mask mode, more images,
+    # pose-estimate-skeleton was re-run (new mask mode, more images,
     # etc.), sparse_best is newer than the stale undistorted/ cache, which
     # would otherwise silently pair new camera poses with old undistorted
     # images (or vice versa).

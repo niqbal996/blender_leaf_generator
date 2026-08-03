@@ -1,6 +1,6 @@
 import numpy as np
 
-from leaf_generator.skeleton.ply_io import read_ply_vertices, write_ply_vertices
+from pose_estimator.ply_io import read_ply_vertices, write_ply_vertices
 
 
 def test_round_trip_preserves_names_and_values(tmp_path):

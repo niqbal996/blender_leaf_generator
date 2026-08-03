@@ -192,3 +192,11 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# --- pose_estimator pipeline ---
+# Vendored SAM2 clone (facebookresearch, Apache-2.0) -- see DECISIONS.md.
+# Cloned rather than submoduled so it can be pinned/patched independently.
+third_party/
+# Model weights: hundreds of MB, re-downloadable from the upstream URLs.
+checkpoints/
+# Per-specimen run artifacts (frames, masks, meshes, splats).
+runs/

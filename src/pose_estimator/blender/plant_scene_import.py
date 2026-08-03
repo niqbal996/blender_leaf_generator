@@ -1,8 +1,8 @@
 """Build a Blender scene for one plant capture: skeleton curves + keypoint
-Empties from `align_plant_skeleton.py`'s baked `skeleton_blender.json`,
+Empties from `pose-align-skeleton`'s baked `skeleton_blender.json`,
 optionally a sanity-check point-cloud mesh, and (if the KIRI 3DGS Render
 add-on is installed) the trained splat -- all already aligned to real-world
-meters, Z-up by `align_plant_skeleton.py`, so nothing needs a live transform
+meters, Z-up by `pose-align-skeleton`, so nothing needs a live transform
 object in Blender; everything just drops in at the right place/scale.
 
 Entry point: `run(workdir)`.
@@ -32,8 +32,8 @@ def run(
     skeleton_path = workdir / "skeleton_blender.json"
     if not skeleton_path.exists():
         raise FileNotFoundError(
-            f"[leaf_generator] {skeleton_path} not found -- run align_plant_skeleton.py on this "
-            "workdir first (this needs its aligned/scaled output, not estimate_plant_skeleton.py's "
+            f"[pose_estimator] {skeleton_path} not found -- run pose-align-skeleton on this "
+            "workdir first (this needs its aligned/scaled output, not pose-estimate-skeleton's "
             "raw skeleton.json)."
         )
 
@@ -52,7 +52,7 @@ def run(
         _import_splat(workdir / "splat_blender.ply", collection)
 
     print(
-        f"[leaf_generator] Plant scene built under collection '{collection_name}': "
+        f"[pose_estimator] Plant scene built under collection '{collection_name}': "
         f"{len(keypoint_empties)} keypoint(s), {len(skeleton['branch_polylines'])} branch curve(s)."
     )
     return collection
@@ -101,7 +101,7 @@ def _create_branch_curves(skeleton: dict, collection: bpy.types.Collection, beve
 
 def _import_pointcloud(ply_path: Path, collection: bpy.types.Collection) -> None:
     if not ply_path.exists():
-        print(f"[leaf_generator] (skipping point cloud import -- {ply_path} not found)")
+        print(f"[pose_estimator] (skipping point cloud import -- {ply_path} not found)")
         return
 
     before = set(bpy.data.objects)
@@ -110,7 +110,7 @@ def _import_pointcloud(ply_path: Path, collection: bpy.types.Collection) -> None
     elif hasattr(bpy.ops.import_mesh, "ply"):
         bpy.ops.import_mesh.ply(filepath=str(ply_path))
     else:
-        print("[leaf_generator] No PLY importer found in this Blender version -- skipping point cloud import.")
+        print("[pose_estimator] No PLY importer found in this Blender version -- skipping point cloud import.")
         return
     _reparent_new_objects(before, collection)
 
@@ -132,15 +132,15 @@ def _find_kiri_import_ply_op():
 def _import_splat(splat_ply_path: Path, collection: bpy.types.Collection) -> None:
     if not splat_ply_path.exists():
         print(
-            f"[leaf_generator] (skipping splat import -- {splat_ply_path} not found; run "
-            "train_gaussian_splat.py then align_plant_skeleton.py first if you want one)"
+            f"[pose_estimator] (skipping splat import -- {splat_ply_path} not found; run "
+            "pose-train-splat then pose-align-skeleton first if you want one)"
         )
         return
 
     import_op = _find_kiri_import_ply_op()
     if import_op is None:
         print(
-            "[leaf_generator] KIRI 3DGS Render add-on not installed -- skipping splat import. "
+            "[pose_estimator] KIRI 3DGS Render add-on not installed -- skipping splat import. "
             f"Install it (https://github.com/Kiri-Innovation/3dgs-render-blender-addon), then "
             f"re-run, or import {splat_ply_path} manually."
         )
@@ -156,7 +156,7 @@ def _import_splat(splat_ply_path: Path, collection: bpy.types.Collection) -> Non
     before = set(bpy.data.objects)
     # No auto-center option on this operator (unlike some older 3DGS Blender
     # importers) -- splat_blender.ply is already aligned/scaled by
-    # align_plant_skeleton.py, so there's nothing to disable here.
+    # pose-align-skeleton, so there's nothing to disable here.
     import_op(filepath=str(splat_ply_path))
     _reparent_new_objects(before, collection)
 

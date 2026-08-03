@@ -1,8 +1,8 @@
 import numpy as np
 
-from leaf_generator.skeleton.pointcloud import (
+from pose_estimator.pointcloud import (
     filter_by_vegetation_color,
-    keep_largest_cluster,
+    keep_plant_clusters,
     remove_statistical_outliers,
 )
 
@@ -36,14 +36,31 @@ def test_remove_statistical_outliers_drops_far_point():
     assert not np.any(np.all(xyz_kept == outlier, axis=1))
 
 
-def test_keep_largest_cluster_drops_small_floating_group():
+def test_keep_plant_clusters_drops_small_distant_group():
     rng = np.random.default_rng(1)
     main = rng.normal(scale=0.1, size=(40, 3))
     floater = rng.normal(loc=[20, 20, 20], scale=0.1, size=(5, 3))
     xyz = np.vstack([main, floater])
 
-    xyz_kept, _ = keep_largest_cluster(xyz)
+    xyz_kept, _ = keep_plant_clusters(xyz)
 
     # Allow a rare Gaussian-tail point to also fall outside the auto radius;
     # what matters is the floater group is gone and most of main is kept.
     assert 38 <= len(xyz_kept) <= 40
+
+
+def test_keep_plant_clusters_keeps_nearby_second_cluster():
+    """The reason this replaced `keep_largest_cluster`: a real leaf that
+    reconstructs too sparsely to stay radius-connected to the main body is a
+    *separate component*, but it sits within the plant's own size scale --
+    keeping only the largest component silently discarded it.
+    """
+    rng = np.random.default_rng(2)
+    main = rng.normal(scale=0.1, size=(40, 3))
+    # ~1 bbox-diagonal away from main: a detached leaf, not background noise.
+    nearby_leaf = rng.normal(loc=[0.7, 0, 0], scale=0.05, size=(10, 3))
+    xyz = np.vstack([main, nearby_leaf])
+
+    xyz_kept, _ = keep_plant_clusters(xyz)
+
+    assert len(xyz_kept) > 40, "the nearby detached cluster should be kept, not pruned"

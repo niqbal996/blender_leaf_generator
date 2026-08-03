@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from leaf_generator.skeleton.alignment import (
+from pose_estimator.alignment import (
     Alignment,
     estimate_up_axis,
     orient_up_axis,

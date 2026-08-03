@@ -10,7 +10,7 @@ Binary support exists specifically to read back the ply gsplat's own
 `export_splats` writes (binary_little_endian, for file size -- a trained
 splat can be a million+ Gaussians, and ASCII would bloat that badly) without
 needing `torch`/`gsplat` imported just to transform an already-trained file
-(see `align_plant_skeleton.py`'s alignment-baking step).
+(see `pose-align-skeleton`'s alignment-baking step).
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from leaf_generator.skeleton.masking import black_background_mask, vegetation_mask
+from pose_estimator.masking import black_background_mask, vegetation_mask
 
 
 def _synthetic_hand_and_plant_frame(size=300):

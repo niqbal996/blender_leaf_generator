@@ -1,8 +1,8 @@
 """CLI: estimate a plant's stem/branch/tip skeleton from a rotation video or
 an already-captured folder of still images.
 
-    python estimate_plant_skeleton.py --video path/to/video.MOV --workdir out/
-    python estimate_plant_skeleton.py --images path/to/stills/ --workdir out/
+    pose-estimate-skeleton --video path/to/video.MOV --workdir out/
+    pose-estimate-skeleton --images path/to/stills/ --workdir out/
 
 Pipeline: extract frames from video, or use a still-image folder as-is ->
 COLMAP sparse reconstruction (unmasked, by default -- see --mask-mode) ->
@@ -10,7 +10,7 @@ solve the turntable's axis/soil plane and crop the plant out geometrically
 -> filter 3D points by color -> point-cloud cleanup -> trace organs outward
 from the stem base -> render + JSON summary.
 
-This is a research prototype (see src/leaf_generator/skeleton/__init__.py
+This is a research prototype (see src/pose_estimator/__init__.py
 and the README's "Plant skeleton from video" section) -- inspect the point
 cloud render alongside the skeleton, don't trust the graph blindly, since
 the whole pipeline lives or dies on how clean the source images are.
@@ -20,36 +20,30 @@ Requires the "skeleton" extra: pip install -e ".[skeleton]"
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from typing import Optional
 
-REPO_ROOT = Path(__file__).resolve().parent
-SRC_DIR = REPO_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-from leaf_generator.skeleton.frames import extract_frames  # noqa: E402
-from leaf_generator.skeleton.masking import write_colmap_masks  # noqa: E402
-from leaf_generator.skeleton.pointcloud import (  # noqa: E402
+from pose_estimator.frames import extract_frames
+from pose_estimator.masking import write_colmap_masks
+from pose_estimator.pointcloud import (
     extract_xyz_rgb,
     keep_plant_clusters,
     remove_sparse_points,
     remove_statistical_outliers,
     vegetation_color_mask,
 )
-from leaf_generator.skeleton.ply_io import write_ply_vertices  # noqa: E402
-from leaf_generator.skeleton.reconstruction import (  # noqa: E402
+from pose_estimator.ply_io import write_ply_vertices
+from pose_estimator.reconstruction import (
     build_sparse_reconstruction,
     get_registered_camera_poses,
 )
-from leaf_generator.skeleton.turntable import (  # noqa: E402
+from pose_estimator.turntable import (
     crop_to_plant,
     find_root_point_on_ground,
     solve_turntable_frame,
 )
-from leaf_generator.skeleton.skeletonize import build_skeleton_graph, smooth_polyline  # noqa: E402
-from leaf_generator.skeleton.visualize import plot_skeleton  # noqa: E402
+from pose_estimator.skeletonize import build_skeleton_graph, smooth_polyline
+from pose_estimator.visualize import plot_skeleton
 
 
 def run(
@@ -219,7 +213,7 @@ def run(
             for idx, kind in skeleton.keypoint_kinds.items()
         ],
         # Raw COLMAP frame (unitless, arbitrary orientation) -- see
-        # align_plant_skeleton.py for solving+baking real-world alignment.
+        # pose-align-skeleton for solving+baking real-world alignment.
         "edges": [list(edge) for edge in skeleton.simplified_edges],
         "branch_polylines": [
             {
@@ -236,7 +230,7 @@ def run(
         ],
         "pointcloud_centroid_colmap": xyz_clean.mean(axis=0).tolist(),
         # Rig geometry, raw COLMAP frame -- `up` here is the same axis
-        # align_plant_skeleton.py solves for, recorded so the crop and root
+        # pose-align-skeleton solves for, recorded so the crop and root
         # choice can be audited without re-deriving them.
         "turntable": {
             "up": frame.up.tolist(),
@@ -256,7 +250,7 @@ def run(
     print(f"  summary saved to {summary_path}")
 
 
-if __name__ == "__main__":
+def main(argv: Optional[list] = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--video", type=Path, help="Path to the rotation video")
     parser.add_argument(
@@ -359,7 +353,7 @@ if __name__ == "__main__":
         "plus `pip install nvidia-cuda-runtime-cu12` if `import pycolmap` complains about "
         "libcudart.so.12.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if (args.video is None) == (args.images is None):
         parser.error("Provide exactly one of --video or --images")
 
@@ -381,3 +375,7 @@ if __name__ == "__main__":
         use_gpu=args.use_gpu,
         reuse_sparse=args.reuse_sparse,
     )
+
+
+if __name__ == "__main__":
+    main()

@@ -4,14 +4,18 @@
 Builds a "Plant" collection from one plant capture's aligned output: skeleton
 curves + tip/branch Empties, a sanity-check point-cloud mesh, and (if the
 KIRI 3DGS Render add-on is installed) the trained Gaussian Splat -- all
-already in real-world meters, Z-up, courtesy of `align_plant_skeleton.py`.
+already in real-world meters, Z-up, courtesy of `pose-align-skeleton`.
 
 Update PLANT_WORKDIR below (or set the PLANT_WORKDIR environment variable) to
 point at a plant's --workdir (the same one passed to
-estimate_plant_skeleton.py / train_gaussian_splat.py / align_plant_skeleton.py),
-then run this script inside Blender. Needs align_plant_skeleton.py to have
-already been run on that workdir (it reads `skeleton_blender.json`, not the
-raw `skeleton.json`).
+`pose-estimate-skeleton` / `pose-train-splat` / `pose-align-skeleton`), then
+run this script inside Blender. Needs `pose-align-skeleton` to have already
+been run on that workdir (it reads `skeleton_blender.json`, not the raw
+`skeleton.json`).
+
+This stays a loose script at the repo root, rather than moving into
+`src/pose_estimator/`, because Blender needs a real file path to open in its
+Text Editor or pass to `blender --python`.
 """
 
 import os
@@ -25,18 +29,18 @@ from pathlib import Path
 REPO_ROOT = Path(r"\\wsl.localhost\Ubuntu-22.04\home\niqbal\git\blender_leaf_generator")
 
 SRC_DIR = REPO_ROOT / "src"
-if not (SRC_DIR / "leaf_generator").is_dir():
+if not (SRC_DIR / "pose_estimator").is_dir():
     raise RuntimeError(
-        f"leaf_generator package not found at {SRC_DIR}. "
+        f"pose_estimator package not found at {SRC_DIR}. "
         f"Update REPO_ROOT at the top of this script to the actual repo path."
     )
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-# Force a fresh import of leaf_generator every run -- see blender_pipeline.py
+# Force a fresh import of pose_estimator every run -- see blender_pipeline.py
 # for why (Blender caches sys.modules across Alt+P re-runs within a session).
 for _module_name in list(sys.modules):
-    if _module_name == "leaf_generator" or _module_name.startswith("leaf_generator."):
+    if _module_name == "pose_estimator" or _module_name.startswith("pose_estimator."):
         del sys.modules[_module_name]
 
 # --- Optional: attach the VS Code debugger before running -- see README's
@@ -46,10 +50,10 @@ if DEBUG:
     import debugpy
     if not debugpy.is_client_connected():
         debugpy.listen(("0.0.0.0", 5678))
-        print("[leaf_generator] Waiting for VS Code debugger to attach on port 5678...")
+        print("[pose_estimator] Waiting for VS Code debugger to attach on port 5678...")
         debugpy.wait_for_client()
 
-from leaf_generator.blender.plant_scene_import import run  # noqa: E402
+from pose_estimator.blender.plant_scene_import import run  # noqa: E402
 
 # UPDATE THIS PATH (or set the PLANT_WORKDIR environment variable) to point
 # at a plant's --workdir. Blender itself runs on Windows here, so this must
@@ -61,4 +65,4 @@ PLANT_WORKDIR = os.environ.get(
 )
 
 collection = run(PLANT_WORKDIR)
-print(f"[leaf_generator] Now snap leaf assets (from blender_pipeline.py) onto the keypoint Empties under '{collection.name}'.")
+print(f"[pose_estimator] Now snap leaf assets (from blender_pipeline.py) onto the keypoint Empties under '{collection.name}'.")

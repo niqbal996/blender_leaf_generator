@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "leaf-generator"
 version = "0.1.0"
-description = "Pipeline for capturing, processing, and assembling procedural leaf assets (masks, PBR maps, keypoints) for Blender."
+description = "Two packages: leaf_generator (assemble procedural leaf assets for Blender from PBR map sets) and pose_estimator (recover plant 3D structure -- point cloud, skeleton, leaf pose -- from a turntable capture)."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
@@ -36,8 +36,8 @@ dev = [
     # Stub package for bpy/bmesh/mathutils IDE autocompletion outside Blender.
     "fake-bpy-module-latest",
 ]
-# Experimental: estimate_plant_skeleton.py (video -> plant stem/branch/leaf
-# skeleton). pycolmap is a large, self-contained wheel (bundles COLMAP);
+# Experimental: pose_estimator's skeleton path (video -> plant stem/branch/
+# leaf skeleton). pycolmap is a large, self-contained wheel (bundles COLMAP);
 # kept out of the base install since most of this repo doesn't need it.
 skeleton = [
     "pycolmap",
@@ -60,7 +60,7 @@ skeleton-gpu = [
     "nvidia-cuda-runtime-cu12",
     "matplotlib",
 ]
-# train_gaussian_splat.py -- trains a 3D Gaussian Splat from a "skeleton"
+# pose-train-splat -- trains a 3D Gaussian Splat from a "skeleton"
 # capture's COLMAP reconstruction, via gsplat. Needs the "skeleton" extra
 # too (reads its sparse/best + images/) plus a GPU: install a CUDA-matching
 # torch build first, e.g. `pip install torch --index-url
@@ -73,7 +73,31 @@ splat = [
     "gsplat",
     "pytorch-msssim",
 ]
+# pose-segment (P2) -- SAM2 video propagation for plant/holder masks.
+# SAM2 itself is NOT installed from PyPI: the `sam2` name there is a
+# third-party upload, not facebookresearch's. Install the real one from the
+# vendored clone instead:
+#   git clone https://github.com/facebookresearch/sam2.git third_party/sam2
+#   pip install -e third_party/sam2
+# (Apache-2.0, checkpoints included -- see DECISIONS.md.)
+# opencv-contrib-python rather than opencv-python: the contrib build is what
+# carries cv2.aruco, needed by the ChArUco path in P1.
+segment = [
+    "torch",
+    "torchvision",
+    "opencv-contrib-python",
+    "matplotlib",
+]
 
+# pose_estimator's phase CLIs. Each reads from and writes to a plant's
+# --workdir on disk, so they can be run (and re-run) independently.
+[project.scripts]
+pose-segment = "pose_estimator.cli.segment:main"
+pose-estimate-skeleton = "pose_estimator.cli.estimate_skeleton:main"
+pose-train-splat = "pose_estimator.cli.train_splat:main"
+pose-align-skeleton = "pose_estimator.cli.align_skeleton:main"
+
+# Finds both top-level packages under src/: leaf_generator and pose_estimator.
 [tool.setuptools.packages.find]
 where = ["src"]
 

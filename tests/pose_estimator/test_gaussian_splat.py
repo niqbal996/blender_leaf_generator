@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from leaf_generator.skeleton.gaussian_splat import init_gaussians_from_pointcloud
+from pose_estimator.gaussian_splat import init_gaussians_from_pointcloud
 
 
 def test_init_gaussians_from_pointcloud_shapes_and_means():
@@ -42,7 +42,7 @@ def test_write_read_gaussian_ply_round_trip(tmp_path):
     pytest.importorskip("torch")
     pytest.importorskip("gsplat")
 
-    from leaf_generator.skeleton.gaussian_splat import read_gaussian_ply, write_gaussian_ply
+    from pose_estimator.gaussian_splat import read_gaussian_ply, write_gaussian_ply
 
     rng = np.random.default_rng(2)
     xyz = rng.normal(size=(8, 3))
