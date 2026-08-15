@@ -406,6 +406,7 @@ def segment_sequence(
     roi_padding: float = 0.18,
     device: str = "cuda",
     offload_to_cpu: bool = True,
+    frame_paths: Optional[Sequence[Path]] = None,
 ) -> dict:
     """Run SAM2 video propagation over `frames_dir` and write P2 artifacts.
 
@@ -420,7 +421,12 @@ def segment_sequence(
     from sam2.build_sam import build_sam2_video_predictor
 
     frames_dir, out_dir, checkpoint = Path(frames_dir), Path(out_dir), Path(checkpoint)
-    frame_paths = sorted(frames_dir.glob("frame_*.jpg"))
+    # An explicit list lets one workdir hold several capture passes: SAM2's
+    # video propagation needs temporal continuity, so each pass is tracked
+    # separately even though the frames share a directory.
+    if frame_paths is None:
+        frame_paths = sorted(frames_dir.glob("frame_*.jpg"))
+    frame_paths = list(frame_paths)
     if not frame_paths:
         raise FileNotFoundError(f"No frame_*.jpg found in {frames_dir}")
 

@@ -75,10 +75,20 @@ def run_qc(
     max_area_jump: float = 0.15,
     max_holder_contamination: float = 0.02,
     max_centroid_jump_fraction: float = 0.08,
+    sources: Optional[dict] = None,
 ) -> dict:
-    """Score a finished P2 run. Returns a report dict (also written as qc.json)."""
+    """Score a finished P2 run. Returns a report dict (also written as qc.json).
+
+    `sources` maps frame stem -> capture pass. Both continuity checks compare
+    consecutive frames, and consecutive frames from *different* passes are not
+    continuous with each other -- the camera jumps to another elevation
+    between them. Without this the boundary registers as tracking loss, so the
+    check would fail on exactly the multi-elevation captures it is meant to
+    validate.
+    """
     frames_dir, p2_dir = Path(frames_dir), Path(p2_dir)
     frame_paths = sorted(frames_dir.glob("frame_*.jpg"))
+    sources = sources or {}
 
     plant_areas: List[int] = []
     holder_areas: List[int] = []
@@ -86,6 +96,7 @@ def run_qc(
     empty_frames: List[str] = []
     full_frames: List[str] = []
     overlap_fractions: List[float] = []
+    kept_paths: List[Path] = []
 
     for path in frame_paths:
         plant = cv2.imread(str(p2_dir / "masks" / "plant" / f"{path.stem}.png"), cv2.IMREAD_GRAYSCALE)
@@ -94,6 +105,7 @@ def run_qc(
             continue
         holder = holder if holder is not None else np.zeros_like(plant)
 
+        kept_paths.append(path)
         plant_b, holder_b = plant > 0, holder > 0
         area = int(plant_b.sum())
         plant_areas.append(area)
@@ -114,12 +126,19 @@ def run_qc(
         bgr = cv2.imread(str(path))
         contaminations.append(holder_contamination(bgr, plant_b))
 
+    # True where frames i and i+1 belong to the same pass, so a comparison
+    # between them is meaningful.
+    contiguous = np.array(
+        [sources.get(a.stem, 0) == sources.get(b.stem, 0)
+         for a, b in zip(kept_paths, kept_paths[1:])], dtype=bool)
+
     areas = np.array(plant_areas, dtype=float)
     median_area = float(np.median(areas)) if len(areas) else 0.0
-    if len(areas) > 1 and median_area > 0:
+    if len(areas) > 1 and median_area > 0 and contiguous.any():
         jumps = np.abs(np.diff(areas)) / median_area
-        worst_jump = float(jumps.max())
-        jump_frames = [frame_paths[i + 1].name for i in np.nonzero(jumps > max_area_jump)[0]]
+        worst_jump = float(jumps[contiguous].max())
+        jump_frames = [kept_paths[i + 1].name
+                       for i in np.nonzero((jumps > max_area_jump) & contiguous)[0]]
     else:
         worst_jump, jump_frames = 0.0, []
 
@@ -128,13 +147,14 @@ def run_qc(
     # onto a different object -- and this catches it without reference to any
     # color prior, which on this rig cannot tell foliage from yellow plastic.
     centroids = centroid_trajectory(
-        [p2_dir / "masks" / "plant" / f"{p.stem}.png" for p in frame_paths]
+        [p2_dir / "masks" / "plant" / f"{p.stem}.png" for p in kept_paths]
     )
     frame_diag = float(np.hypot(*cv2.imread(str(frame_paths[0])).shape[:2])) if frame_paths else 1.0
     finite = np.isfinite(centroids).all(axis=1)
-    if finite.sum() > 2:
-        steps = np.linalg.norm(np.diff(centroids[finite], axis=0), axis=1)
-        worst_centroid_jump = float(steps.max() / frame_diag)
+    usable = contiguous & finite[:-1] & finite[1:] if len(contiguous) else contiguous
+    if usable.any():
+        steps = np.linalg.norm(np.diff(centroids, axis=0), axis=1)
+        worst_centroid_jump = float(steps[usable].max() / frame_diag)
     else:
         worst_centroid_jump = 0.0
 
@@ -166,6 +186,7 @@ def run_qc(
 
     report = {
         "num_frames": len(frame_paths),
+        "num_passes": len(set(sources.values())) if sources else 1,
         "plant_area_px": {
             "median": median_area,
             "min": float(areas.min()) if len(areas) else 0.0,

@@ -41,7 +41,7 @@ def _parse_point(text: Optional[str]) -> Optional[Tuple[int, int]]:
 def run(
     workdir: Path,
     checkpoint: Path,
-    video_path: Optional[Path] = None,
+    video_paths: Optional[list] = None,
     num_frames: int = 96,
     use_roi: bool = True,
     roi_padding: float = 0.45,
@@ -55,16 +55,40 @@ def run(
     p2_dir = workdir / "p2"
 
     existing = sorted(frames_dir.glob("frame_*.jpg")) if frames_dir.is_dir() else []
+    sources_file = workdir / "p1" / "sources.json"
+    # frame stem -> which capture pass it came from. P3 needs this: each pass
+    # has the backdrop in a different place, so they cannot share one
+    # rotating-region mask, and two elevations trace two orbits not one.
+    sources: dict = {}
+
     if reuse_frames and existing:
         print(f"Reusing {len(existing)} frames already in {frames_dir}")
-    elif video_path is not None:
-        print(f"Extracting the sharpest of {num_frames} angular bins from {video_path.name}...")
-        written = extract_sharpest_frames(video_path, frames_dir, target_frame_count=num_frames)
-        print(f"  wrote {len(written)} frames to {frames_dir}")
+        if sources_file.exists():
+            sources = json.loads(sources_file.read_text())
+    elif video_paths:
+        groups = []
+        for index, video in enumerate(video_paths):
+            start = sum(len(g) for g in groups)
+            print(f"Pass {index}: sharpest of {num_frames} angular bins from {video.name}...")
+            written = extract_sharpest_frames(video, frames_dir, target_frame_count=num_frames,
+                                              start_index=start)
+            print(f"  wrote {len(written)} frames (frame_{start:04d} onward)")
+            groups.append(written)
+            for path in written:
+                sources[path.stem] = index
+        sources_file.parent.mkdir(parents=True, exist_ok=True)
+        sources_file.write_text(json.dumps(sources, indent=2))
     elif existing:
         print(f"No --video given; using the {len(existing)} frames already in {frames_dir}")
+        if sources_file.exists():
+            sources = json.loads(sources_file.read_text())
     else:
         raise FileNotFoundError(f"No --video given and no frames found in {frames_dir}")
+
+    if not sources:
+        sources = {p.stem: 0 for p in sorted(frames_dir.glob("frame_*.jpg"))}
+        sources_file.parent.mkdir(parents=True, exist_ok=True)
+        sources_file.write_text(json.dumps(sources, indent=2))
 
     prompts = None
     if plant_point or holder_point:
@@ -75,24 +99,48 @@ def run(
         if not prompts.plant:
             raise ValueError("--holder-point given without --plant-point; the plant prompt is required")
 
-    print("Segmenting with SAM2 video propagation...")
-    result = segment_sequence(
-        frames_dir=frames_dir,
-        out_dir=p2_dir,
-        checkpoint=checkpoint,
-        prompts=prompts,
-        use_roi=use_roi,
-        roi_padding=roi_padding,
-        device=device,
-    )
+    # One SAM2 session per pass. Propagation carries temporal memory between
+    # consecutive frames, so running it across a cut between two videos would
+    # ask it to track through a discontinuity it has no reason to survive.
+    all_frames = sorted(frames_dir.glob("frame_*.jpg"))
+    per_pass = {}
+    for path in all_frames:
+        per_pass.setdefault(sources.get(path.stem, 0), []).append(path)
+
+    combined_stats, crops = [], {}
+    boxes_by_stem = {}
+    for pass_index in sorted(per_pass):
+        paths = per_pass[pass_index]
+        print(f"Segmenting pass {pass_index} ({len(paths)} frames) with SAM2...")
+        result = segment_sequence(
+            frames_dir=frames_dir,
+            out_dir=p2_dir,
+            checkpoint=checkpoint,
+            prompts=prompts,
+            use_roi=use_roi,
+            roi_padding=roi_padding,
+            device=device,
+            frame_paths=paths,
+        )
+        combined_stats.extend(result["per_frame"])
+        crops[str(pass_index)] = result["crop"]
+        if result["crop"]:
+            for path, box in zip(paths, result["crop"]["boxes"]):
+                boxes_by_stem[path.stem] = box
 
     with open(p2_dir / "frame_stats.json", "w") as f:
-        json.dump(result["per_frame"], f, indent=2)
+        json.dump(combined_stats, f, indent=2)
+    with open(p2_dir / "crops_per_pass.json", "w") as f:
+        json.dump(crops, f, indent=2)
+
+    # Each pass solves its own tracking crop, so the boxes must be re-indexed
+    # into global frame order before the overlays can draw them.
+    all_boxes = [boxes_by_stem[p.stem] for p in all_frames] if boxes_by_stem else None
 
     print("Scoring the segmentation...")
-    report = run_qc(frames_dir, p2_dir)
+    report = run_qc(frames_dir, p2_dir, sources=sources)
 
-    write_overlays(frames_dir, p2_dir, crop_boxes=result["crop"]["boxes"] if result["crop"] else None)
+    write_overlays(frames_dir, p2_dir, crop_boxes=all_boxes)
     write_area_plot(p2_dir, report)
 
     print(f"\n  P2 checks ({'ALL PASSED' if report['all_passed'] else 'FAILURES PRESENT'}):")
@@ -107,7 +155,10 @@ def run(
 def main(argv: Optional[list] = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workdir", required=True, type=Path, help="Run directory for this specimen")
-    parser.add_argument("--video", type=Path, help="Turntable video. Omit to reuse <workdir>/p1/frames/")
+    parser.add_argument("--video", type=Path, nargs="+",
+                        help="Turntable video(s). Give several to merge capture passes at "
+                             "different elevations into one workdir; each is tracked separately "
+                             "and they are solved together in P3. Omit to reuse existing frames.")
     parser.add_argument(
         "--checkpoint",
         type=Path,
@@ -155,7 +206,7 @@ def main(argv: Optional[list] = None) -> None:
     run(
         workdir=args.workdir,
         checkpoint=args.checkpoint,
-        video_path=args.video,
+        video_paths=args.video,
         num_frames=args.num_frames,
         use_roi=not args.no_roi,
         roi_padding=args.roi_padding,

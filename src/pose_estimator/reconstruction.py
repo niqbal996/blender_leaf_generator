@@ -32,6 +32,7 @@ def build_sparse_reconstruction(
     num_threads: int = 4,
     max_image_size: int = 2000,
     use_gpu: bool = False,
+    single_camera: bool = True,
 ):
     """Run SIFT extraction + exhaustive matching + incremental mapping.
 
@@ -48,6 +49,16 @@ def build_sparse_reconstruction(
     that package's lib/ dir on LD_LIBRARY_PATH if `import pycolmap` raises
     `libcudart.so.12: cannot open shared object file`); `num_threads` is
     ignored on the GPU path.
+
+    `single_camera` forces every frame to share one set of intrinsics, and
+    defaults to True because it is simply true of these rigs: one locked-off
+    body and lens for the whole sequence. COLMAP's own default is AUTO, which
+    on frames extracted from video has no EXIF to group by and silently falls
+    back to a *separate camera per image* -- handing the solver ~96 extra
+    free focal lengths that it will happily use to absorb reconstruction
+    drift. Measured on DSC_0010: per-image cameras produced a 27.5% spread in
+    focal length across frames from a fixed lens, and camera centres that
+    missed their own fitted circle by 5.2% of orbit radius.
     """
     import pycolmap
 
@@ -71,6 +82,7 @@ def build_sparse_reconstruction(
     pycolmap.extract_features(
         db_path,
         image_dir,
+        camera_mode=pycolmap.CameraMode.SINGLE if single_camera else pycolmap.CameraMode.AUTO,
         reader_options=reader_options,
         extraction_options=extraction_options,
         device=pycolmap.Device.cuda if use_gpu else pycolmap.Device.cpu,

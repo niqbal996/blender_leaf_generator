@@ -92,10 +92,16 @@ segment = [
 # pose_estimator's phase CLIs. Each reads from and writes to a plant's
 # --workdir on disk, so they can be run (and re-run) independently.
 [project.scripts]
-pose-segment = "pose_estimator.cli.segment:main"
-pose-estimate-skeleton = "pose_estimator.cli.estimate_skeleton:main"
-pose-train-splat = "pose_estimator.cli.train_splat:main"
-pose-align-skeleton = "pose_estimator.cli.align_skeleton:main"
+# P1-P6, in pipeline order.
+pose-segment = "pose_estimator.cli.segment:main"      # P1 + P2
+pose-solve = "pose_estimator.cli.pose:main"           # P3
+pose-hull = "pose_estimator.cli.hull:main"            # P4a
+pose-surface = "pose_estimator.cli.surface:main"      # P4b
+pose-classify = "pose_estimator.cli.classify:main"    # P4c stage 1
+pose-fuse = "pose_estimator.cli.fuse:main"            # P4c stage 2
+pose-semantic = "pose_estimator.cli.semantic:main"    # P4c, both stages
+pose-structure = "pose_estimator.cli.structure:main"  # P5
+pose-leaf = "pose_estimator.cli.leaf_model:main"      # P6
 
 # Finds both top-level packages under src/: leaf_generator and pose_estimator.
 [tool.setuptools.packages.find]

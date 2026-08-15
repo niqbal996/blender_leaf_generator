@@ -68,6 +68,7 @@ def extract_sharpest_frames(
     target_frame_count: int = 96,
     jpeg_quality: int = 95,
     roi: Union[Tuple[int, int, int, int], None] = None,
+    start_index: int = 0,
 ) -> List[Path]:
     """Split the video into `target_frame_count` consecutive bins and save the
     single sharpest frame from each, as `frame_0000.jpg`, `frame_0001.jpg`, ...
@@ -122,7 +123,9 @@ def extract_sharpest_frames(
 
     written: List[Path] = []
     for saved, bin_index in enumerate(sorted(best_per_bin)):
-        out_path = out_dir / f"frame_{saved:04d}.jpg"
+        # Offset so several capture passes can share one frames directory
+        # without colliding, which is what lets P3 solve them together.
+        out_path = out_dir / f"frame_{start_index + saved:04d}.jpg"
         cv2.imwrite(str(out_path), best_per_bin[bin_index][1], [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
         written.append(out_path)
 

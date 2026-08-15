@@ -1,29 +1,41 @@
-"""pose_estimator: recover a plant's 3D structure -- point cloud, stem/branch
-skeleton, and (eventually) per-leaf midrib/curvature/curl -- from a turntable
-capture of a single potted or clamp-held plant.
+"""pose_estimator: measure a real plant from a turntable capture.
 
-Split from `leaf_generator` (which assembles procedural leaf *assets* for
-Blender out of PBR map sets); the two packages share no code. Everything here
-is about measuring a real plant, not authoring a synthetic one.
+Video in, per-leaf midribs out. Split from `leaf_generator` (which assembles
+procedural leaf *assets* for Blender out of PBR map sets); the two packages
+share no code. Everything here is about measuring a real plant, not authoring
+a synthetic one.
 
-Layout:
-- Pure, bpy-free library modules (`frames`, `masking`, `reconstruction`,
-  `pointcloud`, `turntable`, `skeletonize`, `alignment`, `gaussian_splat`,
-  `ply_io`, `visualize`) -- importable with a regular Python interpreter.
-- `pose_estimator.cli.*` -- the end-to-end CLIs, also exposed as the
-  `pose-estimate-skeleton` / `pose-train-splat` / `pose-align-skeleton`
-  console scripts.
-- `pose_estimator.blender.*` -- requires `bpy`, run only inside Blender.
+Every phase is a standalone CLI that reads its predecessor's files out of a
+run directory and writes its own, so any one can be re-run, inspected or
+swapped without touching the others:
 
-`reconstruction.py` and `gaussian_splat.py` need optional dependencies
-(`pycolmap`, and `torch`/`gsplat` respectively); both are imported lazily so
-the rest of the package stays usable without them -- install via
-`pip install -e ".[skeleton]"` / `".[skeleton,splat]"`.
+    P1+P2  pose-segment    sharpest frames + SAM2 plant/holder masks
+    P3     pose-solve      camera poses, masked COLMAP
+    P4a    pose-hull       visual hull by silhouette carving
+    P4b    pose-surface    2DGS surfels -> carved thin surface
+    P4c    pose-classify   per-frame organ class maps  (DINOv3 or SAM2)
+           pose-fuse       class maps -> per-point organ labels
+           pose-semantic   both P4c stages in one call
+    P5     pose-structure  stem centreline + leaf instances
+    P6     pose-leaf       per-leaf midrib, frame, curvature, width
 
-Status: the skeleton/splat path is a research prototype whose output should
-be inspected, not trusted blindly -- see `plant_pose_pipeline_PLAN.md` for
-the phased rebuild that replaces its per-plant appearance thresholds with
-geometry-derived constraints.
+Each phase also writes a QC report (`pN/*.json`) with explicit pass/fail
+acceptance checks and diagnostics under `pN/diag/`. Read those before trusting
+a run -- the checks exist to catch the failures that look plausible, not the
+ones that look broken.
+
+Library modules are pure and bpy-free. `reconstruction.py` needs `pycolmap`
+and `surfels.py` needs `torch`/`gsplat`; both are imported lazily so the rest
+of the package stays usable without them. Install via
+`pip install -e ".[dev,skeleton,segment]"`.
+
+`alignment.py` is not yet wired into the P1-P6 chain. It is kept because it is
+the only metric-scale machinery in the repo -- it solves the similarity
+transform from two points whose real-world separation was measured -- and
+scale is the largest outstanding gap in the pipeline.
+
+Status: research code. See `plant_pose_pipeline_PLAN.md` for the target and
+`DECISIONS.md` for what was measured and why each choice was made.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
