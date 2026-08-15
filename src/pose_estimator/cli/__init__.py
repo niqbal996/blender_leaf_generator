@@ -16,6 +16,8 @@ Run them either as installed console scripts, in pipeline order::
     pose-structure --workdir runs/plant_9/                       # P5
     pose-leaf      --workdir runs/plant_9/                       # P6
 
+    pose-view-structure --workdir runs/plant_9/   # inspect P5 interactively
+
 or, without installing, as modules from the repo root::
 
     PYTHONPATH=src python -m pose_estimator.cli.hull --help

@@ -160,6 +160,44 @@ def build_seed_vectors(
     return np.stack(vectors, axis=1), labels
 
 
+def build_seed_vectors_multi(
+    backbone: DinoBackbone,
+    frames_dir,
+    mask_dir,
+    seeds_by_frame: Dict[str, Sequence[Seed]],
+    pad: int = 60,
+) -> Tuple[np.ndarray, List[str]]:
+    """Seed vectors pooled from several frames.
+
+    One frame shows each organ from one angle, and a leaf turned edge-on
+    barely resembles the same leaf face-on. Seeding from a few frames around
+    the orbit gives each class several genuinely different examples, which
+    costs nothing here precisely because the vectors are kept individually --
+    pooling is concatenation, not averaging, so a new example can only add
+    coverage and never dilute an existing one.
+    """
+    from pathlib import Path
+
+    frames_dir, mask_dir = Path(frames_dir), Path(mask_dir)
+    all_vectors, all_labels = [], []
+
+    for stem in sorted(seeds_by_frame):
+        seeds = seeds_by_frame[stem]
+        if not seeds:
+            continue
+        bgr = cv2.imread(str(frames_dir / f"{stem}.jpg"))
+        mask = cv2.imread(str(mask_dir / f"{stem}.png"), cv2.IMREAD_GRAYSCALE)
+        if bgr is None or mask is None:
+            raise SystemExit(f"seed frame {stem} or its mask is missing")
+        vectors, labels = build_seed_vectors(backbone, bgr, mask > 127, seeds, pad)
+        all_vectors.append(vectors)
+        all_labels.extend(labels)
+
+    if not all_vectors:
+        raise SystemExit("no seeds to build vectors from")
+    return np.concatenate(all_vectors, axis=1), all_labels
+
+
 def classify_frame(
     backbone: DinoBackbone,
     bgr: np.ndarray,

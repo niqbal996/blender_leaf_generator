@@ -1,27 +1,42 @@
-"""P5 driven by P4c organ labels rather than by geometry alone.
+"""P5 structure from the P4c organ labels: stem centreline and leaf instances.
 
-The geometry-only path had to *infer* which branches were leaves, and every
-step of that inference needed a threshold: `min_branch_fraction` to decide how
-short an organ could be, a climb-rate rule to decide where the stem ended, a
-tip-termination rule to reject internodes. Each was calibrated on one
-specimen and would drift on the next.
+The labels answer "what is this point". This module answers "which leaf is it",
+and then "where does that leaf's midrib run".
 
-With per-point labels none of those decisions remain:
+**Leaves are separated by their tips, not by their attachments.** The earlier
+version grew each leaf outward from where it touched the stem, and that fails
+on exactly the plants worth measuring: two leaves fused near the apex share one
+contact patch, so they were seen as one organ. Measured on plant_9, one
+instance ended up holding 45% of all leaf tissue while the rest split into ten
+fragments -- eleven instances for seven leaves.
 
-- **The stem is given**, so its centreline is fitted through stem points
-  instead of traced by guessing which branch keeps climbing.
-- **Leaves are given**, so no minimum-length threshold decides what counts.
-- **Attachment points are given**, because a leaf point adjacent to a stem
-  point *is* the insertion. That was the single worst defect in the previous
-  P6: leaf bases landed mid-blade, which hooked the midribs and produced
-  impossible width profiles.
+A tip survives what an attachment does not. Two fused blades still have two
+extremities, so tips are counted first and each leaf is then grown *inward*
+from its own tip. The same measurement: the largest claim drops from 45% to
+11%, the claims come out evenly sized, and the leaf count holds at 7 across a
+range of settings where the old method swept 178 -> 73 -> 28 -> 14 -> 4 with no
+stable region anywhere.
 
-Instancing uses the stem too. Connectivity alone cannot split leaves whose
-blades touch -- measured on DSC_0009, no connectivity radius separated them
-(2.5 voxels gave one 49k-point blob, 1.1 fragmented small leaves before
-splitting the blob cleanly). But two touching leaves still meet the stem at
-*different* places, so leaf points are grouped by which attachment site they
-reach first through the leaf-only graph.
+Deciding how many tips there are needs no tuned radius either. Sweep a level
+downward through the depth field: each local maximum starts its own component,
+and when two components touch, the shallower one stops being separate. Two
+bumps on one blade join high up on that blade; two real leaves can only join
+by descending to where they both meet the stem. So `peak - saddle` -- the
+persistence -- is near the peak's own depth for a real leaf and small for a
+second high point on a leaf already counted. Measured on plant_9 the five
+large leaves all have a saddle of exactly zero, while a competing maximum at
+depth 26 saddles at 19 and is correctly rejected.
+
+Growth also stops at the stem. A front that runs down its own blade, reaches
+the stem and keeps going will hang a tiny bud off the end of an unrelated
+midrib -- so the stem contact points can be reached but not travelled
+through, and tissue left over with no tip of its own becomes its own leaf
+rather than someone else's tail.
+
+Every intermediate is kept on the `Instancing` record rather than being
+consumed in place: the depth field, the candidate tips, which candidates were
+merged, and what each surviving tip claimed. A leaf count is not a diagnosis,
+and when this stage is wrong the answer is always in one of those steps.
 """
 
 from __future__ import annotations
@@ -36,18 +51,52 @@ from scipy.spatial import cKDTree
 
 
 @dataclass
+class Instancing:
+    """Every step of the tip-driven split, kept for inspection."""
+
+    depth: np.ndarray                  # (N,) geodesic distance from the stem, per leaf point
+    contact_index: np.ndarray          # indices of leaf points touching the stem
+    candidate_tips: np.ndarray         # indices into the leaf points
+    tip_group: np.ndarray              # (n_maxima, 3): peak index, peak depth, saddle depth
+    accepted_tips: np.ndarray          # one representative index per merged group
+    owner: np.ndarray                  # (N,) instance id per leaf point, -1 = unassigned
+    distance_from_tip: np.ndarray      # (N,) geodesic distance to the winning tip
+    dropped: List[int] = field(default_factory=list)   # groups cut by min_points
+
+    def to_dict(self) -> dict:
+        finite = np.isfinite(self.depth)
+        return {
+            "leaf_points": int(len(self.depth)),
+            "reachable_from_stem": int(finite.sum()),
+            "contact_points": int(len(self.contact_index)),
+            "candidate_tips": int(len(self.candidate_tips)),
+            "tips_after_merge": int(len(self.accepted_tips)),
+            "instances_kept": int(len({int(o) for o in self.owner if o >= 0})),
+            "instances_dropped_as_too_small": len(self.dropped),
+            "unassigned_points": int((self.owner < 0).sum()),
+            "max_depth": float(self.depth[finite].max()) if finite.any() else 0.0,
+        }
+
+
+@dataclass
 class LabelledStructure:
     stem_path: np.ndarray                      # (M, 3) base -> apex
     leaf_ids: np.ndarray                       # per leaf-point instance id, -1 = dropped
     leaf_points: np.ndarray                    # (K, 3) the leaf points leaf_ids indexes
     attachments: List[np.ndarray] = field(default_factory=list)   # per instance
     tips: List[np.ndarray] = field(default_factory=list)
-    axes: List[np.ndarray] = field(default_factory=list)          # per instance polyline
+    axes: List[np.ndarray] = field(default_factory=list)          # per instance, base -> tip
     root_points: Optional[np.ndarray] = None
+    instancing: Optional[Instancing] = None
 
     @property
     def num_leaves(self) -> int:
         return len(self.axes)
+
+
+# --------------------------------------------------------------------------
+# Stem
+# --------------------------------------------------------------------------
 
 
 def fit_stem_path(stem_points: np.ndarray, num_stations: int = 24,
@@ -79,111 +128,523 @@ def _smooth(points: np.ndarray, iterations: int = 6, strength: float = 0.35) -> 
     return out
 
 
-def _knn_graph(points: np.ndarray, k: int) -> csr_matrix:
-    tree = cKDTree(points)
-    distances, indices = tree.query(points, k=min(k + 1, len(points)))
-    rows = np.repeat(np.arange(len(points)), indices.shape[1] - 1)
-    cols = indices[:, 1:].ravel()
-    data = distances[:, 1:].ravel()
-    graph = csr_matrix((data, (rows, cols)), shape=(len(points), len(points)))
+# --------------------------------------------------------------------------
+# Leaf instancing, step by step
+# --------------------------------------------------------------------------
+
+
+def leaf_graph(leaf_points: np.ndarray, k: int = 10) -> csr_matrix:
+    """Symmetric kNN graph over leaf tissue, edges weighted by length.
+
+    Distances along this graph are what "geodesic" means everywhere below:
+    travel through leaf tissue rather than straight through the air, which is
+    what keeps a curved blade's far end from looking near its own base.
+    """
+    tree = cKDTree(leaf_points)
+    distances, indices = tree.query(leaf_points, k=min(k + 1, len(leaf_points)))
+    rows = np.repeat(np.arange(len(leaf_points)), indices.shape[1] - 1)
+    graph = csr_matrix((distances[:, 1:].ravel(), (rows, indices[:, 1:].ravel())),
+                       shape=(len(leaf_points),) * 2)
     return graph.maximum(graph.T)
 
 
-def instance_by_attachment(
+def depth_from_stem(
+    leaf_points: np.ndarray, stem_points: np.ndarray, graph: csr_matrix,
+    contact_radius: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Geodesic distance from the stem to every leaf point.
+
+    Returns (depth, indices of the leaf points touching the stem). Points no
+    path reaches get infinity rather than a fabricated value -- an island of
+    leaf tissue with no route to the stem is a real thing to know about.
+    """
+    if len(stem_points) == 0 or len(leaf_points) == 0:
+        return np.full(len(leaf_points), np.inf), np.zeros(0, np.int64)
+
+    contact = np.nonzero(cKDTree(stem_points).query(leaf_points)[0] <= contact_radius)[0]
+    if len(contact) == 0:
+        return np.full(len(leaf_points), np.inf), contact
+    return dijkstra(graph, directed=False, indices=contact, min_only=True), contact
+
+
+def tip_persistence(graph: csr_matrix, depth: np.ndarray) -> List[Tuple[int, float, float]]:
+    """Every local maximum of depth, with the level at which it stops being one.
+
+    Returns (peak index, peak depth, saddle depth) per maximum.
+
+    Sweep a level downward from the deepest tissue. Each local maximum starts
+    its own component; when two components touch, the shallower one stops
+    being a separate thing and the level where that happened is its *saddle*.
+    Two bumps on one blade join high up on that blade, because the tissue
+    between them is itself high. Two genuinely different leaves can only join
+    by descending to where they meet the stem, so their saddle is near zero.
+
+    That makes `peak - saddle` -- the persistence -- the honest measure of "is
+    this its own leaf", and it needs no distance threshold, because the answer
+    is written in the shape of the depth field rather than in how far apart
+    two points happen to be. It also fixes the case a separation radius cannot:
+    a long leaf whose blade offers a second high point was being split in two.
+    """
+    n = len(depth)
+    finite = np.isfinite(depth)
+    order = np.argsort(-np.where(finite, depth, -np.inf))
+
+    parent = np.full(n, -1, np.int64)
+    peak_of: Dict[int, float] = {}
+    records: List[Tuple[int, float, float]] = []
+    peak_index: Dict[int, int] = {}
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return int(a)
+
+    for i in order:
+        i = int(i)
+        if not finite[i]:
+            break
+        parent[i] = i
+        roots = {find(int(j)) for j in graph.indices[graph.indptr[i]:graph.indptr[i + 1]]
+                 if parent[int(j)] != -1}
+        if not roots:
+            peak_of[i] = float(depth[i])          # a new maximum is born here
+            peak_index[i] = i
+            continue
+        alive = sorted(roots, key=lambda r: -peak_of[r])
+        survivor = alive[0]
+        for other in alive[1:]:
+            records.append((peak_index[other], peak_of[other], float(depth[i])))
+            parent[other] = survivor
+        parent[i] = survivor
+        if depth[i] > peak_of[survivor]:
+            peak_of[survivor] = float(depth[i])
+
+    for root in {find(i) for i in range(n) if parent[i] != -1}:
+        # Never merged into anything: it reaches all the way to the stem.
+        records.append((peak_index[root], peak_of[root], 0.0))
+    return records
+
+
+def select_tips(
+    records: Sequence[Tuple[int, float, float]],
+    min_depth: float,
+    min_persistence_ratio: float = 0.5,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Split the maxima into real leaf tips and bumps on a blade.
+
+    Returns (all candidates above `min_depth`, the accepted subset).
+
+    A maximum is its own leaf when it survives down through most of its own
+    depth -- `(peak - saddle) / peak` above the ratio. Expressed as a fraction
+    of the peak rather than in voxels so a small leaf is judged by the same
+    rule as a large one.
+    """
+    candidates, accepted = [], []
+    for index, peak, saddle in sorted(records, key=lambda r: -r[1]):
+        if peak < min_depth:
+            continue
+        candidates.append(int(index))
+        if (peak - saddle) / max(peak, 1e-12) > min_persistence_ratio:
+            accepted.append(int(index))
+    return np.array(candidates, np.int64), np.array(accepted, np.int64)
+
+
+def grow_from_tips(
+    graph: csr_matrix, tips: np.ndarray, n_points: int,
+    blocked_at: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Claim leaf tissue for the tip that reaches it with least travel.
+
+    Growing inward from the tips rather than outward from the stem is what
+    separates two blades fused at the apex: their fronts meet at the fusion
+    instead of being decided by a contact patch they share.
+
+    `blocked_at` -- the leaf points touching the stem -- may be *reached* but
+    not travelled through. Without that, a front runs down its own blade,
+    arrives at the stem and simply keeps going up whatever it meets next, so a
+    tiny bud on the far side ends up on the end of another leaf's midrib. A
+    leaf's territory has to stop where the leaf does.
+    """
+    if blocked_at is not None and len(blocked_at):
+        graph = graph.tolil(copy=True)
+        for point in blocked_at:
+            graph.rows[int(point)] = []
+            graph.data[int(point)] = []
+        graph = graph.tocsr()
+        directed = True
+    else:
+        directed = False
+
+    best = np.full(n_points, np.inf)
+    owner = np.full(n_points, -1, np.int64)
+    for instance, tip in enumerate(tips):
+        distances = dijkstra(graph, directed=directed, indices=[int(tip)], min_only=True)
+        closer = distances < best
+        best[closer] = distances[closer]
+        owner[closer] = instance
+    return owner, best
+
+
+def claim_orphans(
+    graph: csr_matrix, owner: np.ndarray, distance: np.ndarray,
+    depth: np.ndarray, min_points: int, min_depth: float,
+) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+    """Give leftover tissue its own instance rather than someone else's.
+
+    Blocking growth at the stem leaves anything with no tip of its own
+    unclaimed -- typically a bud too shallow to register as a maximum. The old
+    behaviour absorbed it into whichever leaf's front arrived first, which put
+    it on the end of an unrelated midrib.
+
+    A leftover piece becomes its own leaf only if it both holds enough points
+    *and* actually stands away from the stem: it must reach `min_depth`, the
+    same bar a tip has to clear. Without that second test this promotes tissue
+    lying against the stem into "leaves" whose deepest point is zero voxels
+    from it -- which is not a leaf, it is the bit of blade base the contact
+    block just cut off. Anything failing either test stays honestly
+    unassigned rather than being attached to a leaf it does not belong to.
+    """
+    free = owner < 0
+    if not free.any():
+        return owner, distance, []
+
+    index = np.nonzero(free)[0]
+    sub = graph[index][:, index]
+    count, component = connected_components(sub, directed=False)
+
+    new_tips: List[int] = []
+    next_id = int(owner.max()) + 1 if (owner >= 0).any() else 0
+    for c in range(count):
+        member = index[component == c]
+        if len(member) < min_points:
+            continue
+        reach = np.where(np.isfinite(depth[member]), depth[member], -np.inf)
+        if reach.max() < min_depth:
+            continue
+        seed = member[int(np.argmax(reach))]
+        local = dijkstra(sub, directed=False,
+                         indices=[int(np.nonzero(index == seed)[0][0])], min_only=True)
+        owner[member] = next_id
+        distance[member] = local[component == c]
+        new_tips.append(int(seed))
+        next_id += 1
+    return owner, distance, new_tips
+
+
+def instance_by_tips(
     leaf_points: np.ndarray,
     stem_points: np.ndarray,
     contact_radius: float,
     k_neighbors: int = 10,
     min_points: int = 150,
-) -> Tuple[np.ndarray, List[np.ndarray]]:
-    """Group leaf points by which stem contact they reach first.
+    min_tip_depth: float = 0.0,
+    min_persistence_ratio: float = 0.5,
+) -> Instancing:
+    """Split leaf tissue into leaves, keeping every intermediate."""
+    n = len(leaf_points)
+    if n == 0:
+        empty = np.zeros(0)
+        return Instancing(depth=empty, contact_index=np.zeros(0, np.int64),
+                          candidate_tips=np.zeros(0, np.int64), tip_group=np.zeros(0, np.int64),
+                          accepted_tips=np.zeros(0, np.int64),
+                          owner=np.zeros(0, np.int64), distance_from_tip=empty)
 
-    Returns (instance id per leaf point, attachment position per instance).
+    graph = leaf_graph(leaf_points, k_neighbors)
+    depth, contact = depth_from_stem(leaf_points, stem_points, graph, contact_radius)
 
-    Two leaves whose blades overlap are one connected component and cannot be
-    split by proximity. They are still distinct organs because they meet the
-    stem at different heights and azimuths, so the split is made at the
-    *attachment* and propagated outward along the leaf tissue by geodesic
-    distance -- which follows the lamina rather than cutting across the gap
-    between two leaves that merely touch.
+    records = tip_persistence(graph, depth)
+    candidates, tips = select_tips(records, min_tip_depth, min_persistence_ratio)
+    owner, distance_from_tip = grow_from_tips(graph, tips, n, blocked_at=contact)
+    owner, distance_from_tip, orphan_tips = claim_orphans(
+        graph, owner, distance_from_tip, depth, min_points, min_tip_depth)
+    if orphan_tips:
+        tips = np.concatenate([tips, np.array(orphan_tips, np.int64)])
+
+    # Drop instances too small to be an organ, then renumber compactly so the
+    # ids stay dense for everything downstream.
+    counts = np.bincount(owner[owner >= 0], minlength=max(len(tips), 1))
+    keep = [g for g in np.argsort(-counts) if counts[g] >= min_points]
+    dropped = [int(g) for g in range(len(counts)) if g not in keep and counts[g] > 0]
+    remap = np.full(max(len(counts), 1), -1, np.int64)
+    for new_id, g in enumerate(keep):
+        remap[g] = new_id
+
+    persistence = np.array([[idx, peak, saddle] for idx, peak, saddle in records], float)
+
+    return Instancing(
+        depth=depth,
+        contact_index=contact,
+        candidate_tips=candidates,
+        tip_group=persistence,
+        accepted_tips=tips[keep] if len(tips) else tips,
+        owner=np.where(owner >= 0, remap[owner], -1),
+        distance_from_tip=distance_from_tip,
+        dropped=dropped,
+    )
+
+
+# --------------------------------------------------------------------------
+# Trunk and attachments, from the shoot's own tree structure
+# --------------------------------------------------------------------------
+
+
+def root_anchor(root_points: np.ndarray, shoot_points: np.ndarray):
+    """Where the root meets the shoot: the shoot point closest to the root.
+
+    The root is the stem continued below the clamp, so the junction between
+    them is the one place the stem certainly passes through -- a far better
+    anchor than the obvious alternatives, both of which are wrong here. The
+    plant frame's origin lies on the *orbit axis* rather than on the plant,
+    and the lowest shoot point is whatever hangs down furthest, which on
+    plant_9 was a drooping leaf spread over 92 voxels of radius.
+
+    Returned as an actual shoot point rather than a centroid of the root's
+    upper slice. A root is a branching thing, so that centroid falls in the
+    gap *between* its branches -- measured at 33 voxels from any root point,
+    which is the same mid-air failure this is meant to prevent.
     """
-    if len(leaf_points) == 0 or len(stem_points) == 0:
-        return np.full(len(leaf_points), -1, np.int32), []
-
-    # Leaf points touching the stem are the candidate insertions.
-    stem_tree = cKDTree(stem_points)
-    contact = stem_tree.query(leaf_points)[0] <= contact_radius
-    if not contact.any():
-        return np.full(len(leaf_points), -1, np.int32), []
-
-    # Cluster the contacts into distinct sites; one leaf touches the stem over
-    # a small patch, not a single point.
-    contact_idx = np.nonzero(contact)[0]
-    sites = _cluster(leaf_points[contact_idx], contact_radius * 2.0)
-    num_sites = int(sites.max()) + 1 if len(sites) else 0
-    if num_sites == 0:
-        return np.full(len(leaf_points), -1, np.int32), []
-
-    # Multi-source geodesic over leaf tissue only: every leaf point is claimed
-    # by the site it can reach through leaf points with the least travel.
-    graph = _knn_graph(leaf_points, k_neighbors)
-    best_distance = np.full(len(leaf_points), np.inf)
-    owner = np.full(len(leaf_points), -1, np.int32)
-
-    for site in range(num_sites):
-        seeds = contact_idx[sites == site]
-        distances = dijkstra(graph, directed=False, indices=seeds, min_only=True)
-        closer = distances < best_distance
-        best_distance[closer] = distances[closer]
-        owner[closer] = site
-
-    # Drop sites too small to be an organ, then renumber compactly.
-    counts = np.bincount(owner[owner >= 0], minlength=num_sites)
-    keep = [s for s in np.argsort(-counts) if counts[s] >= min_points]
-    remap = np.full(num_sites, -1, np.int32)
-    for new_id, site in enumerate(keep):
-        remap[site] = new_id
-
-    instances = np.where(owner >= 0, remap[owner], -1)
-    attachments = [leaf_points[contact_idx[sites == site]].mean(axis=0) for site in keep]
-    return instances, attachments
+    if root_points is None or len(root_points) == 0 or len(shoot_points) == 0:
+        return None
+    nearest = cKDTree(root_points).query(shoot_points)[0]
+    return shoot_points[int(np.argmin(nearest))]
 
 
-def _cluster(points: np.ndarray, radius: float) -> np.ndarray:
-    if len(points) == 0:
-        return np.zeros(0, np.int32)
-    pairs = cKDTree(points).query_pairs(r=radius, output_type="ndarray")
-    if len(pairs) == 0:
-        return np.arange(len(points), dtype=np.int32)
-    graph = csr_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])),
-                       shape=(len(points), len(points)))
-    _, labels = connected_components(graph, directed=False)
-    return labels.astype(np.int32)
+def shoot_paths(
+    shoot_points: np.ndarray, base_radius: float, k_neighbors: int = 10,
+    anchor: Optional[np.ndarray] = None,
+) -> Tuple[csr_matrix, np.ndarray, np.ndarray]:
+    """Geodesic distance and a shortest-path tree over the whole shoot.
 
+    Returns (graph, distance from the base, predecessor array).
 
-def leaf_axis(points: np.ndarray, attachment: np.ndarray,
-              num_stations: int = 20, min_bin: int = 4) -> Tuple[np.ndarray, np.ndarray]:
-    """Midrib polyline and tip for one leaf, ordered from its attachment.
+    Over *all* shoot tissue -- leaf and stem together -- rather than each
+    class on its own. Where the stem ends and a leaf begins is exactly the
+    judgement the labels are worst at: measured on plant_9 the stem class is a
+    tube of radius 4 voxels low down and a 15-voxel blob at the apex, because
+    leaf bases and petioles land in it. Anything that trusts that boundary
+    inherits the blob. The tree structure does not need it -- a plant is a
+    trunk with branches whichever way its pixels were labelled.
 
-    Stations are shells of distance from the attachment, and the tip is simply
-    the farthest point. Because the attachment is now *known* rather than
-    inferred, s=0 is genuinely the petiole -- the previous P6 resolved it by
-    guessing which end of a skeleton branch was inner, got it wrong on a
-    drooping leaf, and produced a blade that measured widest at its own base.
+    `anchor` is where the stem actually starts, normally the top of the root.
+    Every path is traced back to there, so the trunk ends up running down the
+    stem. Seeding on height instead gathered 287 points spread across 92
+    voxels of radius -- a low leaf as much as the stem -- and the trunk left
+    the cloud entirely on its way to them.
     """
-    distance = np.linalg.norm(points - attachment, axis=1)
-    tip = points[int(np.argmax(distance))]
+    graph = leaf_graph(shoot_points, k_neighbors)
 
-    edges = np.linspace(0.0, distance.max(), num_stations + 1)
+    if anchor is not None:
+        near = np.nonzero(np.linalg.norm(shoot_points - anchor, axis=1) <= base_radius)[0]
+        base = near if len(near) else np.array(
+            [int(np.argmin(np.linalg.norm(shoot_points - anchor, axis=1)))])
+    else:
+        lowest = shoot_points[:, 2].min()
+        base = np.nonzero(shoot_points[:, 2] <= lowest + base_radius)[0]
+        if len(base) == 0:
+            base = np.array([int(np.argmin(shoot_points[:, 2]))])
+
+    # With min_only the call also reports which source won each node; the
+    # predecessor chain is all we need, so the third return is discarded.
+    distance, predecessor, _sources = dijkstra(
+        graph, directed=False, indices=base, min_only=True, return_predecessors=True)
+    return graph, distance, predecessor
+
+
+def trace_to_base(predecessor: np.ndarray, node: int, limit: int = 1_000_000) -> List[int]:
+    """The chain of nodes from `node` back down to the base."""
+    path = [int(node)]
+    seen = {int(node)}
+    for _ in range(limit):
+        nxt = int(predecessor[path[-1]])
+        if nxt < 0 or nxt in seen:
+            break
+        path.append(nxt)
+        seen.add(nxt)
+    return path
+
+
+def trunk_and_attachments(
+    shoot_points: np.ndarray, predecessor: np.ndarray, distance: np.ndarray,
+    tips: Sequence[int], merge_radius: float, num_stations: int = 40,
+) -> Tuple[np.ndarray, List[int], List[List[int]]]:
+    """Split the shoot into the trunk every leaf shares and each leaf's own tail.
+
+    Returns (trunk centreline, one attachment node per tip, the path per tip).
+
+    Trace every tip back to the base. Where a leaf's path comes within
+    `merge_radius` of another leaf's path, the two have met: that is the fork
+    where this leaf leaves the stem, so it is the attachment. Everything below
+    the highest fork is trunk.
+
+    Proximity rather than a shared node, which is what an earlier version
+    tested. The stem is a *surface* in this cloud, near enough a tube, and two
+    paths can run down opposite sides of it without ever using the same point
+    -- measured on plant_9 that put one leaf's attachment at the plant base,
+    105 voxels from the stem, because its descent never once coincided with
+    another's.
+
+    For the same reason the centreline is binned and averaged rather than
+    taken from the nodes directly: the mean of two paths on opposite walls of
+    a tube is its axis, while either path alone is its surface.
+
+    Where the stem stops needs no threshold and no label. Above the highest
+    fork there is nothing left for two leaves to share, so the trunk ends
+    there by construction -- which holds for a plant with one leaf or forty.
+    """
+    paths = [trace_to_base(predecessor, int(t)) for t in tips]
+    if not paths:
+        return np.zeros((0, 3)), [], []
+
+    attachments: List[int] = []
+    for i, path in enumerate(paths):
+        others = np.concatenate([p for j, p in enumerate(paths) if j != i]) \
+            if len(paths) > 1 else np.zeros(0, np.int64)
+        if len(others) == 0:
+            attachments.append(int(path[-1]))
+            continue
+        tree = cKDTree(shoot_points[others])
+        close = tree.query(shoot_points[path])[0] <= merge_radius
+        first = int(np.argmax(close)) if close.any() else len(path) - 1
+        attachments.append(int(path[first]))
+
+    top = max(distance[a] for a in attachments)
+    trunk_nodes = np.unique(np.concatenate(
+        [np.array([n for n in path if distance[n] <= top], np.int64) for path in paths]))
+    if len(trunk_nodes) < 2:
+        return shoot_points[trunk_nodes], attachments, paths
+
+    # Bin along the path from the base and average, so opposite walls of the
+    # stem collapse onto its axis instead of zig-zagging between them.
+    d = distance[trunk_nodes]
+    edges = np.linspace(d.min(), d.max(), num_stations + 1)
+    station = np.clip(np.digitize(d, edges) - 1, 0, num_stations - 1)
+    centre = [shoot_points[trunk_nodes[station == s]].mean(axis=0)
+              for s in range(num_stations) if (station == s).sum() >= 2]
+    if len(centre) < 2:
+        return shoot_points[trunk_nodes[np.argsort(d)]], attachments, paths
+
+    # Smooth first, then reject: smoothing pulls each station toward its
+    # neighbours, so a station that was on the cloud can be nudged off it, and
+    # testing beforehand would pass exactly the nodes that end up in mid-air.
+    centre = drop_stations_in_empty_space(_smooth(np.array(centre)), shoot_points)
+    if len(centre) < 2:
+        return shoot_points[trunk_nodes[np.argsort(d)]], attachments, paths
+    return centre, attachments, paths
+
+
+def drop_stations_in_empty_space(
+    centreline: np.ndarray, tissue: np.ndarray, tolerance: float = 3.0,
+) -> np.ndarray:
+    """Remove centreline stations that sit where the plant is not.
+
+    A station is the mean of the trunk nodes in its bin, which is the axis of
+    the stem when those nodes surround it -- and somewhere in mid-air when
+    they do not, as happens wherever paths have not converged yet. The result
+    is a centreline that leaves the cloud, and a leaf whose midrib then reaches
+    out to meet it across empty space.
+
+    The test needs no fixed length: a station on the axis of a tube is about
+    one stem radius from the nearest surface point, so stations are compared
+    against the *median* gap along this plant's own stem and dropped when they
+    exceed it several times over. Scale-free, and it cannot flag a fat stem
+    merely for being fat.
+    """
+    if len(centreline) < 3:
+        return centreline
+    gap = cKDTree(tissue).query(centreline)[0]
+    limit = max(np.median(gap) * tolerance, 1e-12)
+    keep = gap <= limit
+    return centreline[keep] if keep.sum() >= 2 else centreline
+
+
+# --------------------------------------------------------------------------
+# Midrib
+# --------------------------------------------------------------------------
+
+
+def distance_to_polyline(points: np.ndarray, polyline: np.ndarray) -> np.ndarray:
+    """Distance from each point to the nearest *node* of a polyline.
+
+    Node-nearest rather than exact segment distance: the stem centreline is
+    already sampled far more finely than a leaf is long, so the difference is
+    below the voxel size and the KD-tree is a great deal faster.
+    """
+    return cKDTree(polyline).query(points)[0]
+
+
+def _tips_furthest_from_stem(
+    leaf_points: np.ndarray, owner: np.ndarray, stem_path: np.ndarray,
+) -> Dict[int, int]:
+    """Per instance, the index of the point that reaches furthest from the stem."""
+    radial = distance_to_polyline(leaf_points, stem_path)
+    tips: Dict[int, int] = {}
+    for instance in range(int(owner.max()) + 1):
+        member = np.nonzero(owner == instance)[0]
+        if len(member):
+            tips[instance] = int(member[int(np.argmax(radial[member]))])
+    return tips
+
+
+def tip_reach_shortfall(
+    leaf_points: np.ndarray, owner: np.ndarray, tips: Sequence[int], stem_path: np.ndarray,
+) -> List[float]:
+    """How far short of its own leaf's reach each tip falls, per instance.
+
+    The check this stage was missing. A leaf's tip should be the furthest part
+    of it from the stem, so a positive shortfall means the tip was put
+    somewhere the leaf does not end -- which is visible in Blender as a marker
+    on a blade edge with point cloud carrying on past it.
+    """
+    if len(stem_path) < 1 or not len(owner):
+        return []
+    radial = distance_to_polyline(leaf_points, stem_path)
+    out: List[float] = []
+    for instance, tip in enumerate(tips):
+        member = np.nonzero(owner == instance)[0]
+        if len(member) and 0 <= int(tip) < len(radial):
+            out.append(float(radial[member].max() - radial[int(tip)]))
+    return out
+
+
+def leaf_midrib(
+    points: np.ndarray, distance_from_tip: np.ndarray,
+    num_stations: int = 20, min_bin: int = 4,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Midrib for one leaf, from its base to its tip.
+
+    Returns (polyline base->tip, tip position, attachment position).
+
+    Stations are shells of *geodesic* distance from the tip, and each shell's
+    centroid is the midrib estimate for that station -- the lamina is roughly
+    symmetric about the midrib, so the centroid of a cross-section lies on the
+    vein. Geodesic, not straight-line: on a curved blade a Euclidean shell cuts
+    across the curve and merges parts of the leaf that are far apart along it,
+    which bends the midrib through air the leaf does not occupy.
+
+    The attachment is the far end of this curve rather than an input. That is
+    the inversion that matters -- the old code was handed an attachment derived
+    from stem adjacency, and any error in it hooked the whole midrib.
+    """
+    finite = np.isfinite(distance_from_tip)
+    if finite.sum() < min_bin * 2:
+        return np.zeros((0, 3)), points[0], points[0]
+
+    points, distance = points[finite], distance_from_tip[finite]
+    tip = points[int(np.argmin(distance))]
+
+    edges = np.linspace(0.0, float(distance.max()), num_stations + 1)
     station = np.clip(np.digitize(distance, edges) - 1, 0, num_stations - 1)
 
-    axis = [attachment]
-    for i in range(num_stations):
-        members = points[station == i]
-        if len(members) >= min_bin:
-            axis.append(members.mean(axis=0))
-    axis.append(tip)
-    return _smooth(np.array(axis)), tip
+    curve = [points[station == i].mean(axis=0)
+             for i in range(num_stations) if (station == i).sum() >= min_bin]
+    if len(curve) < 2:
+        return np.zeros((0, 3)), tip, points[int(np.argmax(distance))]
+
+    # Built tip-first; reverse so index 0 is the attachment, which is the
+    # contract P6 reads (s = 0 at the petiole).
+    curve = _smooth(np.array(curve))[::-1]
+    return curve, tip, curve[0]
 
 
 def build_from_labels(
@@ -193,6 +654,9 @@ def build_from_labels(
     voxel: float,
     contact_voxels: float = 3.0,
     min_leaf_points: int = 150,
+    min_tip_depth_voxels: float = 8.0,
+    min_persistence_ratio: float = 0.5,
+    k_neighbors: int = 10,
 ) -> LabelledStructure:
     """Full structure from a labelled cloud, in the plant frame."""
     leaf_ids_in_order = [i for i, n in enumerate(class_order) if "leaf" in n]
@@ -203,23 +667,113 @@ def build_from_labels(
     stem_points = points[np.isin(labels, stem_ids)]
     root_points = points[np.isin(labels, root_ids)] if root_ids else None
 
-    stem_path = fit_stem_path(stem_points) if len(stem_points) else np.zeros((0, 3))
+    instancing = instance_by_tips(
+        leaf_points, stem_points,
+        contact_radius=voxel * contact_voxels,
+        k_neighbors=k_neighbors,
+        min_points=min_leaf_points,
+        min_tip_depth=voxel * min_tip_depth_voxels,
+        min_persistence_ratio=min_persistence_ratio,
+    )
 
-    instances, attachments = instance_by_attachment(
-        leaf_points, stem_points, contact_radius=voxel * contact_voxels,
-        min_points=min_leaf_points)
+    # --- the shoot as one tree, so a midrib can run past the blade to the stem ---
+    leaf_index = np.nonzero(np.isin(labels, leaf_ids_in_order))[0]
+    shoot_index = np.nonzero(np.isin(labels, leaf_ids_in_order + stem_ids))[0]
+    shoot = points[shoot_index]
+    to_shoot = np.full(len(points), -1, np.int64)
+    to_shoot[shoot_index] = np.arange(len(shoot_index))
 
-    axes, tips = [], []
-    for instance in range(len(attachments)):
-        subset = leaf_points[instances == instance]
-        if len(subset) < min_leaf_points:
+    # The root is the stem carried on below the clamp, so its top is the one
+    # place the stem is certain to pass through -- a far better anchor than
+    # "lowest point", which is whatever hangs down furthest.
+    anchor = root_anchor(root_points, shoot)
+    graph, base_distance, predecessor = shoot_paths(
+        shoot, base_radius=voxel * 8.0, k_neighbors=k_neighbors, anchor=anchor)
+
+    shoot_tips = [int(to_shoot[leaf_index[int(t)]]) for t in instancing.accepted_tips]
+    stem_path, attach_nodes, paths = trunk_and_attachments(
+        shoot, predecessor, base_distance, shoot_tips, merge_radius=voxel * 4.0)
+    if len(stem_path) < 2 and len(stem_points):
+        stem_path = fit_stem_path(stem_points)
+
+    # Persistence says how many leaves there are, and does that well. Where the
+    # tip *is* is a different question, and geodesic depth answers it badly: on
+    # a sheet the point furthest from the contact region measured through the
+    # tissue is often a lateral corner rather than the pointy end, especially
+    # when the petiole carries the stem label so the leaf touches the stem at a
+    # corner of the blade. Measured on plant_9 that left five of seven tips
+    # short of their own leaf's reach, one by 45 voxels.
+    #
+    # A leaf's tip is simply the part of it that gets furthest from the stem,
+    # so once the trunk is known each instance re-picks its own tip that way.
+    if len(stem_path) > 1 and (instancing.owner >= 0).any():
+        refined = _tips_furthest_from_stem(leaf_points, instancing.owner, stem_path)
+        if refined:
+            instancing.accepted_tips = np.array(
+                [refined.get(i, int(instancing.accepted_tips[i]))
+                 for i in range(len(instancing.accepted_tips))], np.int64)
+            shoot_tips = [int(to_shoot[leaf_index[int(t)]])
+                          for t in instancing.accepted_tips]
+            # Re-solve the topology from the corrected tips, so each leaf's
+            # path down to its fork starts from the right end of the leaf.
+            stem_path, attach_nodes, paths = trunk_and_attachments(
+                shoot, predecessor, base_distance, shoot_tips, merge_radius=voxel * 4.0)
+
+    # Carry the stem down to where the root begins, so the two organs meet
+    # instead of stopping a gap apart.
+    if anchor is not None and len(stem_path) > 1:
+        if np.linalg.norm(stem_path[0] - anchor) > voxel:
+            stem_path = np.vstack([anchor, stem_path])
+
+    axes, tips, attachments = [], [], []
+    num = int(instancing.owner.max()) + 1 if (instancing.owner >= 0).any() else 0
+    for instance in range(num):
+        member = np.nonzero(instancing.owner == instance)[0]
+        if instance >= len(paths):
             continue
-        axis, tip = leaf_axis(subset, attachments[instance])
-        axes.append(axis)
+        # Geodesic distance measured from *this* instance's tip, over this
+        # instance only. The field on `instancing` was measured from the tip
+        # persistence proposed, which the refinement above may have moved.
+        member_shoot = to_shoot[leaf_index[member]]
+        member_shoot = member_shoot[member_shoot >= 0]
+        local = np.nonzero(member_shoot == shoot_tips[instance])[0]
+        if len(local):
+            sub = graph[member_shoot][:, member_shoot]
+            from_tip = dijkstra(sub, directed=False, indices=[int(local[0])], min_only=True)
+        else:
+            from_tip = instancing.distance_from_tip[member]
+
+        blade, tip, _base = leaf_midrib(leaf_points[member], from_tip)
+        if len(blade) < 2:
+            continue
+
+        # Carry the curve on past the lamina to the fork. The petiole is thin
+        # and usually carries the stem label, so it is not in the instance at
+        # all, and binning cannot recover it either -- a one-point-wide chain
+        # puts one or two points in a shell and `min_bin` throws it away. That
+        # is why midribs were stopping on the edge of the blade. The path is
+        # already a centreline, so it is appended rather than re-averaged.
+        path = paths[instance]
+        stop = path.index(attach_nodes[instance]) + 1
+        own = set(to_shoot[leaf_index[member]].tolist())
+        extension = [shoot[n] for n in path[:stop] if n not in own]
+        curve = np.array(list(reversed(extension)) + list(blade)) if extension else blade
+
+        # Land the last node on the stem line itself. The path descends the
+        # *surface* of the stem, so it stops one stem-radius short of the axis
+        # -- correct anatomically, but it leaves every midrib hanging beside
+        # the centreline rather than meeting it, and the insertion angle is
+        # measured against that centreline.
+        if len(stem_path) > 1:
+            nearest = stem_path[int(np.argmin(np.linalg.norm(stem_path - curve[0], axis=1)))]
+            curve = np.vstack([nearest, curve])
+
+        axes.append(_smooth(curve) if len(curve) > 2 else curve)
         tips.append(tip)
+        attachments.append(shoot[attach_nodes[instance]])
 
     return LabelledStructure(
-        stem_path=stem_path, leaf_ids=instances, leaf_points=leaf_points,
-        attachments=attachments[: len(axes)], tips=tips, axes=axes,
-        root_points=root_points,
+        stem_path=stem_path, leaf_ids=instancing.owner, leaf_points=leaf_points,
+        attachments=attachments, tips=tips, axes=axes,
+        root_points=root_points, instancing=instancing,
     )

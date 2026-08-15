@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Batch-run the full plant capture -> skeleton -> Gaussian Splat pipeline
-# (estimate_plant_skeleton.py -> train_gaussian_splat.py ->
-# align_plant_skeleton.py) over every plant folder under a root directory,
+# (pose-estimate-skeleton -> pose-train-splat ->
+# pose-align-skeleton) over every plant folder under a root directory,
 # using the GPU throughout. Stops short of Blender import -- that part is
 # manual (blender_plant_import.py, run inside Blender).
 #
@@ -60,6 +60,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Run the CLIs as pose_estimator modules straight from src/, so the sweep
+# works whether or not the repo is pip-installed in the active env.
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 STATUS_DIR="$(mktemp -d)"
 trap 'rm -rf "$STATUS_DIR"' EXIT
 
@@ -82,32 +85,32 @@ run_plant() {
         echo "[$plant_name] starting on GPU $gpu_index: $(date)"
         echo "=============================================================="
 
-        echo "[$plant_name] 1/3 estimate_plant_skeleton.py (COLMAP + skeleton, GPU SIFT)"
-        if ! python3 "$REPO_ROOT/estimate_plant_skeleton.py" \
+        echo "[$plant_name] 1/3 pose-estimate-skeleton (COLMAP + skeleton, GPU SIFT)"
+        if ! python3 -m pose_estimator.cli.estimate_skeleton \
             --images "$images_dir" \
             --workdir "$plant_dir" \
             --mask-mode none \
             --use-gpu; then
-            echo "[$plant_name] FAILED at estimate_plant_skeleton.py"
+            echo "[$plant_name] FAILED at pose-estimate-skeleton"
             echo "failed" > "$STATUS_DIR/$plant_name"
             return
         fi
 
-        echo "[$plant_name] 2/3 train_gaussian_splat.py ($ITERATIONS iterations, GPU $gpu_index)"
-        if ! python3 "$REPO_ROOT/train_gaussian_splat.py" \
+        echo "[$plant_name] 2/3 pose-train-splat ($ITERATIONS iterations, GPU $gpu_index)"
+        if ! python3 -m pose_estimator.cli.train_splat \
             --workdir "$plant_dir" \
             --iterations "$ITERATIONS"; then
-            echo "[$plant_name] FAILED at train_gaussian_splat.py"
+            echo "[$plant_name] FAILED at pose-train-splat"
             echo "failed" > "$STATUS_DIR/$plant_name"
             return
         fi
 
-        echo "[$plant_name] 3/3 align_plant_skeleton.py (no --scale-ref-* -- output won't be "
+        echo "[$plant_name] 3/3 pose-align-skeleton (no --scale-ref-* -- output won't be "
         echo "    metric; re-run this one step later with --scale-ref-a/-b/-distance-m once you"
         echo "    have a real-world measurement, no need to redo reconstruction/training)"
-        if ! python3 "$REPO_ROOT/align_plant_skeleton.py" \
+        if ! python3 -m pose_estimator.cli.align_skeleton \
             --workdir "$plant_dir"; then
-            echo "[$plant_name] FAILED at align_plant_skeleton.py"
+            echo "[$plant_name] FAILED at pose-align-skeleton"
             echo "failed" > "$STATUS_DIR/$plant_name"
             return
         fi

@@ -10,6 +10,8 @@ photographs it came from.
 
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
@@ -23,6 +25,95 @@ LEAF_PALETTE = np.array(
     ],
     dtype=np.uint8,
 )  # BGR
+
+
+@dataclass
+class StructureView:
+    """Everything an inspector needs, read back from a finished P5 run.
+
+    Loading from the artifacts rather than recomputing is deliberate: a viewer
+    that re-derived the instancing could disagree with what the pipeline
+    actually wrote, which is precisely the thing you would be trying to check.
+    """
+
+    leaf_points: np.ndarray            # (N, 3) in the plant frame
+    leaf_ids: np.ndarray               # (N,) instance id, -1 = unassigned
+    depth: np.ndarray                  # (N,) geodesic distance from the stem
+    candidate_tips: np.ndarray         # indices into leaf_points
+    accepted_tips: np.ndarray
+    axes: List[np.ndarray] = field(default_factory=list)      # midribs, base -> tip
+    stem_path: np.ndarray = field(default_factory=lambda: np.zeros((0, 3)))
+    stem_points: np.ndarray = field(default_factory=lambda: np.zeros((0, 3)))
+    root_points: np.ndarray = field(default_factory=lambda: np.zeros((0, 3)))
+    voxel: float = 1.0
+
+    @property
+    def num_leaves(self) -> int:
+        return len(self.axes)
+
+
+def load_structure_view(workdir: Union[str, Path]) -> StructureView:
+    """Read a finished P5 run back into memory for inspection."""
+    from .ply_io import read_ply_vertices
+
+    workdir = Path(workdir)
+    p5, p4c = workdir / "p5", workdir / "p4c"
+    missing = [p for p in (p5 / "leaf_points_xyz.npy", p5 / "leaf_points.npy",
+                           p5 / "stem_graph.json") if not p.exists()]
+    if missing:
+        raise SystemExit(
+            "missing " + ", ".join(str(m) for m in missing)
+            + "\nrun pose-structure on this workdir first")
+
+    leaf_points = np.load(p5 / "leaf_points_xyz.npy")
+    leaf_ids = np.load(p5 / "leaf_points.npy")
+    depth = (np.load(p5 / "leaf_depth.npy") if (p5 / "leaf_depth.npy").exists()
+             else np.full(len(leaf_points), np.nan))
+
+    candidate = accepted = np.zeros(0, np.int64)
+    if (p5 / "tips.npz").exists():
+        tips = np.load(p5 / "tips.npz")
+        candidate, accepted = tips["candidate"], tips["accepted"]
+
+    with open(p5 / "stem_graph.json") as f:
+        graph = json.load(f)
+    axes = [np.array(leaf["axis_xyz"]) for leaf in graph.get("leaves", [])]
+    stem_path = np.array(graph.get("stem_path_xyz") or []).reshape(-1, 3)
+
+    voxel = 1.0
+    if (workdir / "p4" / "hull.json").exists():
+        with open(workdir / "p4" / "hull.json") as f:
+            voxel = json.load(f)["voxel_size"]
+
+    # Stem and root are not stored separately -- rebuild them from the labelled
+    # cloud through the plant frame P5 recorded, so the viewer shows the same
+    # transform the structure was solved in.
+    stem_points = root_points = np.zeros((0, 3))
+    surface = workdir / "p4b" / "surface.ply"
+    hull = workdir / "p4" / "hull_points.ply"
+    cloud_path = surface if surface.exists() else hull
+    if cloud_path.exists() and (p4c / "labels.npy").exists() and "plant_frame" in graph:
+        fields = read_ply_vertices(cloud_path)
+        cloud = np.stack([fields["x"], fields["y"], fields["z"]], axis=1).astype(float)
+        labels = np.load(p4c / "labels.npy")
+        if len(labels) == len(cloud):
+            order = [str(x) for x in
+                     np.load(p4c / "votes.npz", allow_pickle=True)["class_order"]]
+            frame = graph["plant_frame"]
+            origin = np.array(frame["origin"])
+            rotation = np.array(frame["rotation"])
+            upright = (cloud - origin) @ rotation.T
+            stem_ids = [i for i, n in enumerate(order) if n in ("stem", "petiole", "branch")]
+            root_ids = [i for i, n in enumerate(order) if n == "root"]
+            stem_points = upright[np.isin(labels, stem_ids)]
+            root_points = upright[np.isin(labels, root_ids)]
+
+    return StructureView(
+        leaf_points=leaf_points, leaf_ids=leaf_ids, depth=depth,
+        candidate_tips=candidate, accepted_tips=accepted, axes=axes,
+        stem_path=stem_path, stem_points=stem_points, root_points=root_points,
+        voxel=voxel,
+    )
 
 
 def write_structure_3d_plot(
@@ -97,6 +188,99 @@ def write_structure_3d_plot(
     fig.savefig(out_path, dpi=110)
     plt.close(fig)
     return out_path
+
+
+def write_instancing_plot(
+    out_path: Union[str, Path], structure, voxel: float, max_points: int = 40000,
+) -> Optional[Path]:
+    """The three steps of the leaf split, side by side.
+
+    Left to right: what the split is computed from, what it decided, and what
+    came out. A wrong leaf count is almost always visible in the first two --
+    either the depth field is wrong (islands, or the stem seed in the wrong
+    place) or the tips are, and the final panel alone cannot tell you which.
+    """
+    inst = getattr(structure, "instancing", None)
+    if inst is None or len(structure.leaf_points) == 0:
+        return None
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    pts = structure.leaf_points
+    show = np.arange(len(pts))
+    if len(pts) > max_points:
+        show = np.random.default_rng(0).choice(len(pts), max_points, replace=False)
+
+    depth = inst.depth
+    finite = np.isfinite(depth)
+    fig = plt.figure(figsize=(17, 5.6))
+
+    ax = fig.add_subplot(1, 3, 1, projection="3d")
+    ok = show[finite[show]]
+    bad = show[~finite[show]]
+    if len(ok):
+        ax.scatter(pts[ok, 0], pts[ok, 1], pts[ok, 2], c=depth[ok] / voxel,
+                   cmap="viridis", s=0.8, alpha=0.85, linewidths=0)
+    if len(bad):
+        ax.scatter(pts[bad, 0], pts[bad, 1], pts[bad, 2], c="magenta", s=1.6, linewidths=0)
+    ax.set_title(f"1. geodesic depth from the stem\n"
+                 f"{'magenta = unreachable island' if len(bad) else 'all tissue reachable'}",
+                 fontsize=9.5)
+
+    ax = fig.add_subplot(1, 3, 2, projection="3d")
+    ax.scatter(pts[show, 0], pts[show, 1], pts[show, 2], c="#D3DAD5", s=0.5,
+               alpha=0.35, linewidths=0)
+    accepted = set(int(t) for t in inst.accepted_tips)
+    rejected = [int(t) for t in inst.candidate_tips if int(t) not in accepted]
+    if rejected:
+        ax.scatter(pts[rejected, 0], pts[rejected, 1], pts[rejected, 2],
+                   c="#9AA3A8", s=26, marker="x", linewidths=1.2)
+    if len(inst.accepted_tips):
+        keep = inst.accepted_tips.astype(int)
+        ax.scatter(pts[keep, 0], pts[keep, 1], pts[keep, 2],
+                   c="#1F9E4B", s=90, marker="o", edgecolors="k", linewidths=0.8)
+    ax.set_title(f"2. tips: {len(inst.candidate_tips)} candidates -> "
+                 f"{len(inst.accepted_tips)} leaves\n(grey x = merged into another tip)",
+                 fontsize=9.5)
+
+    ax = fig.add_subplot(1, 3, 3, projection="3d")
+    colors = np.full((len(pts), 3), 0.82)
+    for leaf_id in range(max(structure.num_leaves, 1)):
+        hit = inst.owner == leaf_id
+        if hit.any():
+            colors[hit] = LEAF_PALETTE[leaf_id % len(LEAF_PALETTE)][::-1] / 255.0
+    ax.scatter(pts[show, 0], pts[show, 1], pts[show, 2], c=colors[show], s=0.8,
+               alpha=0.8, linewidths=0)
+    for axis in structure.axes:
+        ax.plot(axis[:, 0], axis[:, 1], axis[:, 2], color="k", lw=2.0)
+    ax.set_title(f"3. {structure.num_leaves} instances, grown inward from their tips\n"
+                 f"(black = midrib, base to tip)", fontsize=9.5)
+
+    for ax in fig.axes:
+        _equalise(ax, pts[show])
+        ax.view_init(elev=16, azim=-60)
+        for setter in (ax.set_xticklabels, ax.set_yticklabels, ax.set_zticklabels):
+            setter([])
+
+    fig.suptitle("P5 leaf instancing: tips separate what attachments cannot", fontsize=12)
+    fig.tight_layout()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+    return out_path
+
+
+def _equalise(ax, points: np.ndarray) -> None:
+    span = (points.max(axis=0) - points.min(axis=0)).max() / 2.0
+    mid = (points.max(axis=0) + points.min(axis=0)) / 2.0
+    ax.set_xlim(mid[0] - span, mid[0] + span)
+    ax.set_ylim(mid[1] - span, mid[1] + span)
+    ax.set_zlim(mid[2] - span, mid[2] + span)
 
 
 def write_reprojected_skeleton(

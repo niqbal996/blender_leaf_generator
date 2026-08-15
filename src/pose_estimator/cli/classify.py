@@ -1,10 +1,10 @@
 """P4c stage 1 CLI: classify every frame's pixels into organ classes.
 
-    pose-classify --workdir runs/plant_9 --seed-frame 57 \\
-        --seeds "leaf:140,150" "leaf:400,250" "stem:300,300" "root:370,640"
+    pose-pick-seeds --workdir runs/plant_9              # click the seeds
+    pose-classify   --workdir runs/plant_9 --seeds-file runs/plant_9/p4c/seeds.json
 
     pose-classify --workdir runs/plant_9 --backend sam \\
-        --checkpoint checkpoints/sam2.1_hiera_large.pt
+        --checkpoint checkpoints/sam2.1_hiera_large.pt      # no seeds at all
 
 Reads <workdir>/p1/frames and p2/masks/plant. Writes into <workdir>/p4c:
     class_maps/frame_XXXX.png   uint8, 0 = not plant, i+1 = class_order[i]
@@ -19,12 +19,15 @@ maps written here are the artifact that makes each half measurable -- score
 these against a few hand-labelled frames, and separately feed the fusion
 synthetic perfect maps to check it returns them.
 
-Seed coordinates for the dino backend are read off the *cropped* seed frame.
-Generate a coordinate grid to pick them from with:
+Three ways to give the dino backend its seeds, in order of preference:
 
-    python scripts/dinov3_organ_lab.py --mode reference \\
-        --images <workdir>/p1/frames --frames 57 \\
-        --plant-mask-dir <workdir>/p2/masks/plant --out /tmp/ref
+    --seeds-file p4c/seeds.json     clicked with pose-pick-seeds. Coordinates
+                                    come from the same crop this stage builds,
+                                    and seeds from several frames are pooled.
+    --seed-bank <path>.npz          reuse an earlier specimen's vectors, so a
+                                    50-plant batch needs no clicking per plant.
+    --seeds "leaf:140,150" ...      typed by hand, in the *cropped* frame's
+                                    pixel space. Needs --seed-frame too.
 """
 
 import argparse
@@ -64,8 +67,14 @@ def build_dino_classifier(
     dino_size: int,
     hf_token: Optional[str],
     device: str,
+    seeds_file: Optional[Path] = None,
 ):
-    from pose_estimator.dino import DinoBackbone, build_seed_vectors, parse_seeds
+    from pose_estimator.dino import (
+        DinoBackbone,
+        build_seed_vectors,
+        build_seed_vectors_multi,
+        parse_seeds,
+    )
 
     frames_dir = workdir / "p1" / "frames"
     mask_dir = workdir / "p2" / "masks" / "plant"
@@ -98,9 +107,31 @@ def build_dino_classifier(
                 f"Their feature spaces are unrelated even when the widths match. "
                 f"Re-run with --dino-model {bank_model}, or rebuild the bank with --seeds.")
         print(f"  {len(seed_labels)} seed vectors loaded from {seed_bank}")
+    elif seeds_file is not None:
+        # Written by pose-pick-seeds, which clicked them on the same crop this
+        # classifier builds -- so there is no coordinate space to get wrong and
+        # nothing to retype.
+        from pose_estimator.seed_picker import load_seeds
+
+        picked, _class_order, file_pad = load_seeds(seeds_file)
+        by_frame: dict = {}
+        for seed in picked:
+            by_frame.setdefault(seed.frame, []).append(seed)
+        seed_vectors, seed_labels = build_seed_vectors_multi(
+            backbone, frames_dir, mask_dir, by_frame, pad=file_pad)
+        print(f"  {len(picked)} seeds from {len(by_frame)} frame(s) in {seeds_file}")
+        for stem in sorted(by_frame):
+            kinds = ", ".join(f"{n}x {lbl}" for lbl, n in
+                              sorted({s.label: sum(1 for t in by_frame[stem] if t.label == s.label)
+                                      for s in by_frame[stem]}.items()))
+            print(f"    {stem}: {kinds}")
     else:
         if not seeds or seed_frame is None:
-            raise SystemExit("give --seeds and --seed-frame, or --seed-bank")
+            raise SystemExit(
+                "give seeds one of three ways:\n"
+                "  --seeds-file p4c/seeds.json   (from pose-pick-seeds -- click, don't type)\n"
+                "  --seeds \"leaf:140,150\" ... --seed-frame 57\n"
+                "  --seed-bank <path>/seed_bank.npz   (reuse an earlier specimen's)")
         parsed = parse_seeds(seeds)
         seed_paths = sorted(frames_dir.glob("frame_*.jpg"))
         if seed_frame >= len(seed_paths):
@@ -136,6 +167,7 @@ def run(
     seed_frame: Optional[int] = None,
     seed_bank: Optional[Path] = None,
     save_seed_bank: Optional[Path] = None,
+    seeds_file: Optional[Path] = None,
     dino_model: str = "facebook/dinov3-vitb16-pretrain-lvd1689m",
     dino_size: int = 896,
     hf_token: Optional[str] = None,
@@ -155,7 +187,7 @@ def run(
     if backend == "dino":
         classifier = build_dino_classifier(workdir, seeds, seed_frame, seed_bank,
                                            save_seed_bank, dino_model, dino_size,
-                                           hf_token, device)
+                                           hf_token, device, seeds_file)
         settings = {"model": dino_model, "size": dino_size, "stride": stride}
     elif backend == "sam":
         if checkpoint is None:
@@ -233,8 +265,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                         help="dino: nearest clicked example in DINOv3 feature space, "
                              "open-vocabulary. sam: SAM2 masks assigned to leaf/stem by shape, "
                              "fixed vocabulary but real object boundaries.")
+    parser.add_argument("--seeds-file", type=Path,
+                        help="(dino) seeds clicked with pose-pick-seeds, normally "
+                             "<workdir>/p4c/seeds.json. Preferred over --seeds: the "
+                             "coordinates were placed on the same crop the classifier "
+                             "builds, and seeds from several frames are supported")
     parser.add_argument("--seeds", nargs="+",
-                        help='(dino) labelled points on the seed frame, e.g. "leaf:140,150"')
+                        help='(dino) labelled points typed by hand, e.g. "leaf:140,150". '
+                             "Coordinates are in the *cropped* frame")
     parser.add_argument("--seed-frame", type=int,
                         help="(dino) index into p1/frames the seed coordinates were read off")
     parser.add_argument("--seed-bank", type=Path,
@@ -267,7 +305,8 @@ def main(argv: Optional[list] = None) -> None:
 
     run(workdir=args.workdir, backend=args.backend, seeds=args.seeds,
         seed_frame=args.seed_frame, seed_bank=args.seed_bank,
-        save_seed_bank=args.save_seed_bank, dino_model=args.dino_model,
+        save_seed_bank=args.save_seed_bank, seeds_file=args.seeds_file,
+        dino_model=args.dino_model,
         dino_size=args.dino_size, hf_token=args.hf_token or os.environ.get("HF_TOKEN"),
         checkpoint=args.checkpoint, stride=args.stride, device=args.device)
 

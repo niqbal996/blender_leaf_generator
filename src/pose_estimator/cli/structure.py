@@ -29,8 +29,12 @@ import numpy as np
 from pose_estimator.ply_io import read_ply_vertices, write_ply_vertices
 from pose_estimator.pose import orbit_frame
 from pose_estimator.structure import solve_plant_frame
-from pose_estimator.structure_labels import build_from_labels
-from pose_estimator.structure_viz import write_reprojected_skeleton, write_structure_3d_plot
+from pose_estimator.structure_labels import build_from_labels, tip_reach_shortfall
+from pose_estimator.structure_viz import (
+    write_instancing_plot,
+    write_reprojected_skeleton,
+    write_structure_3d_plot,
+)
 
 STEM_RGB = (160, 60, 200)
 ROOT_RGB = (240, 140, 40)
@@ -43,6 +47,8 @@ def run(
     source: str = "auto",
     contact_voxels: float = 3.0,
     min_leaf_points: int = 150,
+    min_tip_depth_voxels: float = 8.0,
+    min_persistence_ratio: float = 0.5,
 ) -> dict:
     import pycolmap
 
@@ -97,28 +103,38 @@ def run(
     print(f"  organ classes: {', '.join(class_order)}")
     structure = build_from_labels(upright, labels, class_order, voxel,
                                   contact_voxels=contact_voxels,
-                                  min_leaf_points=min_leaf_points)
+                                  min_leaf_points=min_leaf_points,
+                                  min_tip_depth_voxels=min_tip_depth_voxels,
+                                  min_persistence_ratio=min_persistence_ratio)
 
-    print(f"  stem path {len(structure.stem_path)} nodes, "
+    _report_instancing(structure, voxel)
+
+    print(f"\n  stem path {len(structure.stem_path)} nodes, "
           f"{structure.num_leaves} leaf instance(s), "
           f"{0 if structure.root_points is None else len(structure.root_points)} root points")
     for i, axis in enumerate(structure.axes):
         n = int((structure.leaf_ids == i).sum())
         length = float(np.linalg.norm(np.diff(axis, axis=0), axis=1).sum())
-        print(f"    leaf {i}: {n:>6} points, axis length {length:.4f}")
+        depth = structure.instancing.depth[structure.leaf_ids == i]
+        finite = np.isfinite(depth)
+        print(f"    leaf {i}: {n:>6} points, midrib {length:.4f}, "
+              f"reaches {depth[finite].max() / voxel:>5.1f} voxels from the stem"
+              if finite.any() else f"    leaf {i}: {n:>6} points, midrib {length:.4f}")
 
     stem_ids = [i for i, n in enumerate(class_order) if n in ("stem", "petiole", "branch")]
     stem_points = upright[np.isin(labels, stem_ids)]
 
     _write_outputs(p5_dir, structure, stem_points, frame, clamp)
+    _write_instancing_artifacts(p5_dir, structure, voxel)
     write_structure_3d_plot(p5_dir / "diag" / "structure_3d.png",
                             structure.leaf_points, structure.leaf_ids,
                             structure.num_leaves, structure.stem_path,
                             structure.root_points)
+    write_instancing_plot(p5_dir / "diag" / "instancing.png", structure, voxel)
     write_reprojected_skeleton(p5_dir / "diag", structure.stem_path, structure.axes,
                                frame, reconstruction, workdir / "p1" / "frames")
 
-    report = _evaluate(structure, clamp, frame)
+    report = _evaluate(structure, clamp, frame, voxel)
     with open(p5_dir / "p5.json", "w") as f:
         json.dump(report, f, indent=2)
 
@@ -127,6 +143,89 @@ def run(
         print(f"    [{'PASS' if check['pass'] else 'FAIL'}] {name}: {check['detail']}")
     print(f"\n  artifacts + diagnostics in {p5_dir}")
     return report
+
+
+def _report_instancing(structure, voxel: float) -> None:
+    """Print the split one step at a time, because the leaf count alone never
+    says which step went wrong."""
+    inst = structure.instancing
+    if inst is None:
+        return
+    stats = inst.to_dict()
+    unreachable = stats["leaf_points"] - stats["reachable_from_stem"]
+
+    print("\n  leaf instancing, step by step:")
+    print(f"    1. leaf tissue                 {stats['leaf_points']:>7} points")
+    print(f"    2. touching the stem           {stats['contact_points']:>7} points "
+          f"({100 * stats['contact_points'] / max(stats['leaf_points'], 1):.1f}%) -- the seed for depth")
+    if unreachable:
+        print(f"       no path back to the stem   {unreachable:>7} points "
+              f"({100 * unreachable / max(stats['leaf_points'], 1):.1f}%) -- islands in the surface")
+    print(f"    3. deepest point is            {stats['max_depth'] / voxel:>7.0f} voxels of "
+          f"tissue from the stem")
+    print(f"    4. candidate tips              {stats['candidate_tips']:>7}")
+    print(f"    5. survive persistence         {stats['tips_after_merge']:>7}  "
+          f"<- a maximum on a blade already counted is dropped here")
+    print(f"    6. instances kept              {stats['instances_kept']:>7}"
+          + (f"  ({stats['instances_dropped_as_too_small']} dropped as too small)"
+             if stats["instances_dropped_as_too_small"] else ""))
+    if stats["unassigned_points"]:
+        print(f"       unassigned                 {stats['unassigned_points']:>7} points")
+
+
+def _write_instancing_artifacts(p5_dir: Path, structure, voxel: float) -> None:
+    """Dump each intermediate as something openable, not just a number.
+
+    The clouds are the point: `depth.ply` shows what the split is computed
+    from, `tips.ply` shows what it decided, and comparing the two explains a
+    wrong leaf count faster than any log line.
+    """
+    inst = structure.instancing
+    if inst is None or len(structure.leaf_points) == 0:
+        return
+    pts = structure.leaf_points
+
+    with open(p5_dir / "instancing.json", "w") as f:
+        json.dump({**inst.to_dict(), "voxel_size": voxel,
+                   "max_depth_voxels": inst.to_dict()["max_depth"] / voxel,
+                   "tips": [{"index": int(t),
+                             "xyz": pts[int(t)].tolist(),
+                             "depth_voxels": float(inst.depth[int(t)] / voxel)}
+                            for t in inst.accepted_tips]}, f, indent=2)
+
+    # geodesic depth from the stem, as a heat map over the leaf tissue
+    finite = np.isfinite(inst.depth)
+    scaled = np.zeros(len(pts))
+    if finite.any():
+        top = inst.depth[finite].max()
+        scaled[finite] = inst.depth[finite] / max(top, 1e-9)
+    heat = (np.clip(scaled, 0, 1) * 255).astype(np.uint8)
+    rgb = np.stack([heat, np.full_like(heat, 60), 255 - heat], axis=1)
+    rgb[~finite] = (255, 0, 255)  # unreachable islands, impossible to miss
+    _ply(p5_dir / "depth.ply", pts, rgb)
+
+    # candidate tips vs the ones that survived merging
+    if len(inst.candidate_tips):
+        accepted = set(int(t) for t in inst.accepted_tips)
+        tip_rgb = np.array([[0, 220, 0] if int(t) in accepted else [120, 120, 120]
+                            for t in inst.candidate_tips], np.uint8)
+        _ply(p5_dir / "tips.ply", pts[inst.candidate_tips], tip_rgb)
+
+    # Indices as well as positions, so a viewer can tell accepted from merged
+    # without having to read colours back out of a PLY.
+    np.savez(p5_dir / "tips.npz",
+             candidate=inst.candidate_tips, accepted=inst.accepted_tips,
+             group=inst.tip_group, depth=inst.depth[inst.candidate_tips]
+             if len(inst.candidate_tips) else np.zeros(0))
+    np.save(p5_dir / "leaf_depth.npy", inst.depth)
+
+
+def _ply(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
+    write_ply_vertices(path, {
+        "x": xyz[:, 0].astype(np.float32), "y": xyz[:, 1].astype(np.float32),
+        "z": xyz[:, 2].astype(np.float32),
+        "red": rgb[:, 0].astype(np.uint8), "green": rgb[:, 1].astype(np.uint8),
+        "blue": rgb[:, 2].astype(np.uint8)})
 
 
 def _write_outputs(p5_dir: Path, structure, stem_points: np.ndarray, frame, clamp) -> None:
@@ -178,9 +277,14 @@ def _write_outputs(p5_dir: Path, structure, stem_points: np.ndarray, frame, clam
         "red": rgb[:, 0], "green": rgb[:, 1], "blue": rgb[:, 2]})
 
 
-def _evaluate(structure, clamp, frame) -> dict:
+def _evaluate(structure, clamp, frame, voxel: float) -> dict:
     lengths = [float(np.linalg.norm(np.diff(a, axis=0), axis=1).sum()) for a in structure.axes]
     per_leaf = [int((structure.leaf_ids == i).sum()) for i in range(structure.num_leaves)]
+    shortfall = tip_reach_shortfall(
+        structure.leaf_points, structure.leaf_ids,
+        structure.instancing.accepted_tips if structure.instancing is not None else [],
+        structure.stem_path)
+    worst = max(shortfall) / voxel if shortfall else 0.0
 
     checks = {
         "stem_traced": {
@@ -189,7 +293,10 @@ def _evaluate(structure, clamp, frame) -> dict:
         },
         "leaves_found": {
             "pass": structure.num_leaves >= 2,
-            "detail": f"{structure.num_leaves} leaf instance(s) split at their stem attachments",
+            "detail": (f"{structure.num_leaves} leaf instance(s) from "
+                       f"{len(structure.instancing.candidate_tips)} candidate tips"
+                       if structure.instancing is not None
+                       else f"{structure.num_leaves} leaf instance(s)"),
         },
         "leaves_have_points": {
             "pass": bool(per_leaf) and min(per_leaf) >= 150,
@@ -205,6 +312,14 @@ def _evaluate(structure, clamp, frame) -> dict:
                        f"({max(lengths) / max(min(lengths), 1e-9):.1f}x spread, expected when "
                        f"small leaves are resolved)" if lengths else "no leaves"),
         },
+        # A leaf's tip is the part of it that reaches furthest from the stem.
+        # If a tip falls short, the cloud visibly carries on past the marker --
+        # which is what a tip sitting on a blade edge looks like in Blender.
+        "tips_reach_the_end_of_their_leaf": {
+            "pass": worst <= 3.0,
+            "detail": f"worst tip falls {worst:.1f} voxels short of its own leaf's "
+                      f"furthest point (limit 3)",
+        },
         "origin_is_the_clamp_line": {
             "pass": clamp is not None,
             "detail": "clamp gap found" if clamp is not None
@@ -216,6 +331,7 @@ def _evaluate(structure, clamp, frame) -> dict:
         "num_leaves": structure.num_leaves,
         "points_per_leaf": per_leaf,
         "axis_lengths": lengths,
+        "tip_shortfall_voxels": [round(v / voxel, 2) for v in shortfall],
         "plant_frame": frame.to_dict(),
         "checks": checks,
         "all_passed": all(c["pass"] for c in checks.values()),
@@ -230,18 +346,27 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--source", choices=["auto", "surface", "hull"], default="auto",
                         help="Which cloud to read. 'auto' prefers the P4b surface when present.")
     parser.add_argument("--contact-voxels", type=float, default=3.0,
-                        help="How close a leaf point must be to a stem point to count as an "
-                             "insertion, in hull voxels. Sweeping this on plant_9 gave 178, 73, "
-                             "28, 14 and 4 candidate sites at 1.5, 2, 3, 4 and 6 -- no plateau, "
-                             "which means the organ labels are still too intermixed for "
-                             "adjacency to identify an insertion. Fix the labels, not this.")
+                        help="How close a leaf point must be to a stem point to count as "
+                             "touching it. Only seeds the depth field now -- it no longer "
+                             "decides the leaf count, which is what made it critical before.")
     parser.add_argument("--min-leaf-points", type=int, default=150,
                         help="Drop leaf instances smaller than this. Known to remove the tiny "
                              "basal and apex leaves that ground truth says are present.")
+    parser.add_argument("--min-tip-depth-voxels", type=float, default=8.0,
+                        help="Ignore maxima shallower than this. Low on purpose -- persistence "
+                             "does the rejecting, so this only screens out surface noise.")
+    parser.add_argument("--min-persistence-ratio", type=float, default=0.5,
+                        help="A maximum is its own leaf when it survives down through this "
+                             "fraction of its own depth before joining another. A real leaf "
+                             "only joins at the stem, so its ratio is near 1; a second high "
+                             "point on one blade joins high up and scores low. On plant_9 the "
+                             "leaf count holds at 7 across 0.4-0.5.")
     args = parser.parse_args(argv)
 
     run(workdir=args.workdir, source=args.source,
-        contact_voxels=args.contact_voxels, min_leaf_points=args.min_leaf_points)
+        contact_voxels=args.contact_voxels, min_leaf_points=args.min_leaf_points,
+        min_tip_depth_voxels=args.min_tip_depth_voxels,
+        min_persistence_ratio=args.min_persistence_ratio)
 
 
 if __name__ == "__main__":

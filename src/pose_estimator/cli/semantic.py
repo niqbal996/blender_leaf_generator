@@ -26,6 +26,7 @@ from pose_estimator.cli import classify as classify_stage
 from pose_estimator.cli import fuse as fuse_stage
 
 CLASSIFY_KEYS = ("backend", "seeds", "seed_frame", "seed_bank", "save_seed_bank",
+                 "seeds_file",
                  "dino_model", "dino_size", "hf_token", "checkpoint", "stride", "device")
 FUSE_KEYS = ("source", "instance_radius_voxels", "normal_weighting")
 
@@ -52,6 +53,7 @@ def main(argv: Optional[list] = None) -> None:
         seed_frame=args.seed_frame,
         seed_bank=args.seed_bank,
         save_seed_bank=args.save_seed_bank,
+        seeds_file=args.seeds_file,
         dino_model=args.dino_model,
         dino_size=args.dino_size,
         hf_token=args.hf_token or os.environ.get("HF_TOKEN"),

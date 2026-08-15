@@ -13,11 +13,14 @@ swapped without touching the others:
     P3     pose-solve      camera poses, masked COLMAP
     P4a    pose-hull       visual hull by silhouette carving
     P4b    pose-surface    2DGS surfels -> carved thin surface
-    P4c    pose-classify   per-frame organ class maps  (DINOv3 or SAM2)
+    P4c    pose-pick-seeds click organ seeds on a frame (DINOv3 backend)
+           pose-classify   per-frame organ class maps  (DINOv3 or SAM2)
            pose-fuse       class maps -> per-point organ labels
            pose-semantic   both P4c stages in one call
     P5     pose-structure  stem centreline + leaf instances
     P6     pose-leaf       per-leaf midrib, frame, curvature, width
+
+    pose-view-structure    rotate P5's tips and instances in 3D
 
 Each phase also writes a QC report (`pN/*.json`) with explicit pass/fail
 acceptance checks and diagnostics under `pN/diag/`. Read those before trusting

@@ -97,11 +97,13 @@ pose-segment = "pose_estimator.cli.segment:main"      # P1 + P2
 pose-solve = "pose_estimator.cli.pose:main"           # P3
 pose-hull = "pose_estimator.cli.hull:main"            # P4a
 pose-surface = "pose_estimator.cli.surface:main"      # P4b
+pose-pick-seeds = "pose_estimator.cli.pick_seeds:main" # P4c seed picker (GUI)
 pose-classify = "pose_estimator.cli.classify:main"    # P4c stage 1
 pose-fuse = "pose_estimator.cli.fuse:main"            # P4c stage 2
 pose-semantic = "pose_estimator.cli.semantic:main"    # P4c, both stages
 pose-structure = "pose_estimator.cli.structure:main"  # P5
 pose-leaf = "pose_estimator.cli.leaf_model:main"      # P6
+pose-view-structure = "pose_estimator.cli.view_structure:main"  # inspect P5 in 3D
 
 # Finds both top-level packages under src/: leaf_generator and pose_estimator.
 [tool.setuptools.packages.find]
