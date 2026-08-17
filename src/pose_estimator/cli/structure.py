@@ -126,6 +126,17 @@ def run(
 
     _write_outputs(p5_dir, structure, stem_points, frame, clamp)
     _write_instancing_artifacts(p5_dir, structure, voxel)
+
+    # A "leaf tip" seed class, if the seeds defined one, written as its own
+    # cloud. It is part of leaf tissue everywhere else (the substring rule
+    # folds "leaf tip" into leaf), so this is the only place it is visible.
+    tip_ids = [i for i, n in enumerate(class_order) if "tip" in n]
+    if tip_ids:
+        tip_xyz = upright[np.isin(labels, tip_ids)]
+        print(f"  {len(tip_xyz)} points in the tip class -> p5/tip_class.ply")
+        if len(tip_xyz):
+            _ply(p5_dir / "tip_class.ply", tip_xyz,
+                 np.tile(np.array([[40, 220, 90]], np.uint8), (len(tip_xyz), 1)))
     write_structure_3d_plot(p5_dir / "diag" / "structure_3d.png",
                             structure.leaf_points, structure.leaf_ids,
                             structure.num_leaves, structure.stem_path,
@@ -213,6 +224,9 @@ def _write_instancing_artifacts(p5_dir: Path, structure, voxel: float) -> None:
 
     # Indices as well as positions, so a viewer can tell accepted from merged
     # without having to read colours back out of a PLY.
+    # Whatever the seeds called a tip class, kept as its own cloud so the
+    # DINO tip prior can be looked at directly rather than inferred from the
+    # instance colours it is buried in.
     np.savez(p5_dir / "tips.npz",
              candidate=inst.candidate_tips, accepted=inst.accepted_tips,
              group=inst.tip_group, depth=inst.depth[inst.candidate_tips]

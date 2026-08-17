@@ -128,6 +128,48 @@ def _smooth(points: np.ndarray, iterations: int = 6, strength: float = 0.35) -> 
     return out
 
 
+def fit_smooth_curve(
+    points: np.ndarray, tolerance: float, num_out: int = 0, degree: int = 3,
+) -> np.ndarray:
+    """A smoothing cubic spline through a polyline, resampled evenly.
+
+    Laplacian smoothing was doing this job and does it badly. It only ever
+    averages a point with its two neighbours, so it cannot tell a real bend
+    from a station that landed a voxel off: enough passes to remove the
+    zigzag also drag genuine curvature out, and too few leave the wobble.
+
+    A spline separates the two properly. `tolerance` is how far the curve may
+    sit from the input *per point*, so setting it to a voxel or two says
+    "ignore deviations at the scale of the sampling, keep everything larger" --
+    which is the actual distinction wanted, and it is expressed in the
+    plant's own units rather than as an iteration count.
+    """
+    points = np.asarray(points, float).reshape(-1, 3)
+    if len(points) < 4:
+        return points
+
+    from scipy.interpolate import splev, splprep
+
+    # Duplicate stations make the parameterisation singular, and binned
+    # centroids produce them whenever two bins land on the same tissue.
+    keep = np.concatenate([[True], np.linalg.norm(np.diff(points, axis=0), axis=1) > 1e-9])
+    points = points[keep]
+    if len(points) < 4:
+        return points
+
+    count = num_out or max(len(points), 12)
+    try:
+        # s is a total squared-error budget, so it scales with how many points
+        # are being fitted; tolerance stays a per-point distance.
+        tck, _u = splprep(points.T, s=len(points) * tolerance ** 2,
+                          k=min(degree, len(points) - 1))
+        return np.stack(splev(np.linspace(0, 1, count), tck), axis=1)
+    except (TypeError, ValueError):
+        # Degenerate input (collinear, or too few distinct knots) -- the
+        # unsmoothed polyline is still better than nothing.
+        return _smooth(points)
+
+
 # --------------------------------------------------------------------------
 # Leaf instancing, step by step
 # --------------------------------------------------------------------------
@@ -466,7 +508,8 @@ def trace_to_base(predecessor: np.ndarray, node: int, limit: int = 1_000_000) ->
 
 def trunk_and_attachments(
     shoot_points: np.ndarray, predecessor: np.ndarray, distance: np.ndarray,
-    tips: Sequence[int], merge_radius: float, num_stations: int = 40,
+    tips: Sequence[int], merge_radius: float, smooth_tolerance: float = 0.0,
+    num_stations: int = 40,
 ) -> Tuple[np.ndarray, List[int], List[List[int]]]:
     """Split the shoot into the trunk every leaf shares and each leaf's own tail.
 
@@ -527,10 +570,21 @@ def trunk_and_attachments(
     # Smooth first, then reject: smoothing pulls each station toward its
     # neighbours, so a station that was on the cloud can be nudged off it, and
     # testing beforehand would pass exactly the nodes that end up in mid-air.
-    centre = drop_stations_in_empty_space(_smooth(np.array(centre)), shoot_points)
+    centre = drop_stations_in_empty_space(np.array(centre), shoot_points)
     if len(centre) < 2:
         return shoot_points[trunk_nodes[np.argsort(d)]], attachments, paths
-    return centre, attachments, paths
+
+    # How far the curve may move is the stem's own radius, measured rather
+    # than chosen. A station is the mean of the trunk nodes in its bin, and a
+    # bin that caught more of one wall than the other is displaced by up to a
+    # radius -- so deviations at that scale are sampling noise and anything
+    # larger is a real bend. On the axis of a tube the distance to the nearest
+    # surface point *is* the radius, which makes it free to measure.
+    # Reject first, then fit: a spline pulled toward a station sitting in
+    # mid-air bends the whole neighbourhood toward it.
+    radius = float(np.median(cKDTree(shoot_points).query(centre)[0]))
+    return (fit_smooth_curve(centre, tolerance=max(2.0 * radius, smooth_tolerance)),
+            attachments, paths)
 
 
 def drop_stations_in_empty_space(
@@ -692,7 +746,8 @@ def build_from_labels(
 
     shoot_tips = [int(to_shoot[leaf_index[int(t)]]) for t in instancing.accepted_tips]
     stem_path, attach_nodes, paths = trunk_and_attachments(
-        shoot, predecessor, base_distance, shoot_tips, merge_radius=voxel * 4.0)
+        shoot, predecessor, base_distance, shoot_tips, merge_radius=voxel * 4.0,
+        smooth_tolerance=voxel * 1.5)
     if len(stem_path) < 2 and len(stem_points):
         stem_path = fit_stem_path(stem_points)
 
@@ -717,7 +772,8 @@ def build_from_labels(
             # Re-solve the topology from the corrected tips, so each leaf's
             # path down to its fork starts from the right end of the leaf.
             stem_path, attach_nodes, paths = trunk_and_attachments(
-                shoot, predecessor, base_distance, shoot_tips, merge_radius=voxel * 4.0)
+                shoot, predecessor, base_distance, shoot_tips, merge_radius=voxel * 4.0,
+                smooth_tolerance=voxel * 1.5)
 
     # Carry the stem down to where the root begins, so the two organs meet
     # instead of stopping a gap apart.
@@ -768,7 +824,13 @@ def build_from_labels(
             nearest = stem_path[int(np.argmin(np.linalg.norm(stem_path - curve[0], axis=1)))]
             curve = np.vstack([nearest, curve])
 
-        axes.append(_smooth(curve) if len(curve) > 2 else curve)
+        # Same rule for the midrib: its stations are shell centroids, so they
+        # wander by about the blade's own half-thickness, and the sharpest
+        # kink sits where the blade centroids meet the raw petiole path.
+        if len(curve) > 3:
+            thickness = float(np.median(cKDTree(leaf_points[member]).query(curve)[0]))
+            curve = fit_smooth_curve(curve, tolerance=max(2.0 * thickness, voxel))
+        axes.append(curve)
         tips.append(tip)
         attachments.append(shoot[attach_nodes[instance]])
 

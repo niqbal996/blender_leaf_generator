@@ -15,21 +15,28 @@ laid out in a row, each with an estimated stem-attachment keypoint.
   - `blender/` -- `bpy`-dependent code (mesh building, materials, the
     attachment-point Empty, and the `run()` orchestration). Only importable
     from inside Blender.
-  - `skeleton/` -- experimental, `bpy`-free: estimate a whole-plant
-    stem/branch/leaf skeleton from a rotation video, train a Gaussian Splat
-    of the same capture, and solve the real-world alignment between them.
-    See "Plant skeleton from video" and "Gaussian Splat + Blender overlay"
-    below.
+- `src/pose_estimator/` -- the plant-measurement package (`bpy`-free).
+  Turntable video in, per-leaf midribs out, as the phased P1-P6 pipeline
+  described under "Plant pose pipeline" below.
+  - `frames.py`, `segmentation.py`, `reconstruction.py`, `pose.py`,
+    `hull.py`, `surfels.py`, `classify2d.py`, `dino.py`, `semantic.py`,
+    `structure.py`, `structure_labels.py`, `leaf.py`, `ply_io.py` -- the
+    library modules, one cluster per phase.
+  - `cli/` -- the phase CLIs, installed as the `pose-*` console scripts.
+  - `alignment.py` -- solves a real-world similarity transform from two
+    points whose separation you measured. Not yet wired into P1-P6; kept
+    because metric scale is the pipeline's largest outstanding gap.
 - `blender_pipeline.py` -- thin entry-point script, run inside Blender, for
   the leaf-assembly pipeline above.
-- `estimate_plant_skeleton.py` -- CLI for the video/images -> skeleton
-  pipeline.
-- `train_gaussian_splat.py` -- CLI: trains a Gaussian Splat from an
-  `estimate_plant_skeleton.py` workdir, via gsplat.
-- `align_plant_skeleton.py` -- CLI: solves + bakes the real-world alignment
-  (rotation/scale/recenter) for a workdir's skeleton, point cloud, and splat.
-- `blender_plant_import.py` -- thin entry-point script, run inside Blender,
-  building one plant's aligned skeleton + point cloud + splat into a scene.
+- `plant_pose_pipeline_PLAN.md` -- the target spec for the pose pipeline
+  (visual hull + surface-aligned splatting + per-leaf midrib/curl). Read
+  before extending `pose_estimator`.
+- `DECISIONS.md` -- what was measured, what was chosen, and why. Read this
+  before changing a threshold; most of them were fit rather than guessed.
+- `HOW_IT_WORKS.md` -- the mechanism at the centre of the pipeline: how camera
+  poses are recovered, what the three point clouds are, how a 3D point is
+  projected into a photograph, and how a label drawn in 2D ends up attached to
+  a point in 3D. Start here if the 2D-to-3D step is unclear.
 - `main.py`, `get_mask.py`, `preprocess_NEF.py`, `leaf_size_in_cm.py` --
   the capture-side pipeline (RAW processing, masking, size calibration).
   Unchanged; still run standalone.
@@ -41,15 +48,24 @@ laid out in a row, each with an estimated stem-attachment keypoint.
 pip install -e ".[dev]"
 # only if you also run the capture pipeline (get_mask.py / Uni-MS-PS):
 pip install -e ".[capture]"
-# only if you also run the plant-skeleton / Gaussian Splat pipeline:
-pip install -e ".[skeleton]"
+# only if you also run the plant pose pipeline:
+pip install -e ".[skeleton,segment]"
 pip install torch --index-url https://download.pytorch.org/whl/cu118  # match your CUDA version
 pip install -e ".[splat]"
 ```
 
-This installs `src/leaf_generator` so it's importable, plus pytest,
-debugpy, and `fake-bpy-module` (IDE stubs for `bpy`/`bmesh`/`mathutils` --
-autocomplete only, not a runtime module).
+This installs both `src/leaf_generator` and `src/pose_estimator` so they're
+importable, plus pytest, debugpy, and `fake-bpy-module` (IDE stubs for
+`bpy`/`bmesh`/`mathutils` -- autocomplete only, not a runtime module). The
+`[skeleton]` extra additionally puts the `pose-*` phase commands on your PATH
+(`pose-segment`, `pose-solve`, `pose-hull`, `pose-surface`, `pose-classify`,
+`pose-fuse`, `pose-semantic`, `pose-structure`, `pose-leaf`).
+
+Without installing, run the CLIs straight from the source tree:
+
+```bash
+PYTHONPATH=src python -m pose_estimator.cli.hull --help
+```
 
 Run the pure-module tests any time with:
 
@@ -199,189 +215,197 @@ already (the original script relied on this too).
   `\\wsl.localhost\<distro>\mnt\e\...` (find `<distro>` via `echo
   $WSL_DISTRO_NAME` in a WSL shell).
 
-## Plant skeleton from video (experimental)
+## Plant pose pipeline (P1-P6)
 
-`estimate_plant_skeleton.py` estimates a whole-plant stem/branch/leaf-tip
-topology from a rotation video (e.g. rotating a plant by hand, or on a
-turntable), via structure-from-motion + point-cloud skeletonization. This
-is a research prototype, not a validated pipeline -- treat every run's
-output as something to inspect, not trust blindly.
+The phased pipeline described in `plant_pose_pipeline_PLAN.md`. Every phase is
+a standalone CLI that reads from and writes to a specimen's run directory on
+disk, so any one can be re-run or swapped without touching the others.
 
-```bash
-pip install -e ".[skeleton]"   # pulls in pycolmap + matplotlib
-python estimate_plant_skeleton.py --video path/to/video.MOV --workdir out/
-```
+| phase | command | does | writes |
+|---|---|---|---|
+| P1+P2 | `pose-segment` | sharpest frame per angular bin, then SAM2 plant/holder masks | `p1/`, `p2/` |
+| P3 | `pose-solve` | camera poses, masked COLMAP, one shared camera | `p3/` |
+| P4a | `pose-hull` | visual hull by silhouette carving | `p4/` |
+| P4b | `pose-surface` | 2DGS surfels, then a carved thin surface | `p4b/` |
+| P4c | `pose-classify` | per-frame organ class maps (DINOv3 or SAM2) | `p4c/class_maps/` |
+| P4c | `pose-fuse` | class maps voted onto the 3D points | `p4c/labels.npy` |
+| P5 | `pose-structure` | stem centreline + leaf instances | `p5/` |
+| P6 | `pose-leaf` | per-leaf midrib, frame, curvature, width | `p6/` |
 
-Outputs land in `--workdir`: `images/` (extracted frames), `sparse/`
-(COLMAP's reconstruction), `skeleton.png` (multi-angle render: point cloud
-+ MST in gray, simplified graph in black, tips in blue, branch points in
-red), and `skeleton.json` (registration stats + keypoint coordinates).
-
-**Pipeline**: extract ~60 evenly-spaced frames -> COLMAP sparse
-reconstruction (via `pycolmap`) -> filter the resulting 3D points by color
--> denoise (statistical outlier removal + largest-cluster filter) -> a
-minimum-spanning-tree over a k-NN graph, classifying degree-1 nodes as
-tips and degree>=3 nodes as branch points, with short spurious spurs
-pruned -- see `src/leaf_generator/skeleton/skeletonize.py` for the exact
-algorithm and its docstring's caveats.
-
-### What we learned testing this on a real (messy) capture
-
-Tested against a ~15s handheld video of a tiny seedling rotated between
-finger and thumb (no turntable, cluttered background):
-
-- **Camera pose estimation worked well**: 56-57/64 frames registered,
-  ~1.1px mean reprojection error. So COLMAP itself handles a wobbly
-  handheld rotation fine -- this isn't the bottleneck.
-- **Masking the hand out *before* matching backfired badly**: registration
-  collapsed to 4/64 images. The plant alone doesn't have enough texture
-  for SIFT to find correspondences -- ironically, the fingers you want to
-  exclude are also the main thing giving COLMAP enough texture to solve
-  camera poses at all. Because of this, `--mask-mode` defaults to `none`;
-  only use `vegetation`/`black_background` masking-before-matching when
-  the background is genuinely low-texture (a real black backdrop), never
-  to mask out a hand.
-- **Filtering points by color *after* reconstruction works much better**:
-  pose estimation gets the benefit of all that finger texture, and only
-  the final point cloud gets filtered (`--color-filter vegetation`, an
-  Excess Green Index threshold -- see `pointcloud.filter_by_vegetation_color`).
-  This needed hand-tuning per video (`--color-filter-threshold`): too low
-  and skin/background edge pixels leak through as noise; too high and you
-  lose real plant points. 0.12 worked reasonably for this video; expect to
-  sweep it for others.
-- **End result**: from ~3800 raw points down to ~330 after filtering, the
-  skeleton graph found 5 tips and 3 branch points in a plausible
-  hub-and-spoke arrangement -- but this is a sparse, noisy result from a
-  genuinely hard capture (tiny subject, shallow depth of field, tight
-  crop dominated by fingers). Treat it as "the pipeline runs and produces
-  something structurally sane," not "this is an accurate reconstruction."
-- We were not able to source a clean rotating-plant video from the open
-  web to validate the pipeline against an easy case (stock-video sites are
-  JS-gated and not scrapable with the tools available) -- the strongest
-  remaining validation is the synthetic point-cloud tests in
-  `tests/test_skeletonize.py`, which confirm the graph algorithm itself is
-  correct on clean data.
-
-For your planned turntable + black-background capture, use
-`--mask-mode black_background --color-filter none` -- masking before
-matching should be safe there (the background has nothing worth matching
-either way), and a real black backdrop needs no color-based cleanup.
-
-## Gaussian Splat training + Blender overlay (experimental)
-
-Trains a real 3D Gaussian Splat of the same turntable capture (via
-[gsplat](https://github.com/nerfstudio-project/gsplat)), solves the
-real-world alignment between it and the estimated skeleton, and builds both
-into one Blender scene -- so individual leaf assets (from
-`blender_pipeline.py`) can be manually snapped onto the skeleton for a
-side-by-side morphological comparison against the real plant. Training runs
-entirely in this repo (no external GUI tool), so it's scriptable across many
-plant captures.
-
-### Prerequisites
-
-- An NVIDIA GPU with CUDA. Install a torch build matching your CUDA version
-  *before* the `splat` extra, e.g. for CUDA 11.8:
-  ```bash
-  pip install torch --index-url https://download.pytorch.org/whl/cu118
-  pip install -e ".[skeleton,splat]"
-  ```
-  `gsplat` JIT-compiles its CUDA kernels against whatever torch/CUDA it finds
-  at first use, so this needs a working `nvcc` too (part of the CUDA
-  toolkit, not just the driver).
-- The free [KIRI Engine 3DGS Render Blender
-  add-on](https://github.com/Kiri-Innovation/3dgs-render-blender-addon) (or
-  any add-on exposing a scriptable splat-ply-import operator), installed
-  once in Blender. `blender_plant_import.py` drives its import operator
-  automatically per plant; without it, splat import is skipped with a
-  printed reminder (the rest of the scene -- skeleton curves, keypoints,
-  point cloud -- still builds fine).
-
-### Pipeline
+`run_pipeline.sh` drives P1 through P4c in one call. P5 and P6 are run by hand.
 
 ```bash
-# 1. Reconstruct + estimate the skeleton (as above), writing sparse/best/,
-#    skeleton.json, and pointcloud.ply -- all in COLMAP's raw, unitless,
-#    arbitrarily-oriented frame.
-python estimate_plant_skeleton.py --images stills/ --workdir out/plant1/ \
-    --mask-mode black_background --color-filter none
+conda create -n pose_estimator python=3.11 -y && conda activate pose_estimator
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install -e ".[dev,skeleton,segment]"
 
-# 2. Train the splat against that same reconstruction. Writes splat.ply,
-#    also in the raw COLMAP frame.
-python train_gaussian_splat.py --workdir out/plant1/ --iterations 30000
-
-# 3. Open out/plant1/skeleton.png + skeleton.json, pick two keypoint indices
-#    (the labeled dots) whose real-world distance you can measure (calipers,
-#    ruler, pot rim -- anything on the plant itself). Solve + bake the
-#    alignment -- cheap: no COLMAP rerun, no retraining.
-python align_plant_skeleton.py --workdir out/plant1/ \
-    --scale-ref-a 3 --scale-ref-b 9 --scale-ref-distance-m 0.084
-
-# 4. Build the Blender scene (skeleton curves/Empties + point cloud +
-#    splat, all pre-aligned to real-world meters, Z-up):
-PLANT_WORKDIR="<path>/out/plant1" blender --python blender_plant_import.py
-
-# 5. Load leaf assets and manually snap them onto the skeleton (see below):
-LEAF_MAPS_PATH="<path>/weed1/maps" blender --python blender_pipeline.py
+# SAM2 -- from source, NOT `pip install sam2` (that PyPI name is a
+# third-party upload, not facebookresearch's). See DECISIONS.md.
+git clone https://github.com/facebookresearch/sam2.git third_party/sam2
+pip install -e third_party/sam2
+mkdir -p checkpoints && wget -P checkpoints \
+  https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
 ```
-
-For many plants, steps 1-3 are just a shell loop -- the whole point of
-training in-repo instead of through a GUI tool:
 
 ```bash
-for d in out/*/; do
-    python estimate_plant_skeleton.py --images "$d/stills" --workdir "$d" --mask-mode black_background --color-filter none
-    python train_gaussian_splat.py --workdir "$d"
-done
+pose-segment  --video /path/DSC_0009.MOV --workdir runs/plant_9/
+pose-solve    --workdir runs/plant_9/
+pose-hull     --workdir runs/plant_9/ --resolution 256
+pose-surface  --workdir runs/plant_9/ --iterations 5000
+
+# P4c, as two stages. Click the seeds rather than typing coordinates:
+pose-pick-seeds --workdir runs/plant_9/
+pose-classify   --workdir runs/plant_9/ --seeds-file runs/plant_9/p4c/seeds.json
+pose-fuse       --workdir runs/plant_9/
+
+pose-structure --workdir runs/plant_9/
+pose-leaf      --workdir runs/plant_9/
+
+# rotate the result to check the tips are where leaves actually end
+pose-view-structure --workdir runs/plant_9/
 ```
 
-### How alignment works
+### Judging P5: leaves are separated by their tips
 
-COLMAP's reconstruction (and therefore the skeleton, point cloud, and
-trained splat, all reconstructed in that same frame) has an arbitrary,
-unitless scale and orientation -- nothing about "up" or "how big" is known
-without extra information. `align_plant_skeleton.py` solves this in two
-parts:
+Leaf instances are split at their **tips**, not at where they touch the stem.
+Two leaves fused near the apex share one contact patch, so attachment-based
+splitting saw them as one organ -- on plant_9 that put 45% of all leaf tissue
+into a single instance and returned 11 instances for 7 leaves. A tip survives
+the fusion that an attachment does not.
 
-- **Rotation**: automatic. A turntable capture's registered camera centers
-  lie approximately on a circle in a plane, so PCA over those centers finds
-  the plane's normal -- the rotation axis -- with no manual picking needed.
-- **Scale**: not recoverable from SfM alone (there's no metric reference in
-  the shot). Give it two `skeleton.json` keypoint indices (visible as
-  labeled dots in `skeleton.png`) plus a real-world distance you measured
-  between those same two plant features.
+How many tips there are needs no tuned radius. Two tips on different leaves
+can only reach each other by travelling down one midrib to the base and back
+up the other, so their geodesic separation approaches the sum of their depths
+from the stem; two spurious tips on one ragged blade cut straight across it.
+`--merge-cut` is that ratio, and it carries no length scale, so it does not
+need refitting per specimen -- on plant_9 the leaf count holds at 7 across
+0.4-0.5, where the old method swept 178 -> 73 -> 28 -> 14 -> 4 with no stable
+region at all.
 
-The result is baked directly into `skeleton_blender.json`,
-`pointcloud_blender.ply`, and `splat_blender.ply` (all real-world meters,
-Z-up) -- `alignment.json` records the raw transform too, for provenance and
-for cheaply re-baking after refining the scale reference. Because the splat
-is trained by this same repo (not an external tool with its own coordinate
-conventions), its `.ply` never gets silently re-oriented/re-scaled by
-something else -- the exact same alignment applies to it as to the skeleton.
+Every step is inspectable, because a leaf count is not a diagnosis:
 
-One ply convention worth knowing if you ever touch this code: the standard
-3DGS ply schema stores `scale_0..2` as **log-scale** and `opacity` as
-**logit(alpha)**, not the raw values -- `Alignment.apply_to_gaussians` (in
-`src/leaf_generator/skeleton/alignment.py`) shifts log-scales additively by
-`log(scale)` rather than multiplying, and composes orientation quaternions
-rather than touching them independently. Getting this wrong produces
-wrong-sized, wrong-oriented Gaussians with no error raised.
+```
+p5/diag/instancing.png   depth field -> tips -> instances, side by side
+p5/depth.ply             leaf tissue by geodesic depth; magenta = unreachable
+p5/tips.ply              green = accepted tip, grey = merged away
+p5/instancing.json       counts per step, and every tip's depth and position
+```
 
-### Manual leaf-snapping workflow
+`pose-view-structure` opens the same data in a rotatable window, which is the
+only way to tell a tip at the end of a blade from one floating in front of a
+different leaf. Keys: `1` instances, `2` depth, `t` tips, `r` rejected
+candidates, `m` midribs, `s` stem/root, `[` `]` step through leaves one at a
+time, `a` all, `h` help.
 
-No new code here -- standard Blender operations, using the skeleton's
-keypoint Empties (from `blender_plant_import.py`) and each leaf's existing
-`<mesh_name>_attachment` Empty (from `blender_pipeline.py`) as guides. Leaf
-attachment Empties are *children* of their leaf mesh, so moving one alone
-doesn't move the leaf:
+Each phase writes a QC report (`p2/qc.json`, `p3/poses.json`) with explicit
+pass/fail acceptance checks, plus diagnostic images under `pN/diag/`. **Read
+those before trusting a run** -- the checks exist to catch the failures that
+look plausible, not the ones that look broken.
 
-1. One-time per leaf: select its attachment Empty -> `Shift+S` -> *Cursor to
-   Selected*; select the leaf mesh alone -> *Object > Set Origin > Origin to
-   3D Cursor* (the mesh's own origin now coincides with its attachment
-   point).
-2. To place a leaf: select the target skeleton keypoint Empty -> *Cursor to
-   Selected* -> select the leaf mesh -> *Selection to Cursor*, then
-   eyeball-rotate (`R`) against the local branch curve's direction.
+### Why P4c is two commands
 
-No orientation/placement algorithm yet -- this is a first pass to get real
-comparisons in front of you before investing in automating placement.
+Organ labels can be wrong because the 2D classifier was wrong, or because the
+multi-view fusion was. As one stage there was no way to tell which. Splitting
+it puts the per-frame class maps on disk, so each half can be checked alone:
+score `p4c/class_maps/` against a few hand-labelled frames to test the
+classifier, or feed the fusion synthetic maps whose answer you already know.
+
+Both backends are kept because they fail differently. `--backend dino`
+assigns each image patch to the nearest hand-clicked example, so the class
+vocabulary is whatever you labelled -- but a patch is ~11 source pixels wide,
+so thin petioles are lost. `--backend sam` takes SAM2's object masks and
+sorts them into leaf/stem by shape: a fixed two-class vocabulary, but real
+object boundaries rather than a patch grid.
+
+`pose-semantic` runs both stages in one call, which is what `run_pipeline.sh`
+uses.
+
+### Seeds, and how to avoid clicking 50 times
+
+DINOv3 gives every image patch a feature vector but no names, so a few
+labelled examples are needed to say which vectors mean "leaf". `pose-pick-seeds`
+opens the frame cropped exactly as the classifier will crop it; click to place
+a seed, `1`-`9` to switch class, `n`/`p` to change frame, `s` to save. It
+writes `p4c/seeds.json`, which `pose-classify --seeds-file` reads directly.
+
+Two rules it enforces that hand-typed coordinates do not: the crop matches the
+one the classifier builds, and clicks off the plant are refused (the
+background is zeroed before features are extracted, so a seed there describes
+a blank patch).
+
+Seeding from several frames is worth doing -- a leaf edge-on barely resembles
+the same leaf face-on. Move with `n`/`p` and keep clicking; seeds from every
+frame you visit are pooled. That is safe because the vectors are stored
+individually rather than averaged, so an extra example only adds coverage.
+
+For a batch of specimens there are two ways to avoid per-plant clicking:
+
+```bash
+# no seeds at all -- SAM2 masks sorted by shape. Leaf/stem only, no root.
+pose-classify --workdir runs/plant_N/ --backend sam \
+    --checkpoint checkpoints/sam2.1_hiera_large.pt
+
+# or click once, reuse the vectors everywhere
+pose-classify --workdir runs/plant_1/ --seeds-file runs/plant_1/p4c/seeds.json
+pose-classify --workdir runs/plant_2/ --seed-bank runs/plant_1/p4c/seed_bank.npz
+```
+
+**The seed bank's cross-specimen transfer is untested** -- only one specimen
+has ever been run. Before committing a large batch to it, seed three or four
+plants that differ and check whether one plant's bank labels the others
+sensibly. If it drifts, pool seeds from those few plants into one bank.
+
+Requires a display. WSLg on Windows 11 provides one; without it, fall back to
+the printed coordinate grid (`scripts/dinov3_organ_lab.py --mode reference`)
+and pass `--seeds "leaf:x,y" ... --seed-frame N` by hand.
+
+### The one thing to know about this rig
+
+The camera is locked off and the *subject* rotates. Structure-from-motion
+assumes the opposite, so unmasked COLMAP latches onto the backdrop, correctly
+concludes it never moved, and returns every camera at the same point. P3
+therefore masks matching down to what is rigidly attached to the turntable
+(disc + holder + plant), which it identifies from per-pixel temporal variance
+over the sequence -- static backdrop varies by ~5 DN, the rotating disc by
+30-60. No color threshold, no fiducial marker.
+
+That also means the acceptance test for P3 is real evidence rather than a
+restatement of COLMAP's own objective: in the subject's frame the camera
+*must* trace a circle, and nothing in the solver enforces that.
+
+### Shooting more than one orbit
+
+```bash
+pose-segment --video /path/pass_low.MOV /path/pass_high.MOV --workdir runs/plant_9/
+```
+
+Several videos of the **same plant at different camera elevations** go into
+one workdir and are solved together, ending up in a single coordinate frame.
+Use this when leaves merge where they attach: a single waist-height orbit
+never looks down into an apex whorl, so leaves inserted at nearly the same
+height are never separated by any two silhouettes, and that is a limit of the
+capture rather than of the carving.
+
+Each pass keeps its own tracking session, its own temporal-variance mask and
+its own fitted circle -- they differ enough between elevations that sharing
+them degrades the solve. Two extra checks appear in `p3/poses.json`:
+`passes_share_a_rotation_axis` (the evidence the passes actually merged --
+nothing in the solve enforces it) and `passes_are_at_different_elevations`
+(the extra footage only buys anything if it was shot from somewhere new).
+
+### Removed: the older single-shot prototype
+
+An earlier `pose-estimate-skeleton` / `pose-train-splat` /
+`pose-align-skeleton` path estimated a skeleton straight from a COLMAP cloud
+with a kNN graph and an MST, deciding which branches were leaves via a
+`min_branch_fraction` threshold. It has been deleted, along with the Blender
+scene-import script that consumed its output.
+
+The reason is worth keeping: that threshold had to be re-tuned per specimen
+and never showed a stable plateau. Sweeping it gave leaf counts of 26, 8, 5
+and 1 with no settled region anywhere, and at settings producing a plausible
+count the smallest "leaf" held 2-9 points -- far too few to fit a midrib. The
+labelled P4c path replaces the inference that needed it.
+
+`alignment.py` survived the deletion because it is the only metric-scale
+machinery in the repo. It is not currently called by any phase.

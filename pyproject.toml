@@ -101,6 +101,7 @@ pose-pick-seeds = "pose_estimator.cli.pick_seeds:main" # P4c seed picker (GUI)
 pose-classify = "pose_estimator.cli.classify:main"    # P4c stage 1
 pose-fuse = "pose_estimator.cli.fuse:main"            # P4c stage 2
 pose-semantic = "pose_estimator.cli.semantic:main"    # P4c, both stages
+pose-tips = "pose_estimator.cli.tips:main"            # P4c leaf tips, 2D->3D
 pose-structure = "pose_estimator.cli.structure:main"  # P5
 pose-leaf = "pose_estimator.cli.leaf_model:main"      # P6
 pose-view-structure = "pose_estimator.cli.view_structure:main"  # inspect P5 in 3D
