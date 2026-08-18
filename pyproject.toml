@@ -12,7 +12,7 @@ license = { file = "LICENSE" }
 
 dependencies = [
     "numpy",
-    "opencv-python",
+    "opencv-contrib-python",
     "pillow",
     "scipy",
     "scikit-image",
@@ -88,12 +88,33 @@ segment = [
     "opencv-contrib-python",
     "matplotlib",
 ]
+# pose-classify / pose-semantic / pose-tips (P4c) -- DINOv2/DINOv3 features
+# via transformers. DINOv3 is a gated repo: accept its license on
+# huggingface.co and authenticate (`huggingface-cli login`) before first use.
+semantic = [
+    "torch",
+    "transformers",
+    "matplotlib",
+]
+# Everything the P1-P6 pipeline needs, in one name, for a machine that will
+# run the whole thing. Uses the GPU pycolmap build; swap to "skeleton" for
+# the CPU one (they are mutually exclusive -- same `pycolmap` module).
+# Note this does NOT install torch: install a CUDA-matching build first
+# (see setup_env.sh), or pip resolves whatever the default PyPI wheel
+# targets, which may not match the machine's CUDA.
+pose-all = [
+    "leaf-generator[skeleton-gpu]",
+    "leaf-generator[splat]",
+    "leaf-generator[segment]",
+    "leaf-generator[semantic]",
+]
 
 # pose_estimator's phase CLIs. Each reads from and writes to a plant's
 # --workdir on disk, so they can be run (and re-run) independently.
 [project.scripts]
 # P1-P6, in pipeline order.
 pose-segment = "pose_estimator.cli.segment:main"      # P1 + P2
+pose-pick-prompts = "pose_estimator.cli.pick_prompts:main"  # P2 SAM2 seed picker (GUI)
 pose-solve = "pose_estimator.cli.pose:main"           # P3
 pose-hull = "pose_estimator.cli.hull:main"            # P4a
 pose-surface = "pose_estimator.cli.surface:main"      # P4b

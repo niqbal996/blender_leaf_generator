@@ -49,6 +49,7 @@ def run(
     holder_point: Optional[Tuple[int, int]] = None,
     device: str = "cuda",
     reuse_frames: bool = False,
+    prompts_file: Optional[Path] = None,
 ) -> dict:
     workdir.mkdir(parents=True, exist_ok=True)
     frames_dir = workdir / "p1" / "frames"
@@ -90,8 +91,25 @@ def run(
         sources_file.parent.mkdir(parents=True, exist_ok=True)
         sources_file.write_text(json.dumps(sources, indent=2))
 
+    # Clicked prompts, one set per pass, in full-frame coordinates. Found
+    # automatically at the default path so a re-run after pose-pick-prompts
+    # needs no extra argument.
+    clicked: dict = {}
+    default_prompts_file = p2_dir / "prompts_clicked.json"
+    if prompts_file is None and default_prompts_file.exists():
+        prompts_file = default_prompts_file
+        print(f"found clicked prompts at {prompts_file} -- using them instead of colour")
+    if prompts_file is not None:
+        from pose_estimator.prompt_picker import load_prompts
+
+        clicked = load_prompts(prompts_file)
+
     prompts = None
     if plant_point or holder_point:
+        if clicked:
+            raise ValueError(
+                f"--plant-point/--holder-point conflict with the clicked prompts in "
+                f"{prompts_file}. Use one or the other.")
         prompts = Prompts(
             plant=[plant_point] if plant_point else [],
             holder=[holder_point] if holder_point else [],
@@ -109,6 +127,15 @@ def run(
 
     combined_stats, crops = [], {}
     boxes_by_stem = {}
+    if clicked:
+        unknown = sorted(set(clicked) - set(per_pass))
+        missing = sorted(set(per_pass) - set(clicked))
+        if unknown or missing:
+            raise ValueError(
+                f"{prompts_file} does not match this workdir: it has "
+                f"{sorted(clicked)} but the frames have passes {sorted(per_pass)}. "
+                "Re-run pose-pick-prompts.")
+
     for pass_index in sorted(per_pass):
         paths = per_pass[pass_index]
         print(f"Segmenting pass {pass_index} ({len(paths)} frames) with SAM2...")
@@ -116,7 +143,7 @@ def run(
             frames_dir=frames_dir,
             out_dir=p2_dir,
             checkpoint=checkpoint,
-            prompts=prompts,
+            prompts=clicked.get(pass_index, prompts),
             use_roi=use_roi,
             roi_padding=roi_padding,
             device=device,
@@ -194,6 +221,14 @@ def main(argv: Optional[list] = None) -> None:
         "seed landed.",
     )
     parser.add_argument("--holder-point", type=str, help="Override the auto-derived holder prompt, as X,Y")
+    parser.add_argument(
+        "--prompts-file",
+        type=Path,
+        help="Clicked SAM2 seeds from pose-pick-prompts, one set per capture pass, in "
+        "full-frame coordinates. Defaults to <workdir>/p2/prompts_clicked.json when that "
+        "exists. Unlike --plant-point this works on multi-pass captures, where a single "
+        "point cannot serve two passes with different first frames.",
+    )
     parser.add_argument("--device", default="cuda", help="torch device (cuda or cpu)")
     parser.add_argument(
         "--reuse-frames",
@@ -214,6 +249,7 @@ def main(argv: Optional[list] = None) -> None:
         holder_point=_parse_point(args.holder_point),
         device=args.device,
         reuse_frames=args.reuse_frames,
+        prompts_file=args.prompts_file,
     )
 
 

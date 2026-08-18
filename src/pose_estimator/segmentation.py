@@ -101,6 +101,38 @@ def _significant_components(mask: np.ndarray, min_area_fraction: float = 2e-4) -
     return keep[labels]
 
 
+def _component_nearest(
+    mask: np.ndarray, point: np.ndarray, min_area_fraction: float = 2e-4
+) -> Optional[np.ndarray]:
+    """The significant connected component whose centroid is nearest `point`.
+
+    Continuity rather than area, and the distinction is the whole point.
+    `_significant_components` keeps every blob and `_largest_component` keeps
+    the biggest, but the colour prepass cannot tell amber plastic from
+    foliage -- the pliers' handle reads as strongly green-dominant because
+    its blue channel is near zero. Measured on thistle1: the handle is a
+    62k-px blob against the plant's 44k in the low side-on pass, so "largest"
+    picks the tool, and "all significant" blends the two into a centroid
+    between them and a bounding span wide enough to defeat the crop entirely.
+
+    Given a point known to be on the plant, nearest-centroid tracks the right
+    blob regardless of how big the wrong one grows.
+    """
+    mask = (mask > 0).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if count <= 1:
+        return None
+
+    min_area = min_area_fraction * mask.size
+    candidates = [i for i in range(1, count) if stats[i, cv2.CC_STAT_AREA] >= min_area]
+    if not candidates:  # everything is small -- fall back to the largest blob
+        candidates = [1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))]
+
+    nearest = min(candidates, key=lambda i: float(np.hypot(*(centroids[i] - point))))
+    return labels == nearest
+
+
 def _interior_points(mask: np.ndarray, n: int = 3) -> List[Tuple[int, int]]:
     """Up to `n` points well inside `mask`, ranked by distance from its edge.
 
@@ -190,9 +222,64 @@ def plant_color_mask(bgr: np.ndarray, exg_threshold: float = 0.06) -> np.ndarray
 class Prompts:
     plant: List[Tuple[int, int]] = field(default_factory=list)
     holder: List[Tuple[int, int]] = field(default_factory=list)
+    # Which pixel space the coordinates live in. Auto-derived prompts are read
+    # off the already-cropped frame, but clicked ones cannot be: the crop is
+    # solved from the same colour prepass that mis-seeds, so at click time it
+    # does not exist yet and is not trustworthy if it does. Full-frame
+    # coordinates convert into crop space once the box is known; the reverse
+    # is not well defined, which is why the picker stores full-frame.
+    space: str = "crop"
 
     def to_dict(self) -> dict:
-        return {"plant": [list(p) for p in self.plant], "holder": [list(p) for p in self.holder]}
+        return {
+            "plant": [list(p) for p in self.plant],
+            "holder": [list(p) for p in self.holder],
+            "space": self.space,
+        }
+
+    def to_crop(self, box: Tuple[int, int, int, int]) -> "Prompts":
+        """Same prompts, expressed in the pixel space of `box`.
+
+        The two classes are treated differently on purpose. A **plant** point
+        outside the crop is fatal: the crop is solved from that very point, so
+        if it lands outside, the window is not where it was asked to be and
+        anything downstream is guesswork. A **holder** point outside is
+        expected and merely dropped -- the crop is sized to the plant, and the
+        holder is a pair of pliers extending well past it, so a click on the
+        handle can be legitimately out of frame. Clicking the jaws where they
+        grip the stem keeps it in.
+
+        Clamping instead of dropping would be the worst of both: it seeds SAM2
+        on whatever happens to sit at the crop edge, which is the failure this
+        whole path exists to prevent.
+        """
+        x0, y0, x1, y1 = box
+        width, height = x1 - x0, y1 - y0
+
+        def inside(point: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+            cx, cy = int(point[0]) - x0, int(point[1]) - y0
+            return (cx, cy) if (0 <= cx < width and 0 <= cy < height) else None
+
+        plant = []
+        for point in self.plant:
+            moved = inside(point)
+            if moved is None:
+                raise ValueError(
+                    f"plant prompt {tuple(point)} falls outside the tracking crop {box} -- "
+                    "the crop is not centred on what you clicked. Re-run pose-pick-prompts, "
+                    "or pass --no-roi to segment full frames."
+                )
+            plant.append(moved)
+
+        holder = [m for m in (inside(p) for p in self.holder) if m is not None]
+        dropped = len(self.holder) - len(holder)
+        if dropped:
+            print(f"  {dropped} holder prompt(s) fall outside the tracking crop -- ignored."
+                  + ("" if holder else " The holder will not be tracked separately, so it may"
+                                       " end up inside the plant mask; click the jaws where they"
+                                       " grip the stem to keep the point in frame."))
+
+        return Prompts(plant=plant, holder=holder, space="crop")
 
 
 def derive_prompts(bgr: np.ndarray, n_points: int = 3) -> Prompts:
@@ -231,14 +318,25 @@ class TrackingCrop:
         }
 
 
-def plant_centroids(frame_paths: Sequence[Path]) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+def plant_centroids(
+    frame_paths: Sequence[Path], seed_point: Optional[Tuple[int, int]] = None
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
     """Per-frame plant centroid and bbox size, from the color prepass.
 
     Returns (centroids Nx2, sizes Nx2, (frame_w, frame_h)); frames where the
     plant could not be found get NaN and are interpolated by the caller.
+
+    `seed_point` is a full-frame coordinate known to be on the plant in the
+    *first* frame, from `pose-pick-prompts`. With it, one component is
+    tracked from frame to frame by continuity and everything else in the
+    scene is ignored, so both the centroid and the span describe the plant
+    alone. Without it the old behaviour stands: the union of every
+    significant blob, which also drags in the holder and inflates the span
+    that sets the crop size.
     """
     centroids, sizes = [], []
     frame_w = frame_h = 0
+    previous = np.array(seed_point, float) if seed_point is not None else None
 
     for path in frame_paths:
         bgr = cv2.imread(str(path))
@@ -247,7 +345,15 @@ def plant_centroids(frame_paths: Sequence[Path]) -> Tuple[np.ndarray, np.ndarray
             sizes.append([np.nan, np.nan])
             continue
         frame_h, frame_w = bgr.shape[:2]
-        mask = _significant_components(plant_color_mask(bgr))
+        raw = plant_color_mask(bgr)
+        if previous is None:
+            mask = _significant_components(raw)
+        else:
+            # Keep the last good centroid on a dropped frame rather than the
+            # seed: an orbit moves steadily, so the previous position is a far
+            # better guess than the start after a few dozen frames.
+            found = _component_nearest(raw, previous)
+            mask = found if found is not None else np.zeros(raw.shape, bool)
         if not mask.any():
             centroids.append([np.nan, np.nan])
             sizes.append([np.nan, np.nan])
@@ -255,6 +361,8 @@ def plant_centroids(frame_paths: Sequence[Path]) -> Tuple[np.ndarray, np.ndarray
         ys, xs = np.nonzero(mask)
         centroids.append([xs.mean(), ys.mean()])
         sizes.append([xs.max() - xs.min(), ys.max() - ys.min()])
+        if seed_point is not None:
+            previous = np.array(centroids[-1], float)
 
     return np.array(centroids, float), np.array(sizes, float), (frame_w, frame_h)
 
@@ -295,6 +403,7 @@ def solve_tracking_crop(
     frame_paths: Sequence[Path],
     padding_fraction: float = 0.45,
     smooth_window: int = 9,
+    seed_point: Optional[Tuple[int, int]] = None,
 ) -> TrackingCrop:
     """Solve a plant-following crop window for every frame.
 
@@ -317,11 +426,11 @@ def solve_tracking_crop(
     clamp jaws gripping the stem -- P2 has to segment the holder where it
     touches the plant, which is precisely where confusing the two matters.
     """
-    centroids, sizes, (frame_w, frame_h) = plant_centroids(frame_paths)
+    centroids, sizes, (frame_w, frame_h) = plant_centroids(frame_paths, seed_point=seed_point)
     if np.isnan(centroids).all():
         raise RuntimeError(
             "Could not locate the plant in any frame -- the color prepass is failing. "
-            "Inspect a frame and consider --no-roi with an explicit --plant-point."
+            "Click the plant instead:  pose-pick-prompts --workdir <workdir>"
         )
 
     centroids = _smooth(_interpolate_nans(centroids), smooth_window)
@@ -433,7 +542,16 @@ def segment_sequence(
     first = cv2.imread(str(frame_paths[0]))
     full_h, full_w = first.shape[:2]
 
-    crop = solve_tracking_crop(frame_paths, padding_fraction=roi_padding) if use_roi else None
+    # A clicked plant point also anchors the crop solve. Doing it in the other
+    # order would be circular: the crop comes from the colour prepass, and a
+    # prepass confident enough to centre the crop correctly would not have
+    # needed clicking in the first place.
+    seed_point = prompts.plant[0] if (prompts and prompts.space == "full_frame" and prompts.plant) else None
+    crop = (
+        solve_tracking_crop(frame_paths, padding_fraction=roi_padding, seed_point=seed_point)
+        if use_roi
+        else None
+    )
     if crop is not None:
         print(
             f"  tracking crop {crop.width}x{crop.height} of {full_w}x{full_h} "
@@ -444,10 +562,13 @@ def segment_sequence(
     _write_sam2_inputs(frame_paths, sam2_dir, crop)
 
     # Prompts are derived on the cropped first frame, so their coordinates
-    # already live in the same space SAM2 will see.
+    # already live in the same space SAM2 will see. Clicked prompts arrive in
+    # full-frame coordinates and are converted here, once the box is known.
     first_cropped = cv2.imread(str(sam2_dir / "0.jpg"))
     if prompts is None:
         prompts = derive_prompts(first_cropped)
+    elif prompts.space == "full_frame":
+        prompts = prompts.to_crop(crop.boxes[0] if crop is not None else (0, 0, full_w, full_h))
     if not prompts.plant:
         raise RuntimeError(
             "No plant prompt point could be derived from the first frame. Pass --plant-point X,Y "

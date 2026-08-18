@@ -35,6 +35,22 @@
 # Stops after P4c. Skeleton and leaf-model stages (P5, P6) are deliberately not
 # run -- the deliverable here is coloured point clouds to inspect in Blender.
 #
+# If P2 segments the wrong object. The SAM2 seeds are derived from colour,
+# which fails when the holder out-competes the plant on area -- the pliers'
+# amber grip is green-dominant in RGB, so a pass that shows it large and
+# unlit can seed on the tool and track it for the whole sequence. P4a then
+# carves nothing, because two passes' silhouettes describe different objects.
+# Check p2/qc.json (plant_mask_free_of_holder) and the p2/diag overlays; if
+# the green mask is on the holder, click the seeds instead:
+#
+#   ./run_pipeline.sh --video <a> <b> --workdir runs/plant_9 --stop-after p1p2
+#   pose-pick-prompts --workdir runs/plant_9     # one plant click per pass
+#   pose-segment --workdir runs/plant_9 --reuse-frames    # redo P2 only
+#   ./run_pipeline.sh --workdir runs/plant_9 --skip-to p3
+#
+# That writes p2/prompts_clicked.json, which pose-segment picks up on its own
+# from then on -- no argument needed, the same way p4c/seeds.json works.
+#
 # Picking seeds. P4c classifies every image patch by which labelled example it
 # most resembles, so it needs a few clicks on one frame. Get a coordinate grid
 # to read them off with:
@@ -101,9 +117,91 @@ if [[ -z "$SEEDS_FILE" && ${#SEEDS[@]} -eq 0 && -z "$SEED_BANK" && -f "$WORKDIR/
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="$HOME/anaconda3/envs/pose_estimator/bin/python"
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
-export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-11.8}"
+
+# --- interpreter -----------------------------------------------------------
+# Whatever python is active, so `conda activate <env> && ./run_pipeline.sh`
+# is the whole contract. $POSE_PYTHON overrides for a cron job or a wrapper
+# that cannot activate an env first.
+PY="${POSE_PYTHON:-$(command -v python3 || command -v python)}"
+[[ -n "$PY" && -x "$PY" ]] || { echo "no python found on PATH -- activate your env first" >&2; exit 1; }
+# Checking the heavy dependencies, not just `import pose_estimator`: this
+# script puts src/ on PYTHONPATH, so the package imports from *any*
+# interpreter -- including one with none of its dependencies installed. The
+# run then dies several minutes in, after extracting frames, on a bare
+# ModuleNotFoundError from inside a phase.
+MISSING="$("$PY" - <<'PYCHECK' 2>/dev/null
+import importlib.util as u
+print(" ".join(m for m in ("numpy", "cv2", "torch", "pose_estimator") if u.find_spec(m) is None))
+PYCHECK
+)"
+if [[ -n "${MISSING// /}" ]]; then
+    echo "ERROR: $PY is missing: $MISSING" >&2
+    echo "  Activate the right environment first:  conda activate pose" >&2
+    echo "  Or build one:                          ./setup_env.sh" >&2
+    echo "  Override the interpreter with:         POSE_PYTHON=/path/to/python" >&2
+    exit 1
+fi
+
+# P4b's CUDA toolchain, checked now rather than after COLMAP. gsplat ships no
+# prebuilt wheels, so it JIT-compiles on first render -- and if nvcc is too
+# old or missing, that surfaces 40 minutes into a run, immediately after the
+# expensive phases, with a wall of ninja output. The version matters and not
+# just the presence: gsplat compiles with -std=c++20, which nvcc rejects
+# before 12.0 ("Value 'c++20' is not defined for option 'std'").
+p4b_possible() {
+    [[ "$SKIP_P4B" == 1 ]] && return 1
+    case "$STOP_AFTER" in p1p2|p3|p4a) return 1 ;; esac
+    case "$SKIP_TO" in p4c|p5|p6) return 1 ;; esac
+    return 0
+}
+if p4b_possible; then
+    NVCC_BIN="$(command -v nvcc || true)"
+    NVCC_MAJOR=""
+    [[ -n "$NVCC_BIN" ]] && NVCC_MAJOR="$("$NVCC_BIN" --version | sed -n 's/.*release \([0-9]*\)\..*/\1/p' | head -1)"
+    if [[ -z "$NVCC_BIN" ]]; then
+        echo "WARNING: no nvcc on PATH -- P4b (gsplat) will fail when it tries to compile." >&2
+        echo "  Fix:  ./setup_env.sh          (installs a matching nvcc into the env)" >&2
+        echo "  Or skip that phase:  --skip-p4b" >&2
+    elif [[ -n "$NVCC_MAJOR" && "$NVCC_MAJOR" -lt 12 ]]; then
+        echo "WARNING: nvcc is $("$NVCC_BIN" --version | sed -n 's/.*release \(.*\), .*/\1/p') at $NVCC_BIN," >&2
+        echo "  but gsplat compiles with -std=c++20, which needs nvcc 12.0 or newer. P4b will fail." >&2
+        echo "  Fix:  ./setup_env.sh          (installs a matching nvcc into the env)" >&2
+        echo "  Or skip that phase:  --skip-p4b" >&2
+    fi
+fi
+
+# --- CUDA ------------------------------------------------------------------
+# Located from nvcc rather than assumed: gsplat compiles against whatever
+# toolkit is actually installed, and a wrong CUDA_HOME fails at first use
+# with an error that never mentions this variable.
+if [[ -z "${CUDA_HOME:-}" ]]; then
+    if NVCC="$(command -v nvcc)"; then
+        CUDA_HOME="$(dirname "$(dirname "$(readlink -f "$NVCC")")")"
+    else
+        for candidate in /usr/local/cuda /usr/local/cuda-*; do
+            [[ -x "$candidate/bin/nvcc" ]] && { CUDA_HOME="$candidate"; break; }
+        done
+    fi
+fi
+[[ -n "${CUDA_HOME:-}" ]] && export CUDA_HOME
+
+# --- SAM2 checkpoint -------------------------------------------------------
+# Searched across the places it plausibly lives, so a new machine needs no
+# edits here. --sam-checkpoint or $SAM2_CHECKPOINT still win.
+find_sam_checkpoint() {
+    local name="sam2.1_hiera_large.pt"
+    local candidates=(
+        "${SAM2_CHECKPOINT:-}"
+        "$REPO_ROOT/checkpoints/$name"
+        "$REPO_ROOT/third_party/sam2/checkpoints/$name"
+        "$HOME/.cache/sam2/$name"
+    )
+    for c in "${candidates[@]}"; do
+        [[ -n "$c" && -f "$c" ]] && { echo "$c"; return 0; }
+    done
+    return 1
+}
 [[ -n "$HF_TOKEN_ARG" ]] && export HF_TOKEN="$HF_TOKEN_ARG"
 
 mkdir -p "$WORKDIR"
@@ -139,9 +237,17 @@ phase() { printf '\n\033[1m=== %s ===\033[0m\n' "$1"; }
 if should_run p1p2; then
     phase "P1+P2  sharpest frames + SAM2 plant/holder masks   -> $WORKDIR/p1, p2"
     [[ ${#VIDEOS[@]} -gt 1 ]] && echo "  ${#VIDEOS[@]} capture passes, tracked separately, solved together in P3"
+    if ! SAM_CKPT="$(find_sam_checkpoint)"; then
+        echo "ERROR: SAM2 checkpoint not found (looked for sam2.1_hiera_large.pt in" >&2
+        echo "  \$SAM2_CHECKPOINT, $REPO_ROOT/checkpoints/," >&2
+        echo "  $REPO_ROOT/third_party/sam2/checkpoints/, ~/.cache/sam2/)." >&2
+        echo "  Fetch it with:  ./setup_env.sh --checkpoint-only" >&2
+        exit 1
+    fi
+    echo "  SAM2 checkpoint: $SAM_CKPT"
     $PY -m pose_estimator.cli.segment \
         ${VIDEOS[0]:+--video} ${VIDEOS[@]+"${VIDEOS[@]}"} --workdir "$WORKDIR" \
-        --checkpoint "$REPO_ROOT/checkpoints/sam2.1_hiera_large.pt"
+        --checkpoint "$SAM_CKPT"
 fi
 
 if should_run p3; then
@@ -176,6 +282,11 @@ if should_run p4c; then
         echo "    --seed-bank <path>/seed_bank.npz   reuse an earlier specimen's vectors"
         echo "    --backend sam --sam-checkpoint <ckpt>   no seeds at all (leaf/stem only)"
     else
+        # --backend sam needs a checkpoint too; fall back to the same search.
+        SAM_CKPT_P4C="$SAM_CHECKPOINT"
+        if [[ -z "$SAM_CKPT_P4C" && "$BACKEND" == "sam" ]]; then
+            SAM_CKPT_P4C="$(find_sam_checkpoint || true)"
+        fi
         phase "P4c    organ labels + coloured clouds            -> $WORKDIR/p4c"
         echo "  two stages: classify (frames -> p4c/class_maps) then fuse (maps -> labels)."
         echo "  Run them separately with pose-classify / pose-fuse when debugging -- the"
@@ -184,7 +295,7 @@ if should_run p4c; then
         $PY -m pose_estimator.cli.semantic \
             --workdir "$WORKDIR" --backend "$BACKEND" --dino-model "$DINO_MODEL" \
             ${HF_TOKEN_ARG:+--hf-token "$HF_TOKEN_ARG"} \
-            ${SAM_CHECKPOINT:+--checkpoint "$SAM_CHECKPOINT"} \
+            ${SAM_CKPT_P4C:+--checkpoint "$SAM_CKPT_P4C"} \
             ${SEEDS_FILE:+--seeds-file "$SEEDS_FILE"} \
             ${SEED_BANK:+--seed-bank "$SEED_BANK"} \
             ${SEED_FRAME:+--seed-frame "$SEED_FRAME"} \
