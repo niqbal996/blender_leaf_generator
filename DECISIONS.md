@@ -1,0 +1,736 @@
+# Decisions log
+
+Append-only record of pipeline decisions: what was chosen, why, and what
+evidence backed it. Required by `plant_pose_pipeline_PLAN.md` §0 — the point
+is that a threshold or backend choice made six weeks ago can be re-examined
+without archaeology.
+
+---
+
+## 2026-08-03 — Package split: `leaf_generator` / `pose_estimator`
+
+All plant-measurement code moved from `src/leaf_generator/skeleton/` to a new
+top-level `src/pose_estimator/` package, along with the four root CLI scripts.
+
+**Why:** the two concerns were already independent — `skeleton/` imported
+nothing from the rest of `leaf_generator` — but shared a package namespace,
+which made the boundary invisible. `leaf_generator` *authors* synthetic leaf
+assets for Blender; `pose_estimator` *measures* a real plant. They share no
+code and are developed against different plans.
+
+**Evidence:** the move required zero import changes inside the moved modules
+beyond the package prefix.
+
+**Consequence:** CLIs are now console scripts (`pose-segment`,
+`pose-estimate-skeleton`, `pose-train-splat`, `pose-align-skeleton`) rather
+than root-level `.py` files. `blender_plant_import.py` stays at the repo root
+because Blender needs a real file path to open.
+
+---
+
+## 2026-08-03 — Environment: conda env `pose_estimator`, Python 3.11, torch cu124
+
+Separate from the older `plant_gen` env so the SAM2/torch stack cannot break
+the working COLMAP/gsplat setup.
+
+Hardware this was chosen against: **RTX 2070 Mobile, 8 GB VRAM** (~7 GB free).
+That is the binding constraint on every model choice below.
+
+---
+
+## 2026-08-03 — SAM2 installed from source, NOT from PyPI
+
+**Decision:** clone `github.com/facebookresearch/sam2` into `third_party/` and
+`pip install -e` it. Do **not** `pip install sam2`.
+
+**Why:** the `sam2` name on PyPI (v1.1.0) is *not* published by Meta — its
+project home is `github.com/JinsuaFeito-dev/segment-anything-2`, an unrelated
+third-party account. Installing it would pull unvetted code into the
+environment under a name that looks official. This is exactly the supply-chain
+check §8 of the plan asks for.
+
+**License:** SAM2 code and checkpoints are **Apache-2.0** — no non-commercial
+restriction, so it is safe for a commercial asset library. Verified from the
+repo's LICENSE file, not from a summary.
+
+**Checkpoint:** `sam2.1_hiera_large.pt` (~900 MB on disk). Chosen over
+`base_plus` because P2's hardest job is thin petioles and roots, where the
+larger backbone measurably helps; VRAM pressure is handled by offloading the
+video and inference state to CPU rather than by shrinking the model.
+
+---
+
+## 2026-08-03 — Frame selection: sharpest-per-angular-bin
+
+Replaced even sampling (`extract_frames`) with `extract_sharpest_frames`,
+which splits the video into N consecutive bins and keeps the frame with the
+highest variance-of-Laplacian in each.
+
+**Why:** the turntable rotates continuously, so a fixed stride lands on a
+motion-blurred frame about as often as a crisp one. Within one bin the
+rotation is small, so choosing by sharpness costs nothing in angular
+coverage. Plan §P1.1.
+
+**Not yet done:** blur *rejection* against an absolute threshold, and
+near-duplicate removal for turntable pauses. Per-bin selection covers the
+current captures (continuous rotation, no pauses).
+
+---
+
+## 2026-08-03 — P2 segments a cropped ROI, not the full frame
+
+The subject ROI is the padded union of plant+holder color blobs over all
+frames; SAM2 runs on that crop, and masks are pasted back into full-frame
+coordinates before being written.
+
+**Why:** SAM2 resizes its input to 1024×1024 regardless. In these captures
+(1920×1080, seedling spanning roughly a quarter of the frame) full-frame input
+leaves petioles ~2 px wide — below what any segmenter holds onto. Cropping
+first is the cheapest available resolution gain, and a single fixed window
+keeps the mapping back to full-frame coordinates a constant offset, which
+P3/P4 require since the intrinsics describe the full frame.
+
+**Guard:** `--no-roi` disables it if the color prepass picks the wrong region.
+
+---
+
+## 2026-08-03 — Color is used to *seed* SAM2, never to threshold output
+
+Plant prompts come from an Excess-Green blob, holder prompts from a saturated
+warm-hue blob (tuned for the red/yellow insulated pliers in the current rig).
+
+**Why this does not violate the plan's ground rule on thresholds (§0):** these
+values only decide where a *click* lands. SAM2 then finds the real boundary,
+so a sloppy seed still yields a correct mask, and a seed on the wrong object
+shows up immediately in the `diag/` overlays rather than silently distorting
+geometry. No output pixel is decided by a color threshold.
+
+**Guard:** `--plant-point` / `--holder-point` bypass the derivation entirely.
+The holder hue window is rig-specific and **will** need changing for a
+different holder — flagged here rather than pretending it generalises.
+
+---
+
+## 2026-08-03 — P2 crop *tracks* the plant; a fixed ROI is useless here
+
+**Measured:** the specimen is clamped off the rotation axis, so it orbits. Its
+union bounding box over one rotation covers 1639 of 1920 px on DSC_0009 — a
+fixed crop is the full frame and buys nothing.
+
+**Decision:** `solve_tracking_crop` follows the plant with a constant-size,
+per-frame window (centroid smoothed circularly, since the sequence is one
+closed rotation). Masks paste back to full-frame coordinates before being
+written, so P3/P4 never see crop coordinates.
+
+**Result on the current captures:** the window lands at 1080x1080, i.e. ~0.95x
+— barely better than full-frame, because the plant's own apparent size varies a
+lot across the turn. The mechanism is right and pays off on tighter framing;
+**the real fix is at capture time — fill more of the frame with the plant.**
+
+---
+
+## 2026-08-03 — REJECTED: color agreement as a P2 acceptance check
+
+Plan §P2.4 asks for a chroma/luminance matte cross-checked against SAM2, with
+disagreement treated as a QC failure. **Tried, measured, rejected.**
+
+**Why it fails on this rig — three separate measurements:**
+1. A brightness-based matte swallows the turntable: it covered 19.6% of the
+   frame, giving a meaningless 0.32 IoU against masks that are visibly perfect.
+2. "Did SAM2 find all the green?" scored 0.64 recall — but inspection showed
+   the *missing* pixels were the pliers' **yellow grip**, which is
+   green-dominant in RGB. SAM2 was right and the color prior was wrong.
+3. Hue cannot separate them: **47% of true plant pixels** fall in the same
+   warm-hue window as the yellow plastic.
+
+**Replaced with three checks that need no color prior:**
+- `area_temporally_smooth` — turntable area varies smoothly.
+- `centroid_trajectory_smooth` — the mask centroid traces a closed orbit; a
+  discontinuity is tracking loss. Purely geometric.
+- `plant_mask_free_of_holder` — asks the *decidable* question ("did SAM2 grab
+  something definitely not-plant?") rather than the undecidable one.
+
+**Genuine independent cross-validation is still owed**, and its right home is
+P4: rendered-vs-input mask IoU on held-out views. Noted so this is not
+forgotten.
+
+---
+
+## 2026-08-03 — Holder color rule: two disjoint rules, brightness for yellow
+
+`holder_color_mask` = (narrow true-red hue & S>=120) OR (yellow hue & S>=80 &
+**V>=215**). Brightness, not hue, separates yellow plastic from yellow-green
+foliage.
+
+**Evidence:** the earlier single rule (any warm hue, S>=120) claimed 20% of the
+true plant. The two-rule version claims **<1%** while still finding 40k-135k
+holder px/frame, measured across 4 frames of DSC_0009.
+
+**Rig-specific and flagged as such** — it encodes "red and yellow insulated
+pliers". A different holder needs a new rule; `--holder-point` bypasses it.
+
+---
+
+## 2026-08-03 — QC contamination counts only sizeable blobs
+
+`holder_contamination` runs `_significant_components` (>=0.1% of frame) before
+intersecting.
+
+**Why:** specular highlights on glossy leaves are small, bright and warm, so
+they trip the yellow-plastic rule exactly as the grip does. Unfiltered, this
+reported 4.5% "contamination" on a frame whose mask was pixel-perfect — the red
+pixels were leaf glare, confirmed visually. Real contamination is a contiguous
+piece of plier, never speckle. After filtering: worst frame 0.91% / 0.11%, mean
+0.02% / 0.002% on DSC_0009 / DSC_0010.
+
+This is the plan's "glossy leaves" failure mode (§6) showing up early, in QC
+rather than in geometry.
+
+---
+
+## 2026-08-03 — GROUND TRUTH for DSC_0009, from the person who shot it
+
+Recorded because it corrects an assumption, not just a parameter:
+
+- **6 proper leaves**, mostly well represented in the point cloud at the top.
+- **One of the six sits below the top group.**
+- That lower leaf has **4-6 tiny leaves emerging from the main stem at its
+  base**. The hull smudges them into a single blob.
+- **One more leaf is emerging at the plant's peak.**
+
+**What this corrects.** The "impossible" width profile -- a leaf measuring
+broad at its own base -- was being treated here as proof of a midrib bug. It
+is substantially *real*: that base is a merged cluster of small leaves, not
+one leaf's petiole. A curvature-regularised spline was about to be built to
+suppress it, which would have been fitting away real structure.
+
+**Priority set by the same source:** missing a large leaf while chasing the
+tiny ones is the worse error. Detecting the small ones is a bonus, not a
+requirement.
+
+---
+
+## 2026-08-03 — min_branch_fraction = 0.22, calibrated against the leaf count
+
+| setting | leaves | points per leaf |
+|---|---|---|
+| 0.30 | 5 | 1586, 1122, 1002, 960, 616 |
+| **0.22** | **6** | **1585, 1122, 1004, 960, 733, 614** |
+| 0.16 | 8 | 1122, 831, 825, 767, 712, 571, 532, 528 |
+
+0.22 recovers all six proper leaves, every one substantial, with the two
+largest untouched. 0.16 finds more branches but **splits the largest leaf**
+(1586 down to 1122) -- precisely the failure mode to avoid. Verified visually:
+the six axes land on six distinguishable leaves, including the one below the
+main group.
+
+**The frame-continuity check still fails (21.8 deg vs a 5 deg limit) and that
+is now understood as partly a data property rather than a defect.** The
+merged basal cluster genuinely bends the midrib of the leaf it is attached to.
+Left failing rather than loosened, so the limitation stays visible.
+
+---
+
+## 2026-08-03 — A leaf is an edge that ends at a *tip* (P5 bug, found via P6)
+
+**The bug:** `solve_stem_and_leaves` called every non-stem edge a leaf. On
+DSC_0009 that included a `root -> branch` edge (the basal stem segment) and a
+`branch -> branch` edge (an internode between two insertions). P6 then fitted
+midribs to two pieces of stem.
+
+**How it presented:** impossible width profiles (a "leaf" at maximum width at
+its own base) and insertion angles past 118 degrees. Both symptoms pointed at
+P6's base-point handling, and **two attempted fixes there made things worse** --
+picking the axis endpoint nearest the plant origin (fails on a drooping leaf,
+whose tip curves back closer to the origin than its attachment), then the
+endpoint nearest the stem axis. Neither could work, because the objects being
+measured were not leaves.
+
+**The fix:** a leaf terminates at a tip. Edges ending at another branch point
+are internodes; edges leaving the root are basal stem. Both are structure, not
+organs.
+
+**Result on DSC_0009:** 7 "leaves" -> **5**, all tip-terminating. Insertion
+angles tightened from 31.6-146.5 deg to **33.4-54.0 deg**; arclengths to within
+1.3x of each other; and every leaf now measures narrow at the base and wide
+mid-blade (e.g. leaf 2: 0.0001 at base against 0.0326 at mid-span), which is
+the shape a leaf actually has.
+
+**Lesson worth keeping:** the symptom appeared in P6 and the defect was in P5.
+Two rounds of increasingly clever compensation in the wrong module made the
+output worse each time. The diagnostic that settled it was dumping the
+endpoint *kinds* of every leaf edge -- two minutes of looking at the data
+rather than reasoning about it.
+
+---
+
+## 2026-08-03 — P4b: 2DGS surfels, seeded from the hull *boundary*
+
+Built the step skipped earlier (plan §P4.2-4). Choices worth recording:
+
+**`rasterization_2dgs`, not `rasterization`.** gsplat 1.5.3 ships both. 2D
+Gaussians are flat oriented discs that lie *on* surfaces; isotropic 3DGS fills
+volume, which is the property that made the hull unusable for P5 in the first
+place. Apache-2.0, so no licence constraint (plan §8).
+
+**Seeded from the hull, not the sparse cloud.** The sparse cloud has ~27k
+points concentrated wherever SIFT happened to match; the hull covers the whole
+plant including the thin root that photometric matching never recovered.
+
+**Boundary voxels only.** 71.5% of hull voxels are fully enclosed interior.
+They have no surface to align to, cannot be seen from any view, and seeding
+them spends capacity on primitives hidden behind the ones that matter. On
+DSC_0009 the boundary is 104,324 of 474,091 voxels.
+
+**Orientation seeded from local PCA normals.** With identity quaternions every
+disc starts facing the same arbitrary direction and the normal-consistency
+loss opens at 0.99 — normals essentially orthogonal to the surface it is meant
+to represent, with 100k+ primitives to rotate from scratch.
+
+**No densification strategy.** Hull initialisation already covers the plant
+densely and correctly, so the usual grow/prune machinery has little to do, and
+leaving it out removes a large surface of API and tuning that would otherwise
+need its own validation.
+
+**Geometry from rendered depth, never from primitive centres** (plan §P4.3).
+Centres sit wherever the photometric loss put them and need not lie on any
+surface; the plan names this as the root cause of the old pipeline's need for
+hand-tuned thresholds.
+
+**Acceptance checks chosen to test the thing that failed before:**
+- rendered-alpha vs input-mask IoU >= 0.90 (does the splat match the silhouettes)
+- **median local flatness <= 0.25**, against the hull's measured 0.798. This
+  is the check that matters, because "is this a surface or a blob" is exactly
+  what P5 needs and exactly what P4a could not deliver.
+
+---
+
+## 2026-08-03 — P5 Path C on the raw hull: attempted, does not converge
+
+Ran the plan's classical baseline (kNN graph + level-set/MST skeletonisation,
+reusing the repo's existing `skeletonize.build_skeleton_graph`) directly on the
+P4 hull. **It does not produce stable structure**, and the failure is
+structural rather than a tuning problem.
+
+**Evidence — sweeping `min_branch_fraction`:**
+
+| min_branch | DSC_0009 leaves | stem length | DSC_0010 leaves | stem length |
+|---|---|---|---|---|
+| 0.12 | 26 | 0.934 | 25 | 0.000 |
+| 0.20 | 8  | 1.642 | 18 | 0.000 |
+| 0.30 | 5  | 0.890 | 11 | 0.000 |
+| 0.40 | 1  | 2.215 | 1  | 1.768 |
+
+No plateau anywhere; leaf count runs 26 to 0 with no stable region, and stem
+length is non-monotonic (0.93 → 1.64 → 0.89 → 2.21), which a stable structure
+could not do. At settings giving a plausible leaf count the smallest "leaf"
+holds 2-9 points — far too few to fit a midrib.
+
+**Diagnosis, measured:**
+- The hull is a **solid volume**: 71.5% of voxels are fully enclosed by 26
+  occupied neighbours. kNN+MST skeletonisation assumes points sampled on a
+  *surface*; over a solid it traces arbitrary interior paths, which is exactly
+  the zigzagging seen in `p5/diag/skeleton_*.jpg`.
+- Local neighbourhoods are **not planar**: median PCA flatness 0.798 over
+  6-voxel neighbourhoods, i.e. near-isotropic. Leaves in the hull are chunky
+  blobs, not thin sheets, so normal-based leaf clustering would not rescue it
+  either.
+
+**Root cause — a capture limitation, not a code one.** Every camera lies in
+one plane (P3 measured out-of-plane scatter at 0.09% of orbit radius). A
+silhouette carve from a single-elevation orbit cannot constrain leaf thickness
+for a leaf tilted out of that plane, because the views that would see it
+edge-on do not exist. The plan anticipates this: §P1 specifies
+`elevations_deg: [20, 60]` — **two** elevations. These captures have one.
+
+**The real gap: P4b was skipped.** Plan §P4 is four steps — visual hull, then
+2DGS surface-aligned splatting, then mesh extraction from *rendered depth*,
+then carve that mesh against the hull. Only step 1 was built. P5 is meant to
+consume the carved splat-derived **surface**, which has thin geometry and
+normals; running it on the hull — which the plan itself calls a bound, not a
+surface — was never going to work well.
+
+**Not a wasted phase.** Two pieces stand on their own and carry forward:
+- `solve_up_direction`: the orbit axis sign is arbitrary and differs between
+  specimens (+Z on DSC_0009, -Z on DSC_0010). Resolving it against the table
+  plane is required by anything that measures an insertion angle.
+- Clamp-line detection: the hull gap under the holder gives the schema's
+  origin directly on DSC_0009. **It fails on DSC_0010**, where the holder
+  never fully occludes the stem, and the code reports that rather than
+  substituting a guess.
+
+---
+
+## 2026-08-03 — P4 carve tolerance = 86% of observing views (fit, not guessed)
+
+A strict visual hull (`min_inside_fraction=1.0`) **deletes the exposed root**
+on both specimens. The root is thin and, worse, hidden behind the pliers for
+part of the orbit, so far more than a couple of views vote it empty and the
+intersection removes it — even though it is plainly present in most masks and
+was segmented correctly in P2. Visible in the first carve as a large
+mask-only region in `p4/diag/hull_vs_mask_*.jpg`.
+
+**Method:** swept the threshold on both specimens, scoring reprojected hull
+against input silhouette (IoU / recall / precision), carving once at the
+loosest setting and subsetting, since stricter results are subsets of looser.
+
+| min in-view fraction | IoU DSC_0009 | IoU DSC_0010 |
+|---|---|---|
+| 100% | 0.618 | 0.722 |
+| 94%  | 0.728 | 0.809 |
+| 90%  | 0.768 | 0.833 |
+| **86%** | **0.785** | **0.838** |
+| 82%  | 0.788 | 0.831 |
+
+**Decision:** 0.86. It is the joint optimum — the peak for DSC_0010 and within
+0.003 of the peak for DSC_0009, with DSC_0010 already declining by 82%.
+Tighter loses the root; looser inflates the whole hull. Fit once, validated on
+both specimens, per the plan's §0 rule (b).
+
+**Expressed as a fraction, not a view count**, so it stays meaningful when the
+frame count changes. (The earlier `outlier_views=2` was an absolute count and
+silently meant something different at 96 frames than it would at 200.)
+
+**Still owed:** a third specimen to confirm 0.86 holds without adjustment.
+Note that no sharp knee exists in the voxel-count-vs-threshold curve — this is
+a real precision/recall trade-off, not a natural break, so it should be
+re-checked whenever the capture geometry changes.
+
+---
+
+## 2026-08-03 — Hull evaluation must render at the voxel's projected size
+
+`_evaluate` closes the reprojected voxel stipple with a kernel derived
+per-view from the voxel's own projected size (`f * voxel / depth`), not a
+fixed 3x3.
+
+**Why:** voxel centres are point samples and project to a dotted pattern with
+gaps. A fixed kernel therefore measures *how finely the hull was sampled*
+rather than what shape it is, which made recall resolution-dependent —
+DSC_0009 scored 0.683 recall at 128^3 and 0.824 at 256^3 for the same
+tolerance, purely from sampling density. Deriving the kernel from geometry
+makes the metric comparable across resolutions.
+
+---
+
+## 2026-08-03 — CORRECTION: the camera orbits; the plant is stationary
+
+An earlier entry here claimed a static camera and a rotating subject, inferred
+from image-space motion. **That inference was wrong**, corrected by the person
+who built the rig: the plant sits on a fixed table and the *camera* orbits it,
+with the backdrop mounted to travel with the camera rig. That is why the
+footage reads as a locked-off camera watching a spinning plant.
+
+**What this does not change:** the masking decision, which was right. What it
+changes is the reason. The backdrop is not "the static thing we should ignore
+because it is uninformative" — it is rigid with the camera, so it is the one
+element genuinely motionless in image space, and matching on it would have
+driven SfM to conclude the camera never moved. It carried an actively wrong
+signal, not a merely useless one.
+
+**What it upgrades:** the table and plant are the true static world, so the
+recovered orbit is the camera's literal physical path, not a relative-motion
+equivalence. The circle-fit acceptance test is measuring a real circle.
+
+**New caveat to carry:** the plant is only approximately stationary. Residual
+vibration from the moving rig perturbs leaves between frames, which surfaces
+as silhouette disagreement during P4 carving — the reason
+`carve(outlier_views=...)` is non-zero by default. Plan §6 lists plant motion
+as a known hard failure mode; here it is present but small.
+
+**Method note:** `temporal_std` still works, and works for the same measurable
+reason (the two regions move differently in image space). But its docstring
+previously justified itself with "the camera is locked off", which was a wrong
+explanation of a right method — the kind of thing that survives until someone
+changes the rig and it silently stops applying.
+
+---
+
+## 2026-08-03 — Sparse points on the table and holder are intended
+
+The P3 cloud contains many points on the turntable top and the pliers. This is
+deliberate and load-bearing: a thin seedling triangulates poorly on its own,
+and the disc's dust speckle plus the holder's edges are what make the solve
+well-conditioned (27,154 points on DSC_0009 versus a few hundred from foliage
+alone).
+
+They are not removed by another mask. P4 carves against the **plant**
+silhouettes only, so any voxel outside the plant mask in more than
+`outlier_views` frames is deleted — table and holder fall out automatically.
+Using the P2 holder mask to pre-delete them would be redundant work that also
+costs P3 its parallax.
+
+---
+
+## 2026-08-03 — P3: the rig is camera-static / subject-rotating (measured)
+
+**Measured**, by per-pixel temporal standard deviation over one rotation of
+DSC_0009: backdrop ~5 DN (top strip mean 5.11), turntable disc 30-60
+(p75=43.4). The camera is locked off; the turntable and everything on it
+rotates.
+
+**Why this dominates P3:** SfM assumes a moving camera in a static scene. Here
+the truly-static thing is the *backdrop*, so unmasked COLMAP would fit it
+perfectly, conclude the camera never moved, and emit a degenerate
+reconstruction with all centres coincident — while discarding the plant as an
+outlier for having the temerity to move. This is the same convention trap the
+plan flags in §P1 pitfalls, arriving without a ChArUco board.
+
+**Decision:** mask matching down to what is rigidly attached to the turntable
+(disc + holder + plant). Solved in that frame, relative motion comes out as
+"camera orbiting a static plant" — the convention P4 wants.
+
+**How the mask is derived — no color, no marker:** Otsu on the temporal
+variance map. The histogram is strongly bimodal ("moved" vs "did not"), so the
+split needs no hand-tuned constant, satisfying the plan's §0 ground rule.
+Holes are closed and filled because untextured disc patches vary little yet
+are physically part of the rotating rig; punching them out would throw away
+the parallax that conditions the solve. Coverage: 49% / 51% of frame on
+DSC_0009 / DSC_0010.
+
+The per-frame P2 plant and holder masks are unioned in as insurance, since a
+leaf tip at the extreme of its arc contributes little temporal variance there.
+
+---
+
+## 2026-08-03 — P3 acceptance: fit a circle to the camera centres
+
+The headline check is that recovered camera centres lie on a circle, are
+coplanar, and span the full turn without a large angular gap.
+
+**Why this is real evidence and not circular reasoning:** nothing in COLMAP's
+objective knows this is a turntable or rewards circularity. A reconstruction
+that collapsed, drifted in scale, or mirrored will not produce a clean circle
+by accident. It is the closest available substitute for the independent
+cross-validation a ChArUco board would have given (plan §P3), and it is the
+reason marker-free capture is worth attempting at all here.
+
+Thresholds (first pass, to be calibrated across specimens): circle RMS < 2% of
+orbit radius, out-of-plane scatter < 2%, largest angular gap < 30 deg,
+registration >= 95%, mean reprojection error < 1.5 px.
+
+---
+
+## 2026-08-03 — P3: force a single shared camera (COLMAP's default is wrong here)
+
+**Bug found by the circle check, exactly as intended.** DSC_0010 registered
+96/96 frames at 0.575 px mean reprojection error — by conventional SfM metrics,
+a good reconstruction — yet its camera centres missed their own fitted circle
+by 5.24% RMS (14.15% worst) with a *systematic* drift and a discontinuity, not
+noise.
+
+**Cause:** COLMAP's `camera_mode` defaults to `AUTO`, which groups images by
+EXIF. Frames extracted from video have no EXIF, so it fell back to
+**one camera per image** — 96 independent focal lengths for a locked-off body
+and lens that never changed.
+
+**Evidence:** focal length spread across frames from the same fixed lens —
+DSC_0010 **27.5%**, DSC_0009 1.98%. Physically impossible; the solver was
+absorbing reconstruction drift into intrinsics. DSC_0009's smaller spread is
+why it passed, i.e. it passed by luck, not correctness.
+
+**Decision:** `camera_mode=CameraMode.SINGLE` by default in
+`build_sparse_reconstruction`. `--per-image-cameras` restores the old
+behaviour for footage where the lens genuinely changed.
+
+**Worth noting for the plan:** low reprojection error did *not* catch this —
+of course it didn't, since the extra parameters exist precisely to drive that
+number down. Only the rig-geometry check did. This is the argument for
+acceptance criteria derived from physics rather than from the optimiser's own
+objective (§0), and it is the first time in this pipeline that it has paid.
+
+---
+
+## 2026-08-03 — P2 accepted on DSC_0009 and DSC_0010
+
+96 frames each, all 6 checks pass on both. Median plant mask 52.8k px
+(DSC_0009) / 67.7k px (DSC_0010). Runtime ~2 min/specimen on the RTX 2070.
+
+Masks capture leaves, stem **and the thin exposed roots**, verified visually at
+6 angles per specimen. Mask-area-vs-angle traces a smooth periodic curve
+peaking at broadside views — the physically expected signature.
+
+---
+
+## 2026-08-07 — Multi-elevation capture: several videos into one solve
+
+**Problem it addresses:** leaves 0, 1 and 9 merge at the apex whorl. They
+attach within 0.02 in height of each other, and no camera in a single
+waist-height orbit ever looks *down* into the whorl — measured out-of-plane
+camera scatter on DSC_0009 is 0.09% of the orbit radius, i.e. the orbit is
+essentially a perfect plane. Silhouette carving cannot separate structures it
+never observed from a second direction, so this is a **data** limitation, not
+an algorithm one, and no amount of clustering work fixes it. The remedy is a
+second orbit at a different elevation.
+
+**Design:** several passes share one workdir rather than being reconstructed
+separately and registered afterwards. Post-hoc registration of two independent
+reconstructions needs a shared scale and an alignment step of its own, and
+each pass would be solved from strictly less evidence. Feeding all frames to
+one COLMAP solve puts every camera in one coordinate frame by construction.
+
+**Four things assumed one video and were fixed:**
+
+1. `extract_sharpest_frames(..., start_index=)` — frames from later passes are
+   numbered consecutively instead of overwriting `frame_0000.jpg`.
+
+2. **SAM2 runs once per pass.** Video propagation carries temporal memory
+   between consecutive frames; running it across the cut between two videos
+   asks it to track through a discontinuity it has no reason to survive.
+
+3. **One rotating-region mask per pass.** The backdrop is rigid with the
+   *camera*, so at a different elevation it occupies a different part of the
+   image. Measured on DSC_0009 + DSC_0010: the per-pass masks cover 40.0% and
+   36.2% of the frame at IoU **0.653** — pooling both passes into one
+   variance map gives 44.4%, which includes backdrop that each pass
+   individually excludes. Backdrop features are the one thing P3 must never
+   match on (see the P3 entry above), so this was not cosmetic.
+
+4. **One circle fit per pass, not one overall.** Two elevations trace two
+   coaxial rings; a single circle through both describes neither. On a
+   synthetic *perfect* two-elevation rig (radii 1.0 and 0.8, separation 0.9)
+   the pooled fit reports a circle RMS of **11.0%** and would fail the 2%
+   acceptance check outright, while each pass fits at 0.00%. The pooled radius
+   comes out 0.906 — a value belonging to neither orbit.
+
+**New acceptance checks, only active with more than one pass:**
+
+- `passes_share_a_rotation_axis` (limit 2°) — the strongest evidence
+  available that the passes really merged. Nothing in the solve enforces it:
+  two independently-registered orbits agreeing on an axis is hard to achieve
+  by accident.
+- `passes_are_at_different_elevations` — a second pass only helps if it *is*
+  at a second elevation. Guards against re-shooting the same viewpoint and
+  concluding the extra frames did nothing.
+
+**Downstream frame:** with several passes, `poses.json["orbit"]` is a
+`consensus_orbit` — axis averaged across passes (with signs aligned first,
+since a fitted plane normal's sign is arbitrary and unaligned averaging can
+cancel two consistent axes to zero), centre taken as the mean of the pass
+centres, which lies on the shared axis. Quality figures are reported as the
+worst pass, not the average. P5's upright plant frame reads this.
+
+**P2 QC is now pass-aware.** `area_temporally_smooth` and
+`centroid_trajectory_smooth` both compare consecutive frames, and consecutive
+frames from different passes are not continuous — the camera jumps elevation
+between them. Left unfixed, the boundary registers as tracking loss and the
+checks would fail on exactly the captures they exist to validate.
+
+### Validated on DSC_0009 + DSC_0010, 48 frames each
+
+Merged P3 solve, all six checks pass: 96/96 frames registered, 0.667 px mean
+reprojection error, per-pass circle RMS 0.06% and 0.21%, largest angular gap
+15.3°, **axes agree to 1.30°**, orbit centres separated by 12.9% of the orbit
+radius. 14,286 sparse points.
+
+**But a passing axis check does not establish that the specimen is the same
+in both passes.** The turntable disc's own surface texture is enough to bind
+two orbits into one coordinate frame; the plant could differ and the check
+would still pass. That distinction matters because merging two *different*
+specimens produces a confident, internally consistent, meaningless
+reconstruction.
+
+Two tests were tried:
+
+- *Shared tracks.* Only 16.7% of points are observed by both passes — but the
+  disc, used as a control, is barely different at 18.1% versus 12.4% for the
+  plant crown. SIFT rarely matches across a 12.9% elevation change anywhere in
+  the frame, so this measures feature repeatability, not specimen identity.
+  Inconclusive.
+
+- *Cross-pass silhouette agreement.* Points triangulated as foliage in one
+  pass were projected into the other pass's images and tested against a crude
+  green mask (the plant is the only green object on a black backdrop). They
+  land on foliage **67.3%** of the time. Null hypothesis: the same points spun
+  60/120/180° about the turntable axis — inside the plant's swept envelope but
+  with the correspondence destroyed — score **19.9%**. A uniformly random
+  pixel scores 2.38%. Held-out views *within* a pass score 75-86%, so the
+  remaining 8-18 point gap is self-occlusion, residual plant vibration between
+  takes, and silhouette disagreement at leaf edges viewed from a new
+  elevation.
+
+**Conclusion: same specimen, same pose, two elevations.** The merge is valid.
+
+---
+
+## 2026-08-12 — P4c: obliquity-weighted multi-view fusion
+
+**Observation driving it:** a 2D segmenter identifies a leaf when its blade
+faces the camera and mistakes the same leaf for a stem or ribbon when it turns
+edge-on. Over a 360° orbit this happens to every leaf, so different views are
+right about different leaves and the rest add noise.
+
+**Why "segment every frame and merge" was the wrong shape.** It treats
+disagreement between views as conflict to be resolved, when most of it is not
+conflict at all: an edge-on camera is not wrong about the leaf, it is simply
+not in a position to see one. Requiring agreement asks the capture for
+something its geometry forbids.
+
+**The fix:** each view's vote is scaled by the cosine between the point's
+surface normal and the ray to that camera. This is not a tuning constant --
+it is the foreshortening factor, the fraction of that surface the camera
+actually sees. A blade square to the camera contributes its full area; the
+same blade edge-on projects to a sliver and contributes nearly nothing. No
+threshold, no exponent, no cutoff: grazing views abstain on their own.
+
+**Sign is discarded.** A leaf is a two-sided sheet and which face is turned
+toward the camera flips halfway round the orbit; a signed cosine would reward
+one half of the capture and punish the other for identical geometry. `abs`
+asks the only question that matters -- broad-side or edge-on -- and sidesteps
+normal orientation entirely. Self-occlusion is already handled upstream: the
+z-buffered index map means a point that reaches a pixel is the one facing the
+camera.
+
+**Normals** come free from P4b's `surface.ply` (`nx, ny, nz`), fitted against
+the photographs. `estimate_normals` (local PCA) covers a cloud without them,
+with a warning for the P4a hull -- it is a solid, and its interior points have
+no surface to be normal to.
+
+### Measured on runs/plant_9: 137,024 points, 96 real views
+
+| for each point, the fraction of *its own* views that are broad-side (cos > 0.7) | share of cloud |
+|---|---|
+| 0–10% | 21.3% |
+| 10–25% | 24.0% |
+| 25–50% | 39.2% |
+| over 50% | 15.5% |
+
+**84.5% of the cloud has broad-side views in the minority.** Plain majority
+counting was therefore deciding the overwhelming bulk of this plant from
+cameras that could not see the surface they were voting on. Mean obliquity
+across observing views is 0.525; **14.9% of points are never seen broad-side
+at all** (max cosine < 0.7) — those are labelled from evidence no camera was
+positioned to give, which the new `few_points_decided_edge_on` check surfaces
+rather than burying.
+
+### Reach of the fix, and its limit
+
+On a synthetic orbit (36 cameras, one flat blade, a segmenter that recognises
+the blade only above a given obliquity):
+
+- tolerance 0.8 — blade recognised in **14 of 36 views**, a clear minority, so
+  majority voting labels it stem. Those 14 views carry 13.2 of the 22.9 total
+  weight, and weighted fusion recovers **leaf**.
+- crossover sits near tolerance 0.9 (10 of 36 views): leaf 100% at 0.85, 16%
+  at 0.9, 0% at 0.95.
+
+So weighting moves the break-even from "recognised in over half the views" to
+"recognised in roughly a third". It is not unlimited rescue, and below that
+the fusion reports stem rather than inventing a leaf — which is correct: at
+that point the evidence genuinely is absent.
+
+### Latent bug found and fixed on the way
+
+The tally was three fixed arrays (`vote_other`, `vote_leaf`, `vote_stem`)
+whose names did not match what the DINO path put in them — it round-tripped
+correctly only because class index 0/1/2 happened to line up with the column
+order. With **four** seed classes (`"leaf" "tiny leaf" "stem" "root"`, which
+is what the prompts had been set to) class index 3 was counted in
+`n_views_seen` but into no vote column at all, silently depressing every
+affected point's confidence and letting the argmax pick among the first three.
+The tally is now an (N, C) array over whatever classes the seeds define, and
+out-of-range indices are dropped explicitly rather than folded into class 0.
+
+`--no-normal-weighting` restores plain counting for A/B comparison, and every
+run reports how many points the weighting actually moved — reported, not
+asserted, since a run where it changes nothing is worth seeing.
