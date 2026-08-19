@@ -20,6 +20,11 @@
 #   ./run_pipeline.sh --video <file> --workdir runs/plant_9 \
 #       --backend sam --sam-checkpoint checkpoints/sam2.1_hiera_large.pt
 #
+#   --use-gpu   run P3's SIFT on the GPU. Needs a CUDA pycolmap build
+#               (pip install pycolmap-cuda) with its bundled CUDA runtime on
+#               LD_LIBRARY_PATH -- setup_env.sh arranges both. Without it,
+#               COLMAP still runs, just on CPU.
+#
 # Phases: p1p2 p3 p4a p4b p4c p5 p6.  --skip-to <phase> resumes partway on an
 # existing workdir; --stop-after <phase> ends early. P4c looks for clicked
 # seeds at <workdir>/p4c/seeds.json and uses them without being told.
@@ -76,7 +81,7 @@ set -euo pipefail
 VIDEOS=(); WORKDIR=""; SEED_FRAME=""; HF_TOKEN_ARG="${HF_TOKEN:-}"
 DINO_MODEL="facebook/dinov3-vitb16-pretrain-lvd1689m"
 SEEDS=(); SKIP_TO=""; SEED_BANK=""; SEEDS_FILE=""; SKIP_P4B=0
-BACKEND="dino"; SAM_CHECKPOINT=""; STOP_AFTER=""
+BACKEND="dino"; SAM_CHECKPOINT=""; STOP_AFTER=""; USE_GPU=0
 
 # Print the comment block at the top of this file, however long it is, so the
 # help text cannot drift out of sync with a hard-coded line range.
@@ -99,6 +104,7 @@ while [[ $# -gt 0 ]]; do
         --backend)      BACKEND="$2"; shift 2 ;;
         --sam-checkpoint) SAM_CHECKPOINT="$2"; shift 2 ;;
         --skip-p4b)     SKIP_P4B=1; shift ;;
+        --use-gpu)      USE_GPU=1; shift ;;
         --seeds)        shift; while [[ $# -gt 0 && "$1" != --* ]]; do SEEDS+=("$1"); shift; done ;;
         -h|--help)      usage 0 ;;
         *) echo "unknown option: $1" >&2; usage 1 ;;
@@ -252,7 +258,7 @@ fi
 
 if should_run p3; then
     phase "P3     camera poses, masked COLMAP                 -> $WORKDIR/p3"
-    $PY -m pose_estimator.cli.pose --workdir "$WORKDIR"
+    $PY -m pose_estimator.cli.pose --workdir "$WORKDIR" $( ((USE_GPU)) && echo --use-gpu )
 fi
 
 if should_run p4a; then

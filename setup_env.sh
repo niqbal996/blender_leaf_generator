@@ -298,15 +298,13 @@ if "$PY" -m pip list 2>/dev/null | grep -q '^pycolmap '; then
         # package directory, so uninstalling either deletes files the other
         # still needs. Skipping this leaves a module that imports but has
         # lost attributes -- observed live, `pycolmap.__version__` gone.
-        if "$PY" -c "import pycolmap" >/dev/null 2>&1; then
-            "$PY" -m pip uninstall -y pycolmap-cuda >/dev/null
-            "$PY" -m pip install --force-reinstall --no-deps pycolmap >/dev/null
-            echo "    kept the CPU build (it imports cleanly)"
-        else
-            "$PY" -m pip uninstall -y pycolmap >/dev/null
-            "$PY" -m pip install --force-reinstall --no-deps pycolmap-cuda >/dev/null
-            echo "    kept the GPU build"
-        fi
+        # In GPU mode the CUDA build is the one worth keeping (it is what
+        # makes --use-gpu work); the CPU build only wins as a fallback.
+        if [[ "$MODE" == "gpu" ]]; then KEEP="pycolmap-cuda"; DROP="pycolmap";
+        else KEEP="pycolmap"; DROP="pycolmap-cuda"; fi
+        "$PY" -m pip uninstall -y "$DROP" >/dev/null
+        "$PY" -m pip install --force-reinstall --no-deps "$KEEP" >/dev/null
+        echo "    kept $KEEP"
     fi
 fi
 if ! "$PY" -c "import pycolmap" >/dev/null 2>&1; then
