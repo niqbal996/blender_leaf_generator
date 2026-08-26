@@ -37,6 +37,7 @@ class CarveCamera:
     world_to_camera: np.ndarray  # (4, 4)
     mask: np.ndarray  # bool (H, W), True = subject
     name: str
+    occluder: Optional[np.ndarray] = None  # bool (H, W), True = something in front
 
     def project(self, points_world: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """World points -> (pixel coords Nx2, in-front-of-camera flag)."""
@@ -54,6 +55,7 @@ def load_carve_cameras(
     reconstruction,
     mask_dir: Union[str, Path],
     dilate_px: int = 2,
+    occluder_dir: Optional[Union[str, Path]] = None,
 ) -> List[CarveCamera]:
     """Build carve cameras from a COLMAP reconstruction + P2 plant masks.
 
@@ -64,6 +66,7 @@ def load_carve_cameras(
     correct direction of error for something used as an upper bound.
     """
     mask_dir = Path(mask_dir)
+    occluder_dir = Path(occluder_dir) if occluder_dir is not None else None
     kernel = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), np.uint8) if dilate_px > 0 else None
 
     cameras: List[CarveCamera] = []
@@ -79,6 +82,19 @@ def load_carve_cameras(
         if kernel is not None:
             binary = cv2.dilate(binary.astype(np.uint8), kernel).astype(bool)
 
+        occluder = None
+        if occluder_dir is not None:
+            raw = cv2.imread(str(occluder_dir / f"{Path(image.name).stem}.png"),
+                             cv2.IMREAD_GRAYSCALE)
+            if raw is not None:
+                occluder = raw > 127
+                if kernel is not None:
+                    # Dilated by the same amount as the silhouette, so the rim
+                    # where the two masks disagree is excused rather than
+                    # counted as evidence against the voxel behind it.
+                    occluder = cv2.dilate(occluder.astype(np.uint8), kernel).astype(bool)
+                occluder &= ~binary      # plant in front of the tool is still plant
+
         world_to_camera = np.eye(4)
         world_to_camera[:3, :] = image.cam_from_world().matrix()
 
@@ -88,6 +104,7 @@ def load_carve_cameras(
                 world_to_camera=world_to_camera,
                 mask=binary,
                 name=image.name,
+                occluder=occluder,
             )
         )
     return cameras
@@ -110,11 +127,13 @@ def _vote(
     *and* in-silhouette in nearly every view that observed it.
     """
     observed = np.zeros(len(points), dtype=np.int32)
+    judged = np.zeros(len(points), dtype=np.int32)
     inside = np.zeros(len(points), dtype=np.int32)
 
     for start in range(0, len(points), chunk):
         block = points[start : start + chunk]
         block_observed = np.zeros(len(block), dtype=np.int32)
+        block_judged = np.zeros(len(block), dtype=np.int32)
         block_inside = np.zeros(len(block), dtype=np.int32)
 
         for camera in cameras:
@@ -128,12 +147,23 @@ def _vote(
             yi = np.clip(y, 0, height - 1)
 
             block_observed += testable
-            block_inside += testable & camera.mask[yi, xi]
+            # Behind the holder we learn nothing. Counting a hidden voxel as
+            # "not in the silhouette" is what deleted the root: the pliers
+            # cross in front of it for most of the orbit, so it was absent
+            # from 73% of the masks and lost a 86%-of-views vote it was never
+            # given a fair chance at. Occluded views leave the denominator
+            # instead of voting against.
+            seen = testable
+            if camera.occluder is not None:
+                seen = seen & ~camera.occluder[yi, xi]
+            block_judged += seen
+            block_inside += seen & camera.mask[yi, xi]
 
         observed[start : start + chunk] = block_observed
+        judged[start : start + chunk] = block_judged
         inside[start : start + chunk] = block_inside
 
-    return observed, inside
+    return observed, judged, inside
 
 
 def carve(
@@ -144,6 +174,8 @@ def carve(
     coarse_resolution: int = 64,
     min_inside_fraction: float = 0.86,
     min_observed_fraction: float = 0.9,
+    min_judged_views: int = 8,
+    min_judged_fraction: float = 0.5,
 ) -> Tuple[np.ndarray, float, np.ndarray]:
     """Coarse-to-fine silhouette carve.
 
@@ -166,13 +198,37 @@ def carve(
 
     `min_observed_fraction` requires a voxel to actually fall inside most
     cameras' images before it can be kept at all, which is what confines the
-    hull to the intersection of the frustums.
+    hull to the intersection of the frustums. It counts *frustum* membership,
+    deliberately including views where the voxel was hidden -- being behind
+    the holder is not the same as being outside the camera, and conflating
+    them would delete anything the tool covers for most of the orbit, which
+    is the failure this occlusion handling exists to fix.
+
+    `min_judged_fraction` is the floor on how much of a voxel's evidence may
+    be excused. Without it, excusing occluded views builds a solid block in
+    the holder's shadow: the volume inside the pliers is hidden in almost
+    every frame, so almost nothing votes against it and the little that does
+    is outvoted. Measured on thistle1, that was 221,484 voxels -- 32% of the
+    hull -- sitting inside the tool, while the actual root stayed missing.
+    Requiring half the frustum views to be unoccluded separates the two
+    cleanly there: the plier shadow is judged in 9% of its views, the root
+    column in 78%.
+
+    `min_judged_views` is the floor on unoccluded views. Excusing occluded
+    views makes the in-silhouette fraction a vote among fewer voters, and two
+    voters agreeing means very little; a silhouette intersection needs views
+    spread around the orbit before it constrains a shape at all. Absolute
+    rather than a fraction because it expresses "enough evidence to say
+    anything", which does not scale with how long the capture was.
     """
     min_observed = max(int(np.ceil(min_observed_fraction * len(cameras))), 1)
 
     def survives(points: np.ndarray) -> np.ndarray:
-        observed, inside = _vote(points, cameras)
-        return (observed >= min_observed) & (inside >= min_inside_fraction * observed)
+        observed, judged, inside = _vote(points, cameras)
+        enough = ((observed >= min_observed)
+                  & (judged >= min_judged_views)
+                  & (judged >= min_judged_fraction * np.maximum(observed, 1)))
+        return enough & (inside >= min_inside_fraction * np.maximum(judged, 1))
 
     # --- coarse pass: find where the hull actually lives ---
     grid = _grid_points(bounds_min, bounds_max, coarse_resolution)

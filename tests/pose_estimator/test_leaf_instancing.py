@@ -179,11 +179,35 @@ def test_midrib_runs_base_to_tip_and_follows_a_bend():
     assert np.min(np.linalg.norm(curve - corner, axis=1)) < SPACING * 3
 
 
-def test_no_leaves_when_there_is_no_stem():
+def test_caulescent_needs_a_stem():
+    """Asked for the stem path explicitly, no stem still means no leaves.
+
+    This used to be the behaviour in every case, which is what made a rosette
+    unprocessable: a thistle has no stem tissue to seed the depth field from,
+    so it returned zero leaves and no amount of clicking could fix it.
+    """
     leaf = blade([0, 0, 0], [1, 0, 0], 10)
-    inst = instance_by_tips(leaf, np.zeros((0, 3)), CONTACT, min_points=2)
+    inst = instance_by_tips(leaf, np.zeros((0, 3)), CONTACT, min_points=2,
+                            architecture="caulescent")
     assert len(inst.contact_index) == 0
     assert not np.isfinite(inst.depth).any()
+
+
+def test_rosette_finds_a_crown_without_any_stem():
+    """Blades radiating from one point get a base, and it lands on that point."""
+    centre = np.array([0.0, 0.0, 0.0])
+    directions = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)]
+    leaf = np.vstack([blade(centre, d, 12) for d in directions])
+
+    inst = instance_by_tips(leaf, np.zeros((0, 3)), CONTACT, min_points=5,
+                            architecture="rosette")
+
+    assert inst.base is not None, "no stem and no base means nothing downstream can run"
+    assert inst.architecture == "rosette"
+    # The crown is where the blades meet, not somewhere out along one of them.
+    assert np.linalg.norm(inst.base.center - centre) < SPACING * 4
+    assert np.isfinite(inst.depth).all(), "every blade must be reachable from the crown"
+    assert len({int(o) for o in inst.owner if o >= 0}) == len(directions)
 
 
 def test_empty_input_is_handled():
@@ -294,3 +318,218 @@ def test_root_anchor_absent_without_a_root():
     from pose_estimator.structure_labels import root_anchor
     assert root_anchor(np.zeros((0, 3)), blade([0, 0, 0], [0, 0, 1], 5)) is None
     assert root_anchor(None, blade([0, 0, 0], [0, 0, 1], 5)) is None
+
+
+def test_caulescent_is_the_default_and_uses_the_stem():
+    """The stemmed path is what you get unless you ask for a rosette."""
+    from pose_estimator.structure_labels import instance_by_tips
+
+    stem = np.array([[0, 0, z * SPACING] for z in range(12)], float)
+    leaf = np.vstack([blade([0, 0, SPACING * 3], [1, 0, 0], 10),
+                      blade([0, 0, SPACING * 9], [-1, 0, 0], 10)])
+
+    inst = instance_by_tips(leaf, stem, CONTACT, min_points=3)
+    assert inst.architecture == "caulescent"
+    assert inst.base is None, "no crown search happens on the stemmed path"
+    assert len(inst.contact_index) > 0
+    from pose_estimator.structure_labels import depth_from_stem, leaf_graph
+    expected = depth_from_stem(leaf, stem, leaf_graph(leaf, 10), CONTACT)[1]
+    assert set(inst.contact_index.tolist()) == set(expected.tolist()), \
+        "depth must start from the stem, not from a derived crown"
+
+
+def test_rosette_trunk_is_a_point_not_a_curve():
+    """A rosette must not emit a stem polyline.
+
+    The trunk tracer returns whatever nodes the leaf paths happen to share,
+    which inside a crown is a few voxels of zigzag -- 3 nodes spanning 4% of
+    the plant on runs/thistle1. Rendered as a tube that is an elbow of pipe no
+    thistle has, so the base collapses to the crown instead.
+    """
+    from pose_estimator.structure_labels import build_from_labels
+
+    centre = np.array([0.0, 0.0, 0.0])
+    directions = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)]
+    points = np.vstack([blade(centre, d, 12) for d in directions])
+    labels = np.zeros(len(points), np.int64)          # every point is leaf
+
+    structure = build_from_labels(points, labels, ["leaf"], voxel=SPACING,
+                                  min_leaf_points=5, min_tip_depth_voxels=2.0,
+                                  architecture="rosette")
+
+    assert len(structure.stem_path) == 1, "a rosette has no centreline to draw"
+    assert np.linalg.norm(structure.stem_path[0] - centre) < SPACING * 4
+    # Blade separation is asserted in test_rosette_finds_a_crown_without_any_stem;
+    # these toy blades are too short for a midrib fit, which num_leaves counts.
+    assert len({int(i) for i in structure.leaf_ids if i >= 0}) == len(directions)
+
+
+def test_rosette_ignores_stem_labels():
+    """--architecture rosette must not seed depth from stem tissue.
+
+    P4c calls a rosette's crown "stem" -- it is thick and not lamina -- so
+    the labels are there and are wrong for this purpose. Told it is a rosette,
+    P5 has to use the crown it locates, not the stem contact ring.
+    """
+    from pose_estimator.structure_labels import instance_by_tips
+
+    centre = np.array([0.0, 0.0, 0.0])
+    directions = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)]
+    leaf = np.vstack([blade(centre, d, 12) for d in directions])
+    stem = centre + SPACING * np.array([[0, 0, 0], [0.5, 0, 0], [0, 0.5, 0], [0, 0, 0.5]])
+
+    inst = instance_by_tips(leaf, stem, CONTACT, min_points=5, architecture="rosette")
+    assert inst.architecture == "rosette"
+    assert inst.base is not None, "a crown must have been located"
+    assert len({int(o) for o in inst.owner if o >= 0}) == len(directions)
+
+
+def test_every_midrib_starts_at_the_crown_and_goes_no_further():
+    """One curve per tip, beginning at the base, with no overshoot.
+
+    A rosette's base is a single crown node, and landing the midrib on it
+    used to be guarded on there being a stem *line* -- so on a thistle every
+    midrib stopped short of the crown. Worse, the path that extends a midrib
+    past its blade can run through the crown and up a neighbour, drawing a
+    curve across a leaf that has no tip of its own. Missing a leaf is
+    acceptable; inventing one over it is not.
+    """
+    from pose_estimator.structure_labels import build_from_labels
+
+    centre = np.array([0.0, 0.0, 0.0])
+    directions = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)]
+    # wide enough that the midrib binning has real shells to average
+    points = np.vstack([blade(centre, d, 40, width=2) for d in directions])
+    labels = np.zeros(len(points), np.int64)
+
+    structure = build_from_labels(points, labels, ["leaf"], voxel=SPACING,
+                                  min_leaf_points=20, min_tip_depth_voxels=2.0,
+                                  architecture="rosette")
+
+    crown = structure.stem_path[0]
+    assert len(structure.stem_path) == 1, "a rosette base is a point"
+    assert structure.axes, "no midribs fitted"
+    assert len(structure.axes) == structure.num_leaves, "one curve per leaf, no more"
+
+    for axis in structure.axes:
+        start = np.linalg.norm(axis[0] - crown)
+        assert start < SPACING * 2, f"midrib starts {start:.3f} from the crown"
+        # The far end must be further from the crown than the near end, and
+        # no interior station may double back through the crown.
+        radial = np.linalg.norm(axis - crown, axis=1)
+        assert radial[-1] > radial[0], "curve runs the wrong way"
+        assert radial[1:].min() >= radial[0] - SPACING, "curve doubles back past the crown"
+
+
+def test_clip_to_base_removes_overshoot_past_the_crown():
+    """A midrib that runs through the crown and up a neighbour is trimmed.
+
+    This is the case the structural test above cannot reach: it needs an
+    instance whose extension path crosses the base, which only happens when
+    two leaves were merged. Tested directly on the polyline instead.
+    """
+    from pose_estimator.structure_labels import clip_to_base
+
+    crown = np.array([0.0, 0.0, 0.0])
+    # starts up a neighbouring leaf, comes down through the crown, then runs
+    # out along its own leaf
+    curve = np.array([[-0.30, 0, 0], [-0.15, 0, 0], [0.02, 0, 0],
+                      [0.20, 0, 0], [0.40, 0, 0]])
+    clipped = clip_to_base(curve, crown)
+
+    assert np.allclose(clipped[0], crown), "must start at the crown"
+    assert len(clipped) == 4, f"overshoot not removed: {clipped}"
+    assert (np.linalg.norm(clipped - crown, axis=1)[1:] >= 0).all()
+    # nothing on the neighbour's side of the crown survives
+    assert (clipped[1:, 0] >= 0).all(), "kept points past the crown"
+
+
+def test_clip_to_base_is_a_no_op_without_a_base():
+    from pose_estimator.structure_labels import clip_to_base
+    curve = np.array([[0.0, 0, 0], [1.0, 0, 0]])
+    assert np.allclose(clip_to_base(curve, None), curve)
+
+
+def test_crown_is_located_even_when_it_is_labelled_stem():
+    """Searching leaf tissue alone looks for the crown in a cloud without one.
+
+    A rosette's crown is thick, so P4c labels it stem and it leaves the leaf
+    set -- which turns four blades meeting at a point into four disconnected
+    strips. The crown search has to include stem tissue.
+    """
+    from pose_estimator.structure_labels import _crown_base, leaf_graph
+
+    centre = np.array([0.0, 0.0, 0.0])
+    directions = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)]
+    gap = SPACING * 5
+    leaf = np.vstack([blade(centre + gap * np.array(d, float), d, 14) for d in directions])
+    step = np.arange(-6, 7) * (SPACING / 2)
+    grid = np.array([[x, y, z] for x in step for y in step for z in step])
+    stem = centre + grid[np.linalg.norm(grid, axis=1) <= SPACING * 5.5]
+
+    base = _crown_base(leaf, stem, leaf_graph(leaf, 10), 10)
+    assert base is not None, "no crown found"
+    assert np.linalg.norm(base.center - centre) < SPACING * 3, \
+        f"crown at {base.center}, expected near the origin"
+    assert len(base.nodes) and (base.nodes < len(leaf)).all(), \
+        "nodes must index the leaf array, which is what depth runs over"
+
+
+def test_every_midrib_actually_touches_the_crown():
+    """Smoothing must not detach a curve from the base it was attached to.
+
+    clip_to_base puts the crown on the front of the curve; fit_smooth_curve
+    then runs, and a smoothing spline does not interpolate its endpoints. On
+    thistle1 that left midribs starting 3.3 to 11.9 voxels from the crown, so
+    the skeleton was not connected.
+    """
+    from pose_estimator.structure_labels import build_from_labels
+
+    centre = np.array([0.0, 0.0, 0.0])
+    directions = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)]
+    points = np.vstack([blade(centre, d, 40, width=2) for d in directions])
+    labels = np.zeros(len(points), np.int64)
+
+    structure = build_from_labels(points, labels, ["leaf"], voxel=SPACING,
+                                  min_leaf_points=20, min_tip_depth_voxels=2.0,
+                                  architecture="rosette")
+    crown = structure.stem_path[0]
+    assert structure.axes
+    for i, axis in enumerate(structure.axes):
+        gap = float(np.linalg.norm(axis[0] - crown))
+        assert gap < 1e-9, f"leaf {i} starts {gap / SPACING:.1f} voxels off the crown"
+
+
+def test_chord_midrib_cannot_loop_or_double_back():
+    """Progress from base to tip is structural, not hoped for.
+
+    Geodesic-shell centroids can sit anywhere when an instance holds tissue
+    from two blades, which is how midribs ended up looping and crossing into
+    neighbours. Projecting onto the chord makes reversal impossible.
+    """
+    from pose_estimator.structure_labels import chord_midrib
+
+    base, tip = np.zeros(3), np.array([1.0, 0.0, 0.0])
+    t = np.linspace(0, 1, 300)
+    blade_pts = np.stack([t, 0.2 * np.sin(np.pi * t), np.zeros_like(t)], 1)
+    # a clump of foreign tissue off to one side, as a merged instance carries
+    stray = np.stack([np.full(80, 0.5), np.full(80, -1.5), np.linspace(-.2, .2, 80)], 1)
+
+    curve = chord_midrib(np.vstack([blade_pts, stray]), base, tip)
+
+    assert np.allclose(curve[0], base) and np.allclose(curve[-1], tip)
+    along = (curve - base) @ np.array([1.0, 0, 0])
+    assert (np.diff(along) > 0).all(), "curve reversed along its own chord"
+    arc = float(np.linalg.norm(np.diff(curve, axis=0), axis=1).sum())
+    assert arc < 2.0 * np.linalg.norm(tip - base), f"curve wanders: arc/chord {arc:.2f}"
+
+
+def test_chord_midrib_follows_a_bowed_leaf():
+    """It must still bend to the tissue, not collapse onto the straight line."""
+    from pose_estimator.structure_labels import chord_midrib
+
+    base, tip = np.zeros(3), np.array([1.0, 0.0, 0.0])
+    t = np.linspace(0, 1, 200)
+    pts = np.stack([t, 0.15 * np.sin(np.pi * t), np.zeros_like(t)], 1)
+    curve = chord_midrib(pts, base, tip)
+    assert 0.10 < np.abs(curve[:, 1]).max() < 0.20, "did not follow the bow"

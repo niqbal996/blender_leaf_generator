@@ -55,9 +55,18 @@ def run(
     sparse_rgb = np.array([p.color for p in reconstruction.points3D.values()])
 
     print(f"Loading views (downsample x{downsample})...")
+    holder_masks = workdir / "p2" / "masks" / "holder"
     views = load_views(reconstruction, workdir / "p1" / "frames", workdir / "p2" / "masks" / "plant",
-                       downsample=downsample)
+                       downsample=downsample,
+                       occluder_dir=holder_masks if holder_masks.is_dir() else None)
     print(f"  {len(views)} views at {views[0].image.shape[1]}x{views[0].image.shape[0]}")
+    if views[0].occluder is None:
+        print("  no holder masks -- anything the tool hides for most of the orbit will be")
+        print("  trained away, the same way it used to be carved away in P4a")
+    else:
+        hidden = float(np.mean([v.occluder.mean() for v in views if v.occluder is not None]))
+        print(f"  holder masks used as occluders: {hidden:.1%} of an average frame carries "
+              "no evidence and is excluded from the silhouette loss")
 
     print(f"Initialising surfels from the hull ({len(hull)} voxels)...")
     params = init_surfels_from_hull(hull, sparse, sparse_rgb, hull_voxel,

@@ -44,11 +44,17 @@ def build_sparse_reconstruction(
     `num_threads`/`max_image_size` default to conservative values -- COLMAP's
     own defaults extract at full resolution with one thread per CPU core,
     which for phone-camera-sized images (4000px+) is enough to OOM-kill the
-    process on a 32GB machine. `use_gpu` needs a CUDA-enabled pycolmap build
-    (e.g. `pip install pycolmap-cuda`, plus `nvidia-cuda-runtime-cu12` and
-    that package's lib/ dir on LD_LIBRARY_PATH if `import pycolmap` raises
-    `libcudart.so.12: cannot open shared object file`); `num_threads` is
-    ignored on the GPU path.
+    process on a 32GB machine.
+
+    `use_gpu` moves SIFT extraction onto the GPU and needs a pycolmap that was
+    *built* with CUDA. The wheels on PyPI are not: `pycolmap.has_cuda` is the
+    authoritative test, and it is False for them, so GPU SIFT means building
+    COLMAP and pycolmap from source with `-DCUDA_ENABLED=ON`. Asking for it
+    without that support fails inside COLMAP's own option validation with
+    `Check failed: extraction_options.Check()`, which names neither the option
+    nor the cause, so it is checked here first. `num_threads` is ignored on
+    the GPU path. Only extraction is affected -- matching and mapping are CPU
+    either way, and on a 96-frame sequence they dominate the runtime.
 
     `single_camera` forces every frame to share one set of intrinsics, and
     defaults to True because it is simply true of these rigs: one locked-off
@@ -73,6 +79,17 @@ def build_sparse_reconstruction(
     reader_options = pycolmap.ImageReaderOptions()
     if mask_dir is not None:
         reader_options.mask_path = str(mask_dir)
+
+    if use_gpu and not getattr(pycolmap, "has_cuda", False):
+        raise RuntimeError(
+            "use_gpu was requested but this pycolmap has no CUDA support "
+            f"(pycolmap {getattr(pycolmap, '__version__', '?')} at {pycolmap.__file__}).\n"
+            "  pycolmap.has_cuda is the authoritative test and it is False for the\n"
+            "  wheels published on PyPI -- GPU SIFT needs a pycolmap built against\n"
+            "  COLMAP with -DCUDA_ENABLED=ON.\n"
+            "  Simplest fix: drop --use-gpu. CPU SIFT is the default, and extraction\n"
+            "  is roughly a quarter of P3 -- matching and mapping stay on the CPU\n"
+            "  regardless, so the GPU path saves less than it sounds like.")
 
     extraction_options = pycolmap.FeatureExtractionOptions()
     extraction_options.num_threads = num_threads

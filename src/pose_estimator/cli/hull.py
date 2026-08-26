@@ -38,6 +38,8 @@ def run(
     resolution: int = 256,
     min_inside_fraction: float = 0.86,
     dilate_px: int = 2,
+    min_judged_views: int = 8,
+    min_judged_fraction: float = 0.5,
 ) -> dict:
     import pycolmap
 
@@ -51,8 +53,18 @@ def run(
 
     print(f"Loading poses from {p3_sparse}...")
     reconstruction = pycolmap.Reconstruction(str(p3_sparse))
-    cameras = load_carve_cameras(reconstruction, plant_masks, dilate_px=dilate_px)
+    holder_masks = workdir / "p2" / "masks" / "holder"
+    occluder_dir = holder_masks if holder_masks.is_dir() else None
+    cameras = load_carve_cameras(reconstruction, plant_masks, dilate_px=dilate_px,
+                                 occluder_dir=occluder_dir)
     print(f"  {len(cameras)} views with silhouettes (masks dilated {dilate_px}px)")
+    if occluder_dir is None:
+        print("  no holder masks -- carving without occlusion handling; anything the")
+        print("  tool hides for most of the orbit will be carved away")
+    else:
+        hidden = np.mean([c.occluder.mean() for c in cameras if c.occluder is not None])
+        print(f"  holder masks used as occluders: {hidden:.1%} of an average frame is "
+              "hidden and does not vote")
     if len(cameras) < 8:
         raise RuntimeError(f"Only {len(cameras)} usable views -- carving needs many more than that")
 
@@ -67,6 +79,8 @@ def run(
         bounds_max,
         resolution=resolution,
         min_inside_fraction=min_inside_fraction,
+        min_judged_views=min_judged_views,
+        min_judged_fraction=min_judged_fraction,
     )
     extent = points.max(axis=0) - points.min(axis=0)
     print(f"  {len(points)} occupied voxels, voxel size {voxel:.5f}, extent {np.round(extent, 3).tolist()}")
@@ -93,6 +107,13 @@ def run(
             "num_views": len(cameras),
             "min_inside_fraction": min_inside_fraction,
             "mask_dilation_px": dilate_px,
+            # Recorded so a hull on disk says which carve produced it. These
+            # two are what separates the root from the solid block the pliers
+            # would otherwise leave in their own shadow, and a run predating
+            # them is otherwise indistinguishable from a current one.
+            "min_judged_views": min_judged_views,
+            "min_judged_fraction": min_judged_fraction,
+            "occlusion_aware": occluder_dir is not None,
             "extent": extent.tolist(),
         }
     )

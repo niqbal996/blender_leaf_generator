@@ -4,10 +4,27 @@
 
 Opens the first frame of each capture pass -- the frame SAM2 is actually
 seeded on. Click the plant, press 2 and click the holder, press n for the
-next pass, press s to save. Writes <workdir>/p2/prompts_clicked.json, which
+next pass, press s to save.
+
+Two classes only, plant and holder, because that is all P2 decides. The root
+is *part of the plant*: click it with [1], not with a class of its own. It
+does need its own click -- the holder usually sits between foliage and root,
+leaving the root a disconnected blob that SAM2 will not reach from a leaf
+point. Which parts of the plant are leaf, stem or root is a separate question
+that pose-pick-seeds answers at P4c. Writes <workdir>/p2/prompts_clicked.json, which
 pose-segment picks up automatically:
 
     pose-segment --workdir runs/plant_9/ --reuse-frames
+
+It also writes <workdir>/p2/prompt_bank.npz, and that one is for the *next*
+video. The clicked coordinates only mean something in this capture; the bank
+stores what the plant and the holder look like, so a later specimen shot at a
+slightly different pose can be searched for whatever most resembles them:
+
+    pose-segment --workdir runs/plant_10/ --prompt-bank runs/plant_9/p2/prompt_bank.npz
+
+Click a few passes' worth into one bank and it covers a batch. Building it
+needs the DINO weights (--dino-model, --hf-token); --no-bank skips it.
 
 Faint grey crosses show where the colour heuristic *would* have seeded. When
 those are sitting on the holder, that is the run you are here to fix.
@@ -28,8 +45,11 @@ Coordinates are full-frame pixels (1920x1080 here), NOT the cropped frame.
 """
 
 import argparse
+import os
 from pathlib import Path
 from typing import Optional
+
+import numpy as np
 
 from pose_estimator.prompt_picker import capture_passes, frames_per_pass, pick, save_prompts
 from pose_estimator.seed_picker import display_available
@@ -40,6 +60,12 @@ def run(
     out: Optional[Path] = None,
     max_display: int = 1400,
     show_auto: bool = True,
+    bank: bool = True,
+    bank_out: Optional[Path] = None,
+    dino_model: str = "facebook/dinov3-vitb16-pretrain-lvd1689m",
+    dino_size: int = 896,
+    device: str = "cuda",
+    hf_token: Optional[str] = None,
 ) -> Optional[Path]:
     passes = capture_passes(workdir)
 
@@ -59,7 +85,16 @@ def run(
     print("  the holder, that is the bug you are fixing.")
     print("  Every pass needs at least one plant point; the holder is optional -- but")
     print("  click the JAWS where they grip the stem, not the far end of the handle:")
-    print("  the tracking crop is sized to the plant, and a point outside it is dropped.\n")
+    print("  the tracking crop is sized to the plant, and a point outside it is dropped.")
+    print("  For the reusable bank, place THREE OR MORE plant points per pass, on")
+    print("  different parts of the plant. One example transfers to a new video badly")
+    print("  (1 frame in 12 in a measured test); three per frame got 11 in 12.")
+    print("  ROOTS: there is no root class here and there should not be -- the root is")
+    print("  part of the plant, so click it with [1] plant. It needs its OWN point:")
+    print("  the jaws sit between foliage and root, so the root is a separate blob and")
+    print("  SAM2 cannot grow into it from a leaf. Without a click there the root is")
+    print("  absent from the mask, the hull, the cloud, and every phase after.")
+    print("  leaf/stem/root is a different question, answered later by pose-pick-seeds.\n")
 
     session = pick(passes, max_display=max_display, show_auto=show_auto,
                    pass_frames=frames_per_pass(workdir))
@@ -78,8 +113,66 @@ def run(
         if not counts["holder"]:
             print("      no holder point -- P2 will not track the holder separately for this pass,"
                   " so it cannot subtract it from the plant mask")
+    if bank:
+        _write_bank(workdir, session, bank_out, dino_model, dino_size, device, hf_token)
     print(f"\n  next:  pose-segment --workdir {workdir} --reuse-frames")
     return out
+
+
+def _write_bank(workdir, session, bank_out, dino_model, dino_size, device, hf_token):
+    """Store the clicks as feature vectors, which is what makes them portable.
+
+    Same trick P4c uses for organ classes. The pixel coordinates already saved
+    describe this video only; a vector describes what a plier looks like, so
+    the next capture can be searched for the patch that most resembles it
+    however the rig was posed.
+    """
+    import cv2
+
+    from pose_estimator.dino import DinoBackbone
+    from pose_estimator.prompt_seeds import build_prompt_bank, locate_prompts, save_prompt_bank
+
+    try:
+        backbone = DinoBackbone(dino_model, device=device, size=dino_size, token=hf_token)
+    except (Exception, SystemExit) as exc:
+        # SystemExit and not just Exception: DinoBackbone raises SystemExit for
+        # a gated repo, and the clicked coordinates are already saved by now --
+        # losing the bank must not look like losing the clicks.
+        print(f"\n  no reusable prompt bank written: {exc}")
+        print("  The clicked coordinates above are saved and this video will segment fine.")
+        print("  Re-run with --dino-model facebook/dinov2-base (ungated) to get a bank.")
+        return None
+
+    vectors, labels = [], []
+    for spec in session.passes:
+        bgr = cv2.imread(str(spec.path))
+        clicks = [(name, x, y)
+                  for name, points in session.points[spec.index].items()
+                  for (x, y) in points]
+        if not clicks:
+            continue
+        v, l = build_prompt_bank(backbone, bgr, clicks)
+        vectors.append(v)
+        labels.extend(l)
+    if not labels:
+        return None
+
+    vectors = np.concatenate(vectors, axis=1)
+    bank_out = bank_out or (workdir / "p2" / "prompt_bank.npz")
+    save_prompt_bank(bank_out, vectors, labels, dino_model, dino_size)
+    print(f"\n  reusable prompt bank -> {bank_out}")
+    for name in dict.fromkeys(labels):
+        print(f"    {name}: {sum(1 for l in labels if l == name)} example(s)")
+
+    # Where it would place the prompts on the last pass's first frame. Only a
+    # sanity check, but it costs one forward pass and catches a bank built
+    # from clicks that all landed on background.
+    located = locate_prompts(backbone, cv2.imread(str(session.passes[-1].path)), vectors, labels)
+    print("    self-check on " + session.passes[-1].frame + ": "
+          + ", ".join(f"{k} at {v}" for k, v in located.items() if v))
+    print(f"  use it on the next specimen:  "
+          f"pose-segment --workdir <new> --prompt-bank {bank_out}")
+    return bank_out
 
 
 def main(argv: Optional[list] = None) -> None:
@@ -93,10 +186,23 @@ def main(argv: Optional[list] = None) -> None:
                              "full-frame coordinates automatically")
     parser.add_argument("--no-auto", action="store_true",
                         help="Do not draw the colour heuristic's own seed points")
+    parser.add_argument("--no-bank", action="store_true",
+                        help="Skip the reusable prompt bank (needs the DINO weights). "
+                             "The clicked coordinates are still written.")
+    parser.add_argument("--bank-out", type=Path, help="default <workdir>/p2/prompt_bank.npz")
+    parser.add_argument("--dino-model", default="facebook/dinov3-vitb16-pretrain-lvd1689m",
+                        help="Backbone the bank is built with. --prompt-bank later must "
+                             "use the same one; the vectors mean nothing across models.")
+    parser.add_argument("--dino-size", type=int, default=896)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"),
+                        help="DINOv3 is gated on HuggingFace; or export HF_TOKEN")
     args = parser.parse_args(argv)
 
     run(workdir=args.workdir, out=args.out, max_display=args.max_display,
-        show_auto=not args.no_auto)
+        show_auto=not args.no_auto, bank=not args.no_bank, bank_out=args.bank_out,
+        dino_model=args.dino_model, dino_size=args.dino_size, device=args.device,
+        hf_token=args.hf_token)
 
 
 if __name__ == "__main__":

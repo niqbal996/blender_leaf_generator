@@ -76,8 +76,19 @@ def run_qc(
     max_holder_contamination: float = 0.02,
     max_centroid_jump_fraction: float = 0.08,
     sources: Optional[dict] = None,
+    min_root_fraction: float = 0.05,
+    min_root_frame_fraction: float = 0.86,
 ) -> dict:
     """Score a finished P2 run. Returns a report dict (also written as qc.json).
+
+    `min_root_frame_fraction` defaults to P4a's `min_inside_fraction` on
+    purpose. Carving keeps a voxel that is in-silhouette in 86% of the views
+    that judged it, so tissue present in fewer than 86% of a pass's masks
+    cannot survive the carve however good the rest of the run is. Tying the
+    two together makes this check predictive of P4a rather than a second
+    opinion about it: thistle1 tracked its root in 77% and 51% of its two
+    passes, passed every check P2 had at the time, and reached P4c with 4
+    root points out of 58,875.
 
     `sources` maps frame stem -> capture pass. Both continuity checks compare
     consecutive frames, and consecutive frames from *different* passes are not
@@ -96,6 +107,7 @@ def run_qc(
     empty_frames: List[str] = []
     full_frames: List[str] = []
     overlap_fractions: List[float] = []
+    below_jaw_fractions: List[float] = []
     kept_paths: List[Path] = []
 
     for path in frame_paths:
@@ -110,6 +122,19 @@ def run_qc(
         area = int(plant_b.sum())
         plant_areas.append(area)
         holder_areas.append(int(holder_b.sum()))
+
+        # How much of the plant mask lies below the jaws. The tool grips at
+        # the crown, so this is the exposed root and nothing else. SAM2
+        # propagates from a seed point and the jaws cut the root off from the
+        # foliage, so a run seeded only on leaves tracks a plant that stops at
+        # the clamp -- silently, because every other check here is happy with
+        # a mask that is merely smaller.
+        if area and holder_b.any():
+            jaw_row = float(np.nonzero(holder_b)[0].mean())
+            rows = np.arange(plant_b.shape[0])[:, None]
+            below_jaw_fractions.append(float((plant_b & (rows > jaw_row)).sum() / area))
+        else:
+            below_jaw_fractions.append(float("nan"))
 
         total_px = plant_b.size
         if area == 0:
@@ -160,6 +185,25 @@ def run_qc(
 
     max_contamination = float(np.max(contaminations)) if contaminations else 0.0
 
+    # Per pass, not pooled: one pass that tracked the root hides one that did
+    # not, and they are seeded independently so they fail independently.
+    root_per_pass: dict = {}
+    for path, fraction in zip(kept_paths, below_jaw_fractions):
+        root_per_pass.setdefault(str(sources.get(path.stem, 0)), []).append(fraction)
+    root_summary = {}
+    for pass_id, values in sorted(root_per_pass.items()):
+        arr = np.array(values, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if not len(arr):
+            continue
+        root_summary[pass_id] = {
+            "median_fraction_below_jaws": float(np.median(arr)),
+            "frames_with_root": int((arr >= min_root_fraction).sum()),
+            "num_frames": int(len(arr)),
+        }
+    starved = [p for p, s in root_summary.items()
+               if s["frames_with_root"] < min_root_frame_fraction * s["num_frames"]]
+
     checks = {
         "no_empty_masks": {"pass": not empty_frames, "detail": f"{len(empty_frames)} empty frame(s)"},
         "no_full_frame_masks": {"pass": not full_frames, "detail": f"{len(full_frames)} saturated frame(s)"},
@@ -182,6 +226,23 @@ def run_qc(
             "detail": f"max plant/holder overlap {np.max(overlap_fractions):.2%} of plant area"
             if overlap_fractions else "no holder mask",
         },
+        # The root has to be in the mask in most frames of a pass, not merely
+        # in some of them: P4a needs a voxel in-silhouette in ~86% of the
+        # views that judged it, so tissue tracked intermittently is carved
+        # away and cannot be recovered by any later phase.
+        "root_tracked_below_the_jaws": {
+            "pass": not starved,
+            "detail": (
+                "; ".join(
+                    f"pass {p}: root in {s['frames_with_root']}/{s['num_frames']} frames "
+                    f"(median {s['median_fraction_below_jaws']:.1%} of mask below the jaws)"
+                    for p, s in sorted(root_summary.items()))
+                + (f" -- pass(es) {', '.join(starved)} lost the root. SAM2 was seeded on "
+                   f"foliage only; the jaws cut the root into a separate blob that needs "
+                   f"its own prompt (pose-pick-prompts, click the root with 1=plant)."
+                   if starved else "")
+            ) if root_summary else "no holder mask -- cannot locate the jaws",
+        },
     }
 
     report = {
@@ -200,6 +261,7 @@ def run_qc(
             "mean": float(np.mean(contaminations)) if contaminations else 0.0,
         },
         "worst_centroid_jump_fraction": worst_centroid_jump,
+        "root_below_jaws_per_pass": root_summary,
         "checks": checks,
         "all_passed": all(c["pass"] for c in checks.values()),
     }

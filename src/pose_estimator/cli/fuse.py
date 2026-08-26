@@ -138,7 +138,8 @@ def run(
 
     result = finalise_votes(tally)
     report = _write_outputs(p4c, points, result, class_order,
-                            voxel * instance_radius_voxels, normals is not None)
+                            voxel * instance_radius_voxels, normals is not None,
+                            manifest.get("pixels_per_class"))
     report["views_fused"] = used
     report["backend"] = manifest["backend"]
 
@@ -163,12 +164,48 @@ def run(
     return report
 
 
+def _survival_check(class_order, counts, num_points, pixels_per_class,
+                    min_2d_share: float = 0.01, min_ratio: float = 0.10) -> dict:
+    """Did each class the 2D classifier saw survive into the 3D cloud?
+
+    `min_2d_share` is the share of classified pixels below which a class is
+    too rare in 2D for its 3D share to mean anything. `min_ratio` is how far
+    a class's 3D share may fall below its 2D share before that counts as
+    tissue that was labelled but never reconstructed -- an order of magnitude,
+    which is well clear of the honest reasons the two differ (a class seen
+    edge-on occupies fewer pixels per point than one seen face-on).
+    """
+    if not pixels_per_class:
+        return {"pass": True, "detail": "no 2D pixel counts recorded -- nothing to compare against"}
+    total_px = sum(pixels_per_class.get(n, 0) for n in class_order)
+    if total_px <= 0 or num_points <= 0:
+        return {"pass": True, "detail": "no classified pixels -- nothing to compare against"}
+
+    lost, parts = [], []
+    for name in class_order:
+        share_2d = pixels_per_class.get(name, 0) / total_px
+        share_3d = counts[name] / num_points
+        parts.append(f"{name} 2D {share_2d:.1%} -> 3D {share_3d:.1%}")
+        if share_2d >= min_2d_share and share_3d < min_ratio * share_2d:
+            lost.append(name)
+
+    if lost:
+        return {
+            "pass": False,
+            "detail": f"{', '.join(lost)} segmented in 2D but essentially absent in 3D "
+                      f"({'; '.join(parts)}). The tissue was never reconstructed, so no "
+                      f"amount of relabelling can recover it -- look at P2 masks and the "
+                      f"P4a carve, not at the seeds.",
+        }
+    return {"pass": True, "detail": "; ".join(parts)}
+
+
 def _class_color(name: str, index: int):
     return CLASS_COLORS.get(name, SPARE[index % len(SPARE)])
 
 
 def _write_outputs(p4c: Path, points, result, class_order, instance_radius,
-                   normal_weighted: bool) -> dict:
+                   normal_weighted: bool, pixels_per_class: Optional[dict] = None) -> dict:
     labels = result.labels
     counts = {name: int((labels == i).sum()) for i, name in enumerate(class_order)}
     counts["unlabeled"] = int((labels < 0).sum())
@@ -225,6 +262,17 @@ def _write_outputs(p4c: Path, points, result, class_order, instance_radius,
             "pass": all(counts[n] > 0 for n in class_order),
             "detail": ", ".join(f"{n} {counts[n]}" for n in class_order),
         },
+        # A class the 2D classifier found in quantity must arrive in 3D in
+        # roughly comparable proportion. "Present" is not enough: on thistle1
+        # the root was 6.8% of all classified pixels and reached 4 points of
+        # 58,875 (0.007%), which `all_classes_present` waved through because
+        # 4 > 0. That is not a labelling error -- it means the tissue was
+        # segmented in every frame and never reconstructed, so the label had
+        # no geometry to land on. The comparison is against this specimen's
+        # own 2D evidence rather than an absolute count, so it needs no
+        # per-plant tuning and stays meaningful whatever the class vocabulary.
+        "classes_survived_into_3d": _survival_check(
+            class_order, counts, len(points), pixels_per_class),
         "leaf_instances_found": {
             "pass": num_instances >= 2,
             "detail": f"{num_instances} leaf instance(s) by 3D connectivity "

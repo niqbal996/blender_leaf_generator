@@ -62,10 +62,14 @@ class Instancing:
     owner: np.ndarray                  # (N,) instance id per leaf point, -1 = unassigned
     distance_from_tip: np.ndarray      # (N,) geodesic distance to the winning tip
     dropped: List[int] = field(default_factory=list)   # groups cut by min_points
+    base: object = None                # BaseRegion, whenever the geometry was consulted
+    architecture: str = "caulescent"   # what the depth field was actually started from
 
     def to_dict(self) -> dict:
         finite = np.isfinite(self.depth)
         return {
+            "architecture": self.architecture,
+            "base": self.base.to_dict() if self.base is not None else None,
             "leaf_points": int(len(self.depth)),
             "reachable_from_stem": int(finite.sum()),
             "contact_points": int(len(self.contact_index)),
@@ -382,8 +386,16 @@ def instance_by_tips(
     min_points: int = 150,
     min_tip_depth: float = 0.0,
     min_persistence_ratio: float = 0.5,
+    architecture: str = "caulescent",
 ) -> Instancing:
-    """Split leaf tissue into leaves, keeping every intermediate."""
+    """Split leaf tissue into leaves, keeping every intermediate.
+
+    `architecture` decides where the depth field starts, and is told rather
+    than inferred. "caulescent" seeds from stem tissue, as always. "rosette"
+    ignores stem labels and locates the crown geometrically -- a thistle or a
+    sugar beet has no stem to seed from, and the old behaviour there was 0
+    contact points, 0 tips, 0 leaves.
+    """
     n = len(leaf_points)
     if n == 0:
         empty = np.zeros(0)
@@ -393,7 +405,24 @@ def instance_by_tips(
                           owner=np.zeros(0, np.int64), distance_from_tip=empty)
 
     graph = leaf_graph(leaf_points, k_neighbors)
-    depth, contact = depth_from_stem(leaf_points, stem_points, graph, contact_radius)
+
+    # Which architecture this is comes from --architecture, not from a guess.
+    # It is known when the capture is made, and an earlier version that
+    # inferred it flipped thistle1's verdict purely because P4c had started
+    # labelling the crown "stem".
+    base = None
+    if architecture == "rosette":
+        base = _crown_base(leaf_points, stem_points, graph, k_neighbors)
+        if base is None or not len(base.nodes):
+            raise ValueError(
+                "--architecture rosette, but no crown could be located: the leaf tissue "
+                "has fewer than two geodesic extremities, so there are no paths to "
+                "intersect. Check p4c/labels_vis.ply -- this usually means the labels "
+                "are wrong rather than the plant is.")
+        contact = base.nodes
+        depth = dijkstra(graph, directed=False, indices=contact, min_only=True)
+    else:
+        depth, contact = depth_from_stem(leaf_points, stem_points, graph, contact_radius)
 
     records = tip_persistence(graph, depth)
     candidates, tips = select_tips(records, min_tip_depth, min_persistence_ratio)
@@ -415,6 +444,8 @@ def instance_by_tips(
     persistence = np.array([[idx, peak, saddle] for idx, peak, saddle in records], float)
 
     return Instancing(
+        base=base,
+        architecture=architecture,
         depth=depth,
         contact_index=contact,
         candidate_tips=candidates,
@@ -627,6 +658,133 @@ def distance_to_polyline(points: np.ndarray, polyline: np.ndarray) -> np.ndarray
     return cKDTree(polyline).query(points)[0]
 
 
+def _crown_base(leaf_points, stem_points, graph, k_neighbors):
+    """Locate a rosette's crown, searching leaf AND stem tissue.
+
+    Stem tissue has to be included. A rosette's crown is exactly what P4c
+    labels "stem" -- it is thick and not lamina -- so searching leaf tissue
+    alone looks for the one place the blades meet in a cloud where that place
+    has been removed, leaving four disconnected strips.
+
+    Nodes come back indexed into `leaf_points`, since that is what the depth
+    field runs over.
+    """
+    from pose_estimator.plant_base import BaseRegion, find_base
+
+    if len(stem_points) == 0:
+        return find_base(leaf_points, graph)
+
+    shoot = np.vstack([leaf_points, stem_points])
+    base = find_base(shoot, leaf_graph(shoot, k_neighbors))
+    if base is None:
+        return None
+
+    nodes = base.nodes[base.nodes < len(leaf_points)]
+    if not len(nodes):
+        # The crown is entirely stem-labelled -- which is the normal case, the
+        # crown being the thick part -- so seed from the leaf tissue nearest
+        # to it: the inner ends of the blades. Measured from the closest leaf
+        # point rather than from the crown centre, because the blades start
+        # wherever the crown stops and that distance is not known in advance.
+        distance = np.linalg.norm(leaf_points - base.center, axis=1)
+        radius = base.evidence["ball_fraction"] * base.evidence["plant_extent"]
+        nodes = np.nonzero(distance <= distance.min() + radius)[0]
+    if not len(nodes):
+        return None
+    return BaseRegion(nodes=nodes, center=base.center,
+                      extremities=base.extremities, evidence=base.evidence)
+
+
+def chord_midrib(points: np.ndarray, base: np.ndarray, tip: np.ndarray,
+                 num_stations: int = 14, degree: int = 3,
+                 min_bin: int = 3) -> np.ndarray:
+    """A midrib built as a bend applied to the straight base-to-tip line.
+
+    The previous construction chained centroids of geodesic shells. On a
+    merged or cupped instance those centroids can sit anywhere -- shells far
+    from the tip contain tissue from two different blades, so their centroid
+    lands between them -- and the resulting polyline loops, doubles back, or
+    crosses a neighbouring leaf. Nothing in it forces progress from base to
+    tip.
+
+    Here the chord *is* the parameter. Every point is projected onto it, so
+    stations advance from base to tip by construction and cannot reverse. The
+    only freedom is lateral: two offset functions of t, each forced to vanish
+    at both ends, so the curve begins exactly at the base and ends exactly at
+    the tip whatever the data does. Fitting them as low-order polynomials
+    caps how much the curve can wriggle -- a leaf midrib is a gentle arc, and
+    a cubic cannot tie a knot.
+
+    Returns a polyline from `base` to `tip`.
+    """
+    base = np.asarray(base, float).reshape(3)
+    tip = np.asarray(tip, float).reshape(3)
+    axis = tip - base
+    length = float(np.linalg.norm(axis))
+    if length < 1e-12 or len(points) == 0:
+        return np.vstack([base, tip])
+    u = axis / length
+
+    # two directions across the chord, so lateral offset has two components
+    helper = np.array([0.0, 0.0, 1.0])
+    if abs(u @ helper) > 0.9:
+        helper = np.array([1.0, 0.0, 0.0])
+    e1 = np.cross(u, helper); e1 /= np.linalg.norm(e1)
+    e2 = np.cross(u, e1)
+
+    rel = points - base
+    t = (rel @ u) / length
+    inside = (t >= 0.0) & (t <= 1.0)
+    if inside.sum() < min_bin:
+        return np.vstack([base, tip])
+    t, rel = t[inside], rel[inside]
+
+    edges = np.linspace(0.0, 1.0, num_stations + 1)
+    ts, o1, o2 = [], [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = (t >= a) & (t < b) if b < 1.0 else (t >= a) & (t <= b)
+        if m.sum() < min_bin:
+            continue
+        ts.append(float(t[m].mean()))
+        ts_rel = rel[m].mean(axis=0)
+        o1.append(float(ts_rel @ e1))
+        o2.append(float(ts_rel @ e2))
+    if len(ts) < 2:
+        return np.vstack([base, tip])
+
+    # basis t^k (1 - t): every term is zero at t=0 and t=1, so the endpoints
+    # are exact rather than fitted.
+    ts = np.asarray(ts)
+    design = np.stack([ts ** k * (1.0 - ts) for k in range(1, degree + 1)], axis=1)
+    c1, *_ = np.linalg.lstsq(design, np.asarray(o1), rcond=None)
+    c2, *_ = np.linalg.lstsq(design, np.asarray(o2), rcond=None)
+
+    grid = np.linspace(0.0, 1.0, 40)
+    basis = np.stack([grid ** k * (1.0 - grid) for k in range(1, degree + 1)], axis=1)
+    return (base + np.outer(grid * length, u)
+            + np.outer(basis @ c1, e1) + np.outer(basis @ c2, e2))
+
+
+def clip_to_base(curve: np.ndarray, base_point: Optional[np.ndarray]) -> np.ndarray:
+    """Trim a midrib so it starts at the base and runs nowhere past it.
+
+    A midrib is extended past its blade along the shortest path back to the
+    trunk, and that path can carry on through the base and up a neighbouring
+    leaf -- which draws a curve across a leaf that has no tip of its own.
+    Missing a leaf is acceptable; inventing one over it is not.
+
+    The curve runs base -> tip, so its closest approach to the base is where
+    it should begin and everything before that is overshoot. The base point
+    is then prepended: the path descends the *surface* of the stem or crown,
+    so it stops one radius short of the axis that insertion angle is measured
+    against.
+    """
+    if base_point is None or not len(curve):
+        return curve
+    cut = int(np.argmin(np.linalg.norm(curve - base_point, axis=1)))
+    return np.vstack([np.asarray(base_point, float).reshape(1, 3), curve[cut:]])
+
+
 def _tips_furthest_from_stem(
     leaf_points: np.ndarray, owner: np.ndarray, stem_path: np.ndarray,
 ) -> Dict[int, int]:
@@ -711,8 +869,15 @@ def build_from_labels(
     min_tip_depth_voxels: float = 8.0,
     min_persistence_ratio: float = 0.5,
     k_neighbors: int = 10,
+    architecture: str = "caulescent",
 ) -> LabelledStructure:
-    """Full structure from a labelled cloud, in the plant frame."""
+    """Full structure from a labelled cloud, in the plant frame.
+
+    `architecture` is passed through to the instancing: see `instance_by_tips`.
+    A rosette reaches this function with no stem tissue and no root tissue --
+    its roots are below the clamp and outside the P2 plant mask -- so the
+    anchor for the shoot tree comes from the derived crown instead.
+    """
     leaf_ids_in_order = [i for i, n in enumerate(class_order) if "leaf" in n]
     stem_ids = [i for i, n in enumerate(class_order) if n in ("stem", "petiole", "branch")]
     root_ids = [i for i, n in enumerate(class_order) if n == "root"]
@@ -728,6 +893,7 @@ def build_from_labels(
         min_points=min_leaf_points,
         min_tip_depth=voxel * min_tip_depth_voxels,
         min_persistence_ratio=min_persistence_ratio,
+        architecture=architecture,
     )
 
     # --- the shoot as one tree, so a midrib can run past the blade to the stem ---
@@ -741,6 +907,10 @@ def build_from_labels(
     # place the stem is certain to pass through -- a far better anchor than
     # "lowest point", which is whatever hangs down furthest.
     anchor = root_anchor(root_points, shoot)
+    if anchor is None and instancing.base is not None:
+        # No root and no stem: a rosette. The crown is where the leaves meet,
+        # which is the same thing the root junction gives on a stemmed plant.
+        anchor = shoot[int(cKDTree(shoot).query(instancing.base.center)[1])]
     graph, base_distance, predecessor = shoot_paths(
         shoot, base_radius=voxel * 8.0, k_neighbors=k_neighbors, anchor=anchor)
 
@@ -750,6 +920,15 @@ def build_from_labels(
         smooth_tolerance=voxel * 1.5)
     if len(stem_path) < 2 and len(stem_points):
         stem_path = fit_stem_path(stem_points)
+
+    # A rosette's trunk is a point, not a curve. Left alone, the trunk tracer
+    # returns whatever few nodes the paths happened to share inside the crown
+    # -- on runs/thistle1 a 3-node zigzag spanning 4% of the plant, which is
+    # noise, and drawn as a tube in Blender it reads as an elbow of pipe that
+    # no thistle has.
+    rosette = architecture == "rosette"
+    if rosette and instancing.base is not None:
+        stem_path = np.asarray(instancing.base.center, float).reshape(1, 3)
 
     # Persistence says how many leaves there are, and does that well. Where the
     # tip *is* is a different question, and geodesic depth answers it badly: on
@@ -761,7 +940,7 @@ def build_from_labels(
     #
     # A leaf's tip is simply the part of it that gets furthest from the stem,
     # so once the trunk is known each instance re-picks its own tip that way.
-    if len(stem_path) > 1 and (instancing.owner >= 0).any():
+    if len(stem_path) >= 1 and (instancing.owner >= 0).any():
         refined = _tips_furthest_from_stem(leaf_points, instancing.owner, stem_path)
         if refined:
             instancing.accepted_tips = np.array(
@@ -771,9 +950,11 @@ def build_from_labels(
                           for t in instancing.accepted_tips]
             # Re-solve the topology from the corrected tips, so each leaf's
             # path down to its fork starts from the right end of the leaf.
-            stem_path, attach_nodes, paths = trunk_and_attachments(
+            new_path, attach_nodes, paths = trunk_and_attachments(
                 shoot, predecessor, base_distance, shoot_tips, merge_radius=voxel * 4.0,
                 smooth_tolerance=voxel * 1.5)
+            if not rosette:
+                stem_path = new_path
 
     # Carry the stem down to where the root begins, so the two organs meet
     # instead of stopping a gap apart.
@@ -815,21 +996,41 @@ def build_from_labels(
         extension = [shoot[n] for n in path[:stop] if n not in own]
         curve = np.array(list(reversed(extension)) + list(blade)) if extension else blade
 
-        # Land the last node on the stem line itself. The path descends the
-        # *surface* of the stem, so it stops one stem-radius short of the axis
-        # -- correct anatomically, but it leaves every midrib hanging beside
-        # the centreline rather than meeting it, and the insertion angle is
-        # measured against that centreline.
-        if len(stem_path) > 1:
-            nearest = stem_path[int(np.argmin(np.linalg.norm(stem_path - curve[0], axis=1)))]
-            curve = np.vstack([nearest, curve])
+        # End at the base, and nowhere past it. A rosette's base is a single
+        # crown node, and this step used to be guarded on there being a stem
+        # *line*, so on a thistle no midrib ever met the crown.
+        if len(stem_path) == 1:
+            base_point = stem_path[0]
+        elif len(stem_path) > 1:
+            base_point = stem_path[int(np.argmin(np.linalg.norm(stem_path - curve[0], axis=1)))]
+        else:
+            base_point = None
+        curve = clip_to_base(curve, base_point)
 
         # Same rule for the midrib: its stations are shell centroids, so they
         # wander by about the blade's own half-thickness, and the sharpest
         # kink sits where the blade centroids meet the raw petiole path.
+        # Rebuild the curve as a bend on the base-to-tip chord. The station
+        # chain above finds the right *ends*; what it cannot guarantee is that
+        # everything between them advances, and on a merged instance it does
+        # not. Projecting onto the chord makes progress structural.
+        if base_point is not None and len(curve) > 1:
+            chorded = chord_midrib(leaf_points[member], base_point, curve[-1])
+            if len(chorded) > 1:
+                curve = chorded
+
         if len(curve) > 3:
             thickness = float(np.median(cKDTree(leaf_points[member]).query(curve)[0]))
             curve = fit_smooth_curve(curve, tolerance=max(2.0 * thickness, voxel))
+
+        # Re-attach after smoothing. `clip_to_base` put the base on the front,
+        # but a smoothing spline does not interpolate its endpoints, so it
+        # then pulled the curve off again -- measured on thistle1, midribs
+        # starting 3.3 to 11.9 voxels away from a crown they were supposed to
+        # begin at. Every tip has to reach the base or the skeleton is not
+        # connected.
+        if base_point is not None and len(curve):
+            curve = np.vstack([np.asarray(base_point, float).reshape(1, 3), curve[1:]])
         axes.append(curve)
         tips.append(tip)
         attachments.append(shoot[attach_nodes[instance]])

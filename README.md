@@ -232,7 +232,13 @@ disk, so any one can be re-run or swapped without touching the others.
 | P5 | `pose-structure` | stem centreline + leaf instances | `p5/` |
 | P6 | `pose-leaf` | per-leaf midrib, frame, curvature, width | `p6/` |
 
-`run_pipeline.sh` drives P1 through P4c in one call. P5 and P6 are run by hand.
+`run_pipeline.sh` drives the phases; `--stop-after` and `--skip-to` are how
+you stop for the two things that need a human, which are picking the P2
+plant/holder prompts and picking the P4c organ seeds.
+
+### Install the pose pipeline
+
+The env this needs is heavier than the leaf-generator one above:
 
 ```bash
 conda create -n pose_estimator python=3.11 -y && conda activate pose_estimator
@@ -247,23 +253,493 @@ mkdir -p checkpoints && wget -P checkpoints \
   https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
 ```
 
+DINOv3 is gated on HuggingFace: accept the licence at
+[facebook/dinov3-vitb16-pretrain-lvd1689m](https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m),
+then `export HF_TOKEN=hf_xxx`. Without a token use
+`--dino-model facebook/dinov2-base`, which is ungated and behaves similarly.
+
+### GPU use, and why P3 is the exception
+
+Most of the pipeline is on the GPU already and needs no flag: P4b trains
+surfels with gsplat, and P4c runs DINOv3 or SAM2 with `--device cuda`
+(default). P2's SAM2 propagation is on the GPU too.
+
+**P3 is the exception.** COLMAP's SIFT extraction runs on the CPU unless
+pycolmap was *built* against CUDA, and the wheels published on PyPI are not.
+There is one authoritative test, and it is not `nvidia-smi` or whether torch
+sees your GPU:
+
 ```bash
-pose-segment  --video /path/DSC_0009.MOV --workdir runs/plant_9/
-pose-solve    --workdir runs/plant_9/
-pose-hull     --workdir runs/plant_9/ --resolution 256
-pose-surface  --workdir runs/plant_9/ --iterations 5000
-
-# P4c, as two stages. Click the seeds rather than typing coordinates:
-pose-pick-seeds --workdir runs/plant_9/
-pose-classify   --workdir runs/plant_9/ --seeds-file runs/plant_9/p4c/seeds.json
-pose-fuse       --workdir runs/plant_9/
-
-pose-structure --workdir runs/plant_9/
-pose-leaf      --workdir runs/plant_9/
-
-# rotate the result to check the tips are where leaves actually end
-pose-view-structure --workdir runs/plant_9/
+python -c "import pycolmap; print(pycolmap.__version__, pycolmap.has_cuda)"
 ```
+
+- `True` -- you have a CUDA build; pass `--use-gpu` to move SIFT extraction
+  onto it.
+- `False` -- `--use-gpu` will not work. Getting it means building COLMAP and
+  pycolmap from source with `-DCUDA_ENABLED=ON`; there is no wheel to install.
+
+```bash
+./run_pipeline.sh --workdir runs/thistle1 --skip-to p3 --use-gpu   # via the driver
+pose-solve --workdir runs/thistle1 --use-gpu                       # or the phase alone
+```
+
+Asking for `--use-gpu` without CUDA support used to fail deep inside COLMAP's
+own option validation with `Check failed: extraction_options.Check()`, naming
+neither the option nor the cause. It is now checked up front and says so.
+
+**It is a smaller win than it sounds.** Only extraction moves; matching and
+mapping stay on the CPU whatever you do. Measured on this repo's frames
+(1600px, 8 threads, unmasked, on the dev machine's CPU), extraction is linear
+in frames and exhaustive matching is linear in *pairs*:
+
+| frames | extract | match | pairs |
+|---|---|---|---|
+| 8 | 4.0 s | 0.7 s | 28 |
+| 16 | 7.6 s | 2.1 s | 120 |
+
+That is ~0.48 s/frame extracting and ~0.018 s/pair matching, so a two-pass
+192-frame capture (18,336 pairs) works out at roughly 1.5 minutes extracting
+against 5 minutes matching. GPU SIFT takes a bite out of the smaller half.
+Masking cuts the real numbers below these, since fewer features survive.
+
+If you want P3 faster without building anything, `--max-image-size` is the
+lever that moves both halves at once:
+
+```bash
+pose-solve --workdir runs/thistle1 --max-image-size 1200
+```
+
+> **Note on the `skeleton-gpu` extra.** `pyproject.toml` declares a
+> `skeleton-gpu` extra listing `pycolmap-cuda`, and `pose-all` pulls it in.
+> Installing it has broken this environment before -- both packages provide
+> the same `pycolmap` module, so whichever unpacks last wins and `import
+> pycolmap` can end up raising or missing attributes. `setup_env.sh` detects
+> that collision and keeps whichever build imports. If you land in it, the
+> way out is to force the CPU wheel back:
+>
+> ```bash
+> pip install --force-reinstall --index-url https://pypi.org/simple pycolmap==4.1.1
+> python -c "import pycolmap; print(pycolmap.__version__, pycolmap.has_cuda)"
+> ```
+>
+> The documented install line above (`.[dev,skeleton,segment]`) does not
+> include this extra, and P3 works fine on the CPU build.
+
+### Running one plant, start to finish
+
+Worked example: two orbits of a thistle, one at waist height and one from
+slightly above, into `runs/thistle1/`. Run the steps in order. There are
+**two** points where you stop and click something, and **two** where you stop
+and read a QC number; neither is optional, and skipping either wastes the
+half hour that follows it.
+
+| step | command | wall time | you do what |
+|---|---|---|---|
+| 1 | `run_pipeline.sh --stop-after p1p2` | ~10 min | nothing |
+| 2 | read `p2/qc.json` | seconds | **decide if P2 tracked the plant** |
+| 3 | `pose-pick-prompts` + `pose-segment --reuse-frames` | ~8 min | click the plant, once per pass |
+| 4 | `run_pipeline.sh --skip-to p3 --stop-after p4b` | ~30 min | nothing |
+| 5 | read `p3/poses.json` | seconds | **check the circle fit** |
+| 6 | `pose-pick-seeds` | ~2 min | click leaf / stem / root |
+| 7 | `run_pipeline.sh --skip-to p4c --stop-after p4c` | ~5 min | nothing |
+| 8 | `run_pipeline.sh --skip-to p5` | ~2 min | nothing |
+| 9 | `pose-view-structure` / Blender | — | look at it |
+
+---
+
+**Step 1 -- frames and plant masks (P1+P2).** Several `--video` files are
+capture passes of the *same plant* at different camera elevations; they share
+one workdir and are solved together in P3. See
+[Shooting more than one orbit](#shooting-more-than-one-orbit).
+
+```bash
+./run_pipeline.sh --video /data/DSC_0015.MOV /data/DSC_0016.MOV \
+    --workdir runs/thistle1 --stop-after p1p2
+```
+
+**Step 2 -- check that P2 tracked the plant and not the pliers. Do not skip
+this.** SAM2 has to be told which object to follow, and by default that seed
+point is chosen by colour, which fails often enough on this rig that it is a
+routine step rather than an exception. Nothing errors when it goes wrong: you
+get 96 clean masks of a pair of pliers and find out in P4a, half an hour
+later, when the hull carves to nothing.
+
+```bash
+python -c "import json; d=json.load(open('runs/thistle1/p2/qc.json')); \
+print(json.dumps(d['checks'], indent=2)); print('all passed:', d['all_passed'])"
+eog runs/thistle1/p2/diag/          # the green overlay must be on the plant
+```
+
+Two checks decide it:
+
+- `plant_mask_free_of_holder` -- what fraction of the "plant" mask is sitting
+  on holder plastic. Limit 2%. A failure in the 80-90% range means the mask
+  *is* the pliers.
+- `plant_holder_disjoint` -- the two tracked objects should not overlap.
+
+With more than one pass, check them **per pass**, because one good pass hides
+one bad one in the aggregate:
+
+```bash
+python - <<'EOF'
+import cv2, json, numpy as np
+src = json.load(open("runs/thistle1/p1/sources.json"))
+rows = {}
+for stem, p in sorted(src.items()):
+    pm = cv2.imread(f"runs/thistle1/p2/masks/plant/{stem}.png", 0) > 127
+    hm = cv2.imread(f"runs/thistle1/p2/masks/holder/{stem}.png", 0) > 127
+    rows.setdefault(p, []).append(((pm & hm).sum() / max(pm.sum(), 1), pm.sum()))
+for p, r in rows.items():
+    ov = np.array([x[0] for x in r]); ar = np.array([x[1] for x in r])
+    print(f"pass {p}: {len(r):3d} frames  median plant area {np.median(ar):8.0f} px  "
+          f"mean overlap with holder {ov.mean()*100:5.1f}%")
+EOF
+```
+
+Healthy looks like `mean overlap with holder 0.0%`. A pass reading 70-90% is
+tracking the tool. **If every check passes, skip to step 4.**
+
+**Step 3 -- only if step 2 failed: click the plant, once per capture pass.**
+
+```bash
+pose-pick-prompts --workdir runs/thistle1 --hf-token hf_xxxxxxxxxxxxxx
+```
+The hf-token must be added otherwise, the seed bank will not be generated since the DINOv3 is a gated model. 
+The window opens on the frame each pass is actually seeded on -- the *first*
+frame of that pass, because SAM2 propagates forward from there and a point
+clicked anywhere else has nothing to attach to. Faint grey crosses show where
+the colour rule put its seeds; when those are on the pliers, that is the bug
+you are looking at.
+
+- click **three or more** points on different parts of the plant (one click
+  is not enough for the reusable bank -- see the numbers
+  [below](#when-the-pliers-get-segmented-as-the-plant))
+- **click the root too, with `1` = plant.** There is no root class here and
+  there should not be: P2 only decides which object is the plant, and the
+  root is part of it. It needs its *own* click because the jaws usually sit
+  between foliage and root, leaving the root a disconnected blob that SAM2
+  cannot reach from a leaf point. Miss it and the root is absent from the
+  mask, the hull, the cloud and every phase after -- P4c cannot put it back,
+  because P4c only labels points that already exist. Measured on thistle1:
+  nine plant clicks, all on foliage, and no root anywhere downstream
+- press `2`, click the plier **jaws** where they grip the stem, not the far
+  end of the handle: the tracking crop is sized to the plant, and a point
+  outside it is dropped
+- press `n` for the next pass and repeat -- **every pass needs its own
+  clicks**, including the ones that were already fine
+- press `s` to save
+
+Then redo P2 alone, keeping the frames you already extracted:
+
+```bash
+pose-segment --workdir runs/thistle1 --reuse-frames
+```
+
+Re-check step 2 before going on. That run also writes
+`runs/thistle1/p2/prompt_bank.npz`, which makes every later specimen on this
+rig seed itself -- see
+[When the pliers get segmented as the plant](#when-the-pliers-get-segmented-as-the-plant).
+
+> Do **not** re-run with `--video` to fix this. That extracts a second set of
+> frames on top of the first, leaving `p1/frames` disagreeing with
+> `p1/sources.json`, and P3 then pools two elevations into one orbit and P4a
+> carves an empty hull.
+
+**Step 4 -- camera poses, hull and surface (P3, P4a, P4b).** This is the long
+one. P4b is on the GPU already; P3's SIFT is not, unless you have a CUDA
+pycolmap -- see [GPU use](#gpu-use-and-why-p3-is-the-exception) before adding
+`--use-gpu`.
+
+```bash
+./run_pipeline.sh --workdir runs/thistle1 --skip-to p3 --stop-after p4b
+```
+
+**Step 5 -- check the circle fit.** The camera is fixed and the plant turns,
+so in the plant's frame the camera must trace a circle. Nothing in the solver
+enforces that, which is what makes it real evidence rather than a restatement
+of COLMAP's own objective.
+
+```bash
+python -c "import json; print(json.dumps(json.load(open('runs/thistle1/p3/poses.json'))['checks'], indent=2))"
+```
+
+For a single pass the checks are `cameras_lie_on_a_circle`,
+`cameras_coplanar` and `full_rotation_covered`. For a multi-pass capture they
+become `each_pass_lies_on_a_circle`, `full_rotation_covered`,
+`passes_share_a_rotation_axis` (the evidence the passes actually merged into
+one coordinate frame -- nothing in the solve enforces it) and
+`passes_are_at_different_elevations` (the extra footage only buys anything if
+it was shot from somewhere new).
+
+If the circle fit fails, nothing downstream can be right, and the usual cause
+is step 2: two passes whose silhouettes describe different objects cannot
+agree on an axis.
+
+**Step 6 -- click the organ seeds for P4c.** A different set of clicks from
+step 3: those said *which object is the plant*, these say *which parts of the
+plant are leaf, stem and root*. This is where `root` becomes a class -- at P2
+the root was simply part of the plant. The window opens on the plant cropped exactly
+as the classifier crops it, and clicks off the plant are refused.
+
+```bash
+pose-pick-seeds --workdir runs/thistle1
+```
+
+Click three or four leaf points **on frames at different angles** (`n` / `p`
+to move; a leaf edge-on barely resembles the same leaf face-on), press `2`
+and click the stem twice, `3` and click the root, then `s`. Writes
+`p4c/seeds.json`.
+
+**Step 7 -- organ labels and coloured clouds (P4c).** The seeds are found at
+`p4c/seeds.json` without being named.
+
+```bash
+./run_pipeline.sh --workdir runs/thistle1 --skip-to p4c --stop-after p4c
+```
+
+Check `p4c/diag/parts_*.jpg` (photograph beside classification) before
+blaming the 3D labels for anything -- that image tells you whether a bad
+label came from the 2D classifier or from the multi-view voting.
+
+**Step 8 -- structure and per-leaf measurements (P5, P6).** Tell it what kind
+of plant this is:
+
+```bash
+# upright, with a central stem (the default)
+./run_pipeline.sh --workdir runs/thistle1 --skip-to p5
+
+# leaves radiating from a crown at ground level: thistle, sugar beet
+./run_pipeline.sh --workdir runs/thistle1 --skip-to p5 --architecture rosette
+```
+
+
+**Step 9 -- look at it.**
+
+```bash
+pose-view-structure --workdir runs/thistle1     # matplotlib, rotatable
+./scripts/view_in_blender.sh runs/thistle1      # Blender (Windows Blender, from WSL)
+```
+
+Measurements land in `runs/thistle1/p6/leaves.json`: arclength, insertion
+angle, azimuth and a width profile per leaf, in COLMAP units rather than
+millimetres -- no scale reference is solved yet.
+
+### Recovering after a bad P2
+
+If you got as far as P3 or P4 before noticing the masks were wrong, nothing
+needs deleting -- every phase overwrites its own output. Fix P2, then re-run
+from P3:
+
+```bash
+pose-pick-prompts --workdir runs/thistle1        # step 3 above
+pose-segment --workdir runs/thistle1 --reuse-frames
+./run_pipeline.sh --workdir runs/thistle1 --skip-to p3 --stop-after p4b
+```
+
+The one thing that *does* need cleaning is a duplicated frame set from
+re-running with `--video` on an existing workdir. Check it before anything
+else:
+
+```bash
+ls runs/thistle1/p1/frames | wc -l
+python -c "import json,collections; \
+print(collections.Counter(json.load(open('runs/thistle1/p1/sources.json')).values()))"
+```
+
+The count and the per-pass totals must agree (192 frames, `{0: 96, 1: 96}`).
+If they do not, delete `runs/thistle1/p1/` and start from step 1.
+
+### Running the rest of the batch
+
+Once one plant is done, its two seed files carry to the others and there is
+nothing left to click:
+
+```bash
+./run_pipeline.sh --video /data/DSC_0010.MOV --workdir runs/thistle2 \
+    --seed-bank runs/thistle1/p4c/seed_bank.npz
+```
+
+The plant/holder prompt bank is picked up on its own: `run_pipeline.sh` looks
+for the newest `*/p2/prompt_bank.npz` beside the workdir, so `runs/thistle2`
+finds `runs/thistle1`'s. `--prompt-bank <path>` names a particular one,
+`--prompt-root <dir>` says where to look, `--no-prompt-bank` turns it off.
+
+Individual phases can also be run directly, which is what to do when
+debugging one of them:
+
+```bash
+pose-segment   --video /data/DSC_0009.MOV --workdir runs/thistle1/
+pose-solve     --workdir runs/thistle1/
+pose-hull      --workdir runs/thistle1/ --resolution 256
+pose-surface   --workdir runs/thistle1/ --iterations 5000
+pose-classify  --workdir runs/thistle1/ --seeds-file runs/thistle1/p4c/seeds.json
+pose-fuse      --workdir runs/thistle1/
+pose-structure --workdir runs/thistle1/
+pose-leaf      --workdir runs/thistle1/
+```
+
+Other flags on `run_pipeline.sh`: `--skip-p4b` halves the runtime by labelling
+the P4a hull instead of a trained surface (blobbier, and P5 cannot
+skeletonise it afterwards without going back); `--backend sam
+--sam-checkpoint <ckpt>` skips seeds entirely at the cost of a fixed
+leaf/stem vocabulary; `--video a.MOV b.MOV` merges two capture passes of the
+same plant, covered under
+[Shooting more than one orbit](#shooting-more-than-one-orbit).
+
+### When the pliers get segmented as the plant
+
+On some plants P2 tracks the holder instead of the specimen, for the whole
+sequence. SAM2 has to be told which object to follow, and the default rule
+picks that seed point by colour: the pliers' amber grip is green-dominant in
+RGB, so a pass that shows the tool large and the plant small and shadowed
+seeds on the tool. Nothing errors. P4a then carves an empty or nonsensical
+hull, because the two passes' silhouettes describe different objects.
+
+Catch it at step 1: `p2/qc.json` reports `plant_mask_free_of_holder`, and the
+overlays in `p2/diag/` show what the green mask is actually on.
+
+Fix it by clicking the plant once, per capture pass:
+
+```bash
+export HF_TOKEN=hf_xxx                      # REQUIRED, see below
+pose-pick-prompts --workdir runs/thistle1   # click plant, press 2, click the plier jaws
+pose-segment --workdir runs/thistle1 --reuse-frames    # redo P2 only, keeping the frames
+./run_pipeline.sh --workdir runs/thistle1 --skip-to p3
+```
+
+> **The token is not optional here.** The reusable bank is DINO feature
+> vectors, so building it loads the gated DINOv3 weights. Without `--hf-token`
+> (or `HF_TOKEN`) the clicker still writes `p2/prompts_clicked.json` and fixes
+> *this* video, prints a one-line note, and writes **no** `p2/prompt_bank.npz`
+> -- so the next specimen silently falls back to the colour rule. Confirm you
+> got both files before moving on:
+>
+> ```bash
+> ls runs/thistle1/p2/prompts_clicked.json runs/thistle1/p2/prompt_bank.npz
+> ```
+>
+> The success line reads `reusable prompt bank -> .../p2/prompt_bank.npz`.
+> Use `--dino-model facebook/dinov2-base` if you have no token; just build
+> every later bank with the same model, since a bank refuses to load under a
+> different one.
+
+> **`--seed-bank` is not the P2 bank.** There are two, and passing the wrong
+> one is silently a no-op:
+>
+> | flag | file | feeds |
+> |---|---|---|
+> | `--prompt-bank` | `p2/prompt_bank.npz` | P2: which object is the plant |
+> | `--seed-bank` | `p4c/seed_bank.npz` | P4c: which parts are leaf/stem/root |
+>
+> `run_pipeline.sh` also finds the newest `*/p2/prompt_bank.npz` beside the
+> workdir on its own, so usually neither needs naming. If P2 has no prompt
+> source at all it now warns loudly before falling back to colour.
+
+**You do this once for a rig, not once per plant.** The clicker writes two
+files. `p2/prompts_clicked.json` holds the pixel coordinates, which fix this
+video and mean nothing in the next one. `p2/prompt_bank.npz` holds the DINO
+feature vectors at those points -- what a thistle and a pair of pliers *look
+like* -- and that is what transfers. On a later specimen the bank is compared
+against every patch of the first frame and the prompt is placed wherever most
+resembles the stored plant, so a different pose, a different distance, or the
+plant sitting elsewhere in frame all still work. The prompt only has to land
+somewhere inside the right object; SAM2 finds the boundary itself.
+
+```bash
+pose-segment --workdir runs/thistle2 --prompt-bank runs/thistle1/p2/prompt_bank.npz
+```
+
+Clicking a few specimens into one bank widens it, the same way extra organ
+seeds do: the vectors are kept individually rather than averaged, so an
+example of a plant shot in shade only adds coverage. The bank records which
+backbone built it and refuses to load under a different one, because
+dinov2-base and dinov3-vitb16 both emit 768 numbers that mean unrelated
+things.
+
+**How well it actually transfers**, measured on the two runs in this repo
+(dinov2-base, bank built only from `plant_6`, prompt scored against each
+frame's P2 mask, every 8th frame):
+
+| bank | tested on | plant prompt lands on the plant |
+|---|---|---|
+| 1 example, 1 frame | plant_6 (same video) | 1/12 |
+| 3 examples, 1 frame | plant_6 (same video) | 8/12 |
+| 9 examples, 3 frames | plant_6 (same video) | 11/12 |
+| 9 examples, 3 frames | **plant_9 (different specimen)** | **10/12** |
+
+So: click at least three plant points per pass, on different parts of the
+plant. One click is not a bank. With that, the plant prompt does carry to a
+new specimen, which is the case this exists for.
+
+The **holder** prompt did not transfer in the same test -- 8/12 within
+plant_6, 0/12 on plant_9. Only the plant prompt is required, so a run still
+segments; what you lose is P2 subtracting the tracked holder from the plant
+mask. Click the holder per specimen if you need that, or check
+`plant_mask_free_of_holder` in `p2/qc.json` and only go back when it fails.
+
+If the tool changes -- a clamp instead of pliers, a pot instead of a holder --
+click a fresh bank rather than editing a threshold. There is no colour rule
+left to tune.
+
+### Plant architecture: stem or crown
+
+P5 splits leaves by how far into them you can travel from the plant's base, so
+it needs a base to start from. Which one you have is a property of the
+specimen, and you pass it in:
+
+| `--architecture` | base | for |
+|---|---|---|
+| `caulescent` (default) | the stem tissue P4c labelled | an upright plant with a central stem |
+| `rosette` | a crown located from the geometry | thistle, sugar beet -- no stem exists |
+
+A rosette has nothing to seed the depth field from: there is no stem to label,
+and its roots sit outside the P2 plant mask. Run it as `caulescent` and P5
+reports 0 contact points, 0 tips and 0 leaves. With `--architecture rosette`
+the crown is found instead, by taking the geodesic extremities of the leaf
+tissue and intersecting the paths between them -- every leaf-to-leaf path has
+to cross wherever the leaves are joined. `p5/instancing.json` records how
+tight the result was (`base_spread_fraction_of_extent`; 1.3% on thistle1),
+which is the evidence the leaves really do meet at a point.
+
+Two consequences for a rosette, both visible in Blender:
+
+- **the base is a sphere, not a tube.** `plant_stem` holds a single crown
+  node. Left as a curve it came out as a 3-node zigzag spanning 4% of the
+  plant -- noise, drawn as an elbow of pipe no thistle has.
+- **stem labels are ignored.** P4c calls a rosette's crown "stem", because it
+  is thick and not lamina. That is a reasonable thing for a patch classifier
+  to say and a bad thing to build a skeleton on: seeding four stem points on
+  thistle1 had P4c label 2,214 points stem, and P5 traced a 33-node
+  centreline through a plant with no stem.
+
+### Anything the holder hides
+
+Both P4a and P4b read `p2/masks/holder` and treat a pixel the tool covers as
+carrying **no evidence**, rather than as evidence the plant is not there.
+
+This matters for the exposed root. The pliers cross in front of it for most
+of a rotation, so on thistle1 the root reached the plant mask in only 27% of
+frames. A plain silhouette intersection needs 86% agreement and deleted it;
+P4b's silhouette loss then trained the same tissue to zero opacity, because
+"not in the mask" and "hidden" were the same thing to it. Measured: the P4a
+hull now spans z -0.339..0.884 in the plant frame while the P4b surface
+spanned 0.000..0.894 -- the carve kept the root and the surfels threw it away.
+
+Neither phase lowers a threshold. Occluded views leave the denominator
+instead of voting against, and P4b's silhouette term is weighted to zero on
+hidden pixels. `min_judged_views` (default 8) is the floor on unoccluded
+views, so a handful of agreeing voters cannot invent geometry.
+
+If the holder was never tracked -- `p2/masks/holder` missing or empty --
+both phases say so and fall back to the old behaviour. That happens when the
+holder prompt lands outside the tracking crop, which `pose-segment` warns
+about at the time.
+
+**This is not inferred.** An earlier version read the crown's spread and
+decided for you, and it flipped thistle1 from crown (1.6% of extent) to stem
+(15.2%) purely because P4c had started labelling the crown "stem", removing it
+from the tissue the test ran on -- same plant, same geometry, opposite answer.
+You know which kind of plant you clamped.
 
 ### Judging P5: leaves are separated by their tips
 
@@ -320,7 +796,13 @@ object boundaries rather than a patch grid.
 `pose-semantic` runs both stages in one call, which is what `run_pipeline.sh`
 uses.
 
-### Seeds, and how to avoid clicking 50 times
+### Organ seeds for P4c, and how to avoid clicking 50 times
+
+There are two separate sets of clicks in this pipeline and they are easy to
+mix up. The P2 *prompts* say which object in the scene is the plant, and are
+covered above. The P4c *seeds* below say which parts of the plant are leaf,
+stem and root. Both store DINO feature vectors so they carry to later videos;
+they live in different files and are picked with different tools.
 
 DINOv3 gives every image patch a feature vector but no names, so a few
 labelled examples are needed to say which vectors mean "leaf". `pose-pick-seeds`

@@ -41,15 +41,21 @@
 # unlit can seed on the tool and track it for the whole sequence. P4a then
 # carves nothing, because two passes' silhouettes describe different objects.
 # Check p2/qc.json (plant_mask_free_of_holder) and the p2/diag overlays; if
-# the green mask is on the holder, click the seeds instead:
+# the green mask is on the holder, click the plant once:
 #
 #   ./run_pipeline.sh --video <a> <b> --workdir runs/plant_9 --stop-after p1p2
 #   pose-pick-prompts --workdir runs/plant_9     # one plant click per pass
 #   pose-segment --workdir runs/plant_9 --reuse-frames    # redo P2 only
 #   ./run_pipeline.sh --workdir runs/plant_9 --skip-to p3
 #
-# That writes p2/prompts_clicked.json, which pose-segment picks up on its own
-# from then on -- no argument needed, the same way p4c/seeds.json works.
+# You only do that once for a rig. Clicking writes two files: the pixel
+# coordinates in p2/prompts_clicked.json, which fix this video, and the DINO
+# feature vectors in p2/prompt_bank.npz, which fix every later one. The
+# vectors describe what the plant and the plier *look like*, so the next
+# specimen is searched for whatever most resembles them and needs no clicks
+# however it is posed. Later runs pick the newest bank sitting beside their
+# workdir on their own; --prompt-bank <path> names one, --prompt-root <dir>
+# says where to look, --no-prompt-bank goes back to the colour rule.
 #
 # Picking seeds. P4c classifies every image patch by which labelled example it
 # most resembles, so it needs a few clicks on one frame. Get a coordinate grid
@@ -68,6 +74,33 @@
 # --hf-token (or export HF_TOKEN). Without a token, pass
 # --dino-model facebook/dinov2-base, which is ungated and behaves similarly.
 #
+# Plant architecture. P5 splits leaves by how far into them you can travel
+# from the plant's base, so it needs a base to start from -- and which kind
+# you have is a property of the specimen, so you pass it in:
+#
+#   --architecture caulescent   (default) upright, with a central stem; leaf
+#                               depth is measured from the stem tissue P4c
+#                               labelled
+#   --architecture rosette      leaves radiate from a crown at ground level
+#                               and there is no stem at all (thistle, sugar
+#                               beet); the crown is located from the geometry
+#                               and stem labels are ignored
+#
+# Run a rosette as caulescent and P5 reports 0 contact points, 0 tips and 0
+# leaves: there is nothing to seed the depth field from. It is not inferred --
+# an earlier version guessed and flipped thistle1 from crown to stem purely
+# because P4c had started labelling the crown "stem".
+#
+# GPU. P4b (gsplat) and P4c (DINOv3/SAM2) always use the GPU. P3 is the
+# exception: COLMAP's SIFT extraction runs on the CPU unless pycolmap was
+# built with CUDA, which the PyPI wheels are not. Check with
+#
+#   python -c "import pycolmap; print(pycolmap.has_cuda)"
+#
+# True means --use-gpu will work here; False means it raises. Only extraction
+# moves -- matching and mapping are CPU either way, and on 192 frames matching
+# is the larger share, so this is a smaller win than it sounds.
+#
 # Runtime on an RTX 2070, 96 frames: about 40 minutes, dominated by COLMAP
 # (P3) and surfel training (P4b).
 
@@ -77,6 +110,7 @@ VIDEOS=(); WORKDIR=""; SEED_FRAME=""; HF_TOKEN_ARG="${HF_TOKEN:-}"
 DINO_MODEL="facebook/dinov3-vitb16-pretrain-lvd1689m"
 SEEDS=(); SKIP_TO=""; SEED_BANK=""; SEEDS_FILE=""; SKIP_P4B=0
 BACKEND="dino"; SAM_CHECKPOINT=""; STOP_AFTER=""
+PROMPT_BANK=""; PROMPT_ROOT=""; NO_PROMPT_BANK=0; USE_GPU=0; ARCHITECTURE=""; PERSISTENCE=""; PROMPT_POINTS=""
 
 # Print the comment block at the top of this file, however long it is, so the
 # help text cannot drift out of sync with a hard-coded line range.
@@ -95,6 +129,13 @@ while [[ $# -gt 0 ]]; do
         --skip-to)      SKIP_TO="$2"; shift 2 ;;
         --stop-after)   STOP_AFTER="$2"; shift 2 ;;
         --seed-bank)    SEED_BANK="$2"; shift 2 ;;
+        --prompt-bank)  PROMPT_BANK="$2"; shift 2 ;;
+        --prompt-points) PROMPT_POINTS="$2"; shift 2 ;;
+        --prompt-root)  PROMPT_ROOT="$2"; shift 2 ;;
+        --no-prompt-bank) NO_PROMPT_BANK=1; shift ;;
+        --use-gpu)      USE_GPU=1; shift ;;
+        --architecture) ARCHITECTURE="$2"; shift 2 ;;
+        --min-persistence-ratio) PERSISTENCE="$2"; shift 2 ;;
         --seeds-file)   SEEDS_FILE="$2"; shift 2 ;;
         --backend)      BACKEND="$2"; shift 2 ;;
         --sam-checkpoint) SAM_CHECKPOINT="$2"; shift 2 ;;
@@ -114,6 +155,24 @@ done
 if [[ -z "$SEEDS_FILE" && ${#SEEDS[@]} -eq 0 && -z "$SEED_BANK" && -f "$WORKDIR/p4c/seeds.json" ]]; then
     SEEDS_FILE="$WORKDIR/p4c/seeds.json"
     echo "found clicked seeds at $SEEDS_FILE -- using them for P4c"
+fi
+
+# Which object is the plant, for P2. Three sources, most specific first:
+#   1. clicks for this video          <workdir>/p2/prompts_clicked.json
+#   2. a bank named with --prompt-bank
+#   3. the newest bank beside this workdir
+# (3) is what makes a batch work. The bank holds what a plant and a holder
+# look like rather than where they sat in one video, so one specimen's clicks
+# carry to every later capture of the same rig. Without any of the three, P2
+# falls back to the colour rule, which is the thing that seeds on the pliers.
+if [[ "$NO_PROMPT_BANK" == 0 && -z "$PROMPT_BANK" && ! -f "$WORKDIR/p2/prompts_clicked.json" ]]; then
+    PROMPT_ROOT="${PROMPT_ROOT:-$(dirname "$WORKDIR")}"
+    FOUND_BANK="$(ls -t "$PROMPT_ROOT"/*/p2/prompt_bank.npz 2>/dev/null | head -1 || true)"
+    if [[ -n "$FOUND_BANK" && "$FOUND_BANK" != "$WORKDIR/p2/prompt_bank.npz" ]]; then
+        PROMPT_BANK="$FOUND_BANK"
+        echo "reusing plant/holder prompts from $PROMPT_BANK"
+        echo "  (pass --prompt-bank <other> to choose, or --no-prompt-bank for the colour rule)"
+    fi
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -245,14 +304,30 @@ if should_run p1p2; then
         exit 1
     fi
     echo "  SAM2 checkpoint: $SAM_CKPT"
+    if [[ -n "$PROMPT_BANK" ]]; then
+        echo "  plant/holder prompts: $PROMPT_BANK"
+    elif [[ -f "$WORKDIR/p2/prompts_clicked.json" ]]; then
+        echo "  plant/holder prompts: clicked, $WORKDIR/p2/prompts_clicked.json"
+    else
+        echo "  WARNING: no plant/holder prompts -- falling back to the COLOUR RULE." >&2
+        echo "    That rule picks the largest green-dominant blob, and an orange or" >&2
+        echo "    amber plier grip is green-dominant in RGB. It has seeded on the tool" >&2
+        echo "    on more than one capture here. Check p2/qc.json before P3." >&2
+        echo "    A P4c --seed-bank does NOT feed P2: that bank holds organ classes." >&2
+        echo "    The P2 bank is p2/prompt_bank.npz, written by pose-pick-prompts." >&2
+    fi
     $PY -m pose_estimator.cli.segment \
         ${VIDEOS[0]:+--video} ${VIDEOS[@]+"${VIDEOS[@]}"} --workdir "$WORKDIR" \
-        --checkpoint "$SAM_CKPT"
+        --checkpoint "$SAM_CKPT" \
+        ${PROMPT_BANK:+--prompt-bank "$PROMPT_BANK"} \
+        ${PROMPT_BANK:+--dino-model "$DINO_MODEL"} \
+        ${PROMPT_POINTS:+--prompt-points "$PROMPT_POINTS"}
 fi
 
 if should_run p3; then
     phase "P3     camera poses, masked COLMAP                 -> $WORKDIR/p3"
-    $PY -m pose_estimator.cli.pose --workdir "$WORKDIR"
+    $PY -m pose_estimator.cli.pose --workdir "$WORKDIR" \
+        $([[ "$USE_GPU" == 1 ]] && echo --use-gpu)
 fi
 
 if should_run p4a; then
@@ -306,7 +381,9 @@ fi
 if should_run p5; then
     if [[ -f "$WORKDIR/p4c/labels.npy" ]]; then
         phase "P5     stem centreline + leaf instances           -> $WORKDIR/p5"
-        $PY -m pose_estimator.cli.structure --workdir "$WORKDIR"
+        $PY -m pose_estimator.cli.structure --workdir "$WORKDIR" \
+            ${ARCHITECTURE:+--architecture "$ARCHITECTURE"} \
+            ${PERSISTENCE:+--min-persistence-ratio "$PERSISTENCE"}
     else
         phase "P5     SKIPPED -- no $WORKDIR/p4c/labels.npy"
         echo "  P5 is driven by the P4c organ labels; run P4c first."

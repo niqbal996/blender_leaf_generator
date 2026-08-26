@@ -17,7 +17,10 @@ Three ways to run it.
 What you get, as four collections:
 
     plant_cloud    the labelled points, in their own colours
-    plant_stem     the stem centreline -- thick, white, unmistakable
+    plant_stem     the stem centreline -- thick, white, unmistakable.
+                   On a rosette (thistle, sugar beet) there is no stem: this
+                   holds a single sphere at the crown where the leaves meet.
+    plant_chords   straight tip-to-base lines, to read the midribs against
     plant_midribs  one curve per leaf, tip to stem, in the P5 leaf colours
     plant_tips     a sphere on each detected leaf tip
 
@@ -358,6 +361,22 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True):
 
     if len(stem) > 1:
         add_curve(stem, "plant_stem_line", STEM_RGBA, stem_radius, collection("plant_stem"))
+    elif len(stem) == 1:
+        # A rosette: P5 reports its base as one node because the leaves meet at
+        # a crown rather than along a stem. Drawn as a curve that would be an
+        # elbow of pipe no thistle has, so it gets a sphere instead.
+        add_sphere(stem[0], "plant_crown", STEM_RGBA, stem_radius * 2.5,
+                   collection("plant_stem"))
+
+    chords = np.array(graph.get("chords_xyz") or []).reshape(-1, 24, 3) \
+        if graph.get("chords_xyz") else np.zeros((0, 24, 3))
+    if len(chords):
+        # Straight tip-to-base reference lines. A midrib that wanders is
+        # obvious beside one; alone it just looks like a curve.
+        chord_group = collection("plant_chords")
+        for i, chord in enumerate(chords):
+            add_curve(chord, f"chord_{i:02d}", (0.75, 0.75, 0.75, 1.0),
+                      leaf_radius * 0.35, chord_group)
 
     midribs = collection("plant_midribs")
     tips = collection("plant_tips")

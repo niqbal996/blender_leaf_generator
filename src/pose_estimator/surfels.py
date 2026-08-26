@@ -50,6 +50,7 @@ class TrainView:
     K: np.ndarray  # (3, 3)
     world_to_camera: np.ndarray  # (4, 4)
     name: str
+    occluder: Optional[np.ndarray] = None  # (H, W) float32, 1 = hidden by the holder
 
 
 def load_views(
@@ -57,6 +58,7 @@ def load_views(
     frames_dir: Union[str, Path],
     mask_dir: Union[str, Path],
     downsample: int = 2,
+    occluder_dir: Optional[Union[str, Path]] = None,
 ) -> List[TrainView]:
     """Build training views from P3 poses, P1 frames and P2 plant masks.
 
@@ -66,6 +68,7 @@ def load_views(
     with the camera and therefore geometrically meaningless.
     """
     frames_dir, mask_dir = Path(frames_dir), Path(mask_dir)
+    occluder_dir = Path(occluder_dir) if occluder_dir is not None else None
     views: List[TrainView] = []
 
     for image_id in sorted(reconstruction.reg_image_ids()):
@@ -77,10 +80,19 @@ def load_views(
         if bgr is None or mask is None:
             continue
 
+        hidden = None
+        if occluder_dir is not None:
+            raw = cv2.imread(str(occluder_dir / f"{Path(image.name).stem}.png"),
+                             cv2.IMREAD_GRAYSCALE)
+            if raw is not None:
+                hidden = np.where((raw > 127) & (mask <= 127), 255, 0).astype(np.uint8)
+
         if downsample > 1:
             size = (bgr.shape[1] // downsample, bgr.shape[0] // downsample)
             bgr = cv2.resize(bgr, size, interpolation=cv2.INTER_AREA)
             mask = cv2.resize(mask, size, interpolation=cv2.INTER_AREA)
+            if hidden is not None:
+                hidden = cv2.resize(hidden, size, interpolation=cv2.INTER_AREA)
 
         K = np.asarray(camera.calibration_matrix(), dtype=np.float64).copy()
         K[:2] /= downsample
@@ -98,6 +110,7 @@ def load_views(
                 K=K,
                 world_to_camera=world_to_camera,
                 name=image.name,
+                occluder=None if hidden is None else hidden.astype(np.float32) / 255.0,
             )
         )
     return views
@@ -249,6 +262,14 @@ def train(
 
     images = [torch.tensor(v.image, device=device) for v in views]
     masks = [torch.tensor(v.mask, device=device) for v in views]
+    # 1 where the pixel carries evidence, 0 where the holder hides whatever is
+    # behind it. Without this the silhouette term trains the root away: the
+    # pliers cross in front of it for most of the orbit, so in ~73% of frames
+    # the mask says "empty" at pixels that are merely hidden, and opacity
+    # there is driven to zero. Absence of evidence, taught as evidence of
+    # absence.
+    visible = [None if v.occluder is None
+               else torch.tensor(1.0 - v.occluder, device=device) for v in views]
     Ks = [torch.tensor(v.K, dtype=torch.float32, device=device)[None] for v in views]
     viewmats = [torch.tensor(v.world_to_camera, dtype=torch.float32, device=device)[None] for v in views]
 
@@ -280,8 +301,13 @@ def train(
             rgb.permute(2, 0, 1)[None], images[i].permute(2, 0, 1)[None], data_range=1.0
         )
         # The silhouette term is what makes this a geometry fit rather than a
-        # texture fit: it penalises opacity anywhere the mask says empty.
-        mask_term = F.l1_loss(alpha, masks[i])
+        # texture fit: it penalises opacity anywhere the mask says empty --
+        # except where the holder is in the way, which is not the same thing.
+        if visible[i] is None:
+            mask_term = F.l1_loss(alpha, masks[i])
+        else:
+            weight = visible[i]
+            mask_term = ((alpha - masks[i]).abs() * weight).sum() / weight.sum().clamp(min=1.0)
         # Normal consistency: the rendered surfel normals should agree with
         # the normals implied by the rendered depth. Without it a surfel can
         # satisfy the photometric loss while oriented arbitrarily, and the
@@ -385,7 +411,14 @@ def render_surface_points(
             alpha = alphas[0, ..., 0]
             mask = torch.tensor(view.mask, device=device)
 
-            valid = (alpha > alpha_threshold) & (depth > 1e-6) & (mask > 0.5)
+            # A pixel the holder covers tells us nothing, so it must not veto
+            # a surfel behind it either. Anything admitted this way still has
+            # to survive the hull carve below, which is what keeps floaters
+            # out.
+            seen = mask > 0.5
+            if view.occluder is not None:
+                seen = seen | (torch.tensor(view.occluder, device=device) > 0.5)
+            valid = (alpha > alpha_threshold) & (depth > 1e-6) & seen
             if not valid.any():
                 continue
 

@@ -143,6 +143,17 @@ def build_dino_classifier(
         print(f"  {len(parsed)} seeds taken from {seed_path.stem}")
 
     class_order = list(dict.fromkeys(seed_labels))
+    if len(class_order) < 2:
+        # Not an error. A rosette (thistle, sugar beet) has no stem and its
+        # roots fall outside the P2 plant mask, so "leaf" is the only class
+        # there is anything to click -- demanding a second one would be
+        # demanding something that does not exist on the specimen.
+        print(f"\n  NOTE: one class only ({class_order[0]!r}, {len(seed_labels)} examples).")
+        print("  Every patch on the plant becomes that class, so this pass adds no")
+        print("  information -- which is correct for an all-leaf rosette and wrong")
+        print("  for a plant that does have a stem you meant to seed.")
+        print("  P5 cannot grow leaves from a stem that was never labelled; it needs")
+        print("  a base found geometrically instead. See 'Plant architecture' in the README.\n")
 
     classifier = DinoClassifier.__new__(DinoClassifier)
     classifier.backbone = backbone

@@ -49,6 +49,7 @@ def run(
     min_leaf_points: int = 150,
     min_tip_depth_voxels: float = 8.0,
     min_persistence_ratio: float = 0.5,
+    architecture: str = "caulescent",
 ) -> dict:
     import pycolmap
 
@@ -105,7 +106,18 @@ def run(
                                   contact_voxels=contact_voxels,
                                   min_leaf_points=min_leaf_points,
                                   min_tip_depth_voxels=min_tip_depth_voxels,
-                                  min_persistence_ratio=min_persistence_ratio)
+                                  min_persistence_ratio=min_persistence_ratio,
+                                  architecture=architecture)
+
+    base = structure.instancing.base if structure.instancing is not None else None
+    if base is not None:
+        ev = base.evidence
+        print(f"\n  --architecture rosette: crown located from the geometry")
+        print(f"    extremities used  {len(base.extremities)}")
+        print(f"    base spread       {ev['base_spread_fraction_of_extent']:.1%} of plant "
+              "extent (small = the leaves really do meet at a point)")
+        print(f"    base elongation   {ev['base_elongation']:.2f}  (1 = ball, large = curve)")
+        print(f"    crown at          {np.round(base.center, 4).tolist()}")
 
     _report_instancing(structure, voxel)
 
@@ -264,6 +276,34 @@ def _write_outputs(p5_dir: Path, structure, stem_points: np.ndarray, frame, clam
     with open(p5_dir / "stem_graph.json", "w") as f:
         json.dump(graph, f, indent=2)
 
+    # The straight chord from each tip back to the base, as a reference the
+    # midrib can be read against. A midrib should bow away from its chord by
+    # roughly the leaf's own curvature and no more; one that loops, doubles
+    # back or crosses another leaf stands out immediately next to a straight
+    # line, where on its own it just looks like a curve.
+    if structure.axes and len(structure.stem_path):
+        chords, gaps = [], []
+        base = structure.stem_path[0]
+        for axis in structure.axes:
+            axis = np.asarray(axis).reshape(-1, 3)
+            if len(axis) < 2:
+                continue
+            chord = np.linspace(axis[0], axis[-1], 24)
+            chords.append(chord)
+            arc = float(np.linalg.norm(np.diff(axis, axis=0), axis=1).sum())
+            straight = float(np.linalg.norm(axis[-1] - axis[0]))
+            gaps.append(arc / max(straight, 1e-9))
+        if chords:
+            pts = np.vstack(chords)
+            _ply(p5_dir / "chords.ply", pts,
+                 np.tile(np.array([[210, 210, 210]], np.uint8), (len(pts), 1)))
+            graph["chords_xyz"] = [c.tolist() for c in chords]
+            graph["arc_over_chord"] = [round(g, 3) for g in gaps]
+            with open(p5_dir / "stem_graph.json", "w") as f:
+                json.dump(graph, f, indent=2)
+            print("  arc/chord per leaf (1.0 = straight; a wandering midrib is >> 1): "
+                  + ", ".join(f"{g:.2f}" for g in gaps))
+
     np.save(p5_dir / "leaf_points.npy", structure.leaf_ids)
     np.save(p5_dir / "leaf_points_xyz.npy", structure.leaf_points)
 
@@ -291,6 +331,26 @@ def _write_outputs(p5_dir: Path, structure, stem_points: np.ndarray, frame, clam
         "red": rgb[:, 0], "green": rgb[:, 1], "blue": rgb[:, 2]})
 
 
+def _stem_check(structure) -> dict:
+    """A rosette has no stem, so demanding a centreline is demanding a fiction.
+
+    Left as a real check for anything that does have stem tissue, because
+    there a missing centreline is a genuine failure rather than anatomy.
+    """
+    inst = structure.instancing
+    if inst is not None and inst.architecture == "rosette":
+        spread = inst.base.evidence["base_spread_fraction_of_extent"] if inst.base else 0.0
+        return {
+            "pass": True,
+            "detail": (f"not applicable: --architecture rosette, leaves meet at a crown "
+                       f"({spread:.1%} of extent) rather than along a stem"),
+        }
+    return {
+        "pass": len(structure.stem_path) >= 3,
+        "detail": f"{len(structure.stem_path)} stem centreline nodes",
+    }
+
+
 def _evaluate(structure, clamp, frame, voxel: float) -> dict:
     lengths = [float(np.linalg.norm(np.diff(a, axis=0), axis=1).sum()) for a in structure.axes]
     per_leaf = [int((structure.leaf_ids == i).sum()) for i in range(structure.num_leaves)]
@@ -301,10 +361,7 @@ def _evaluate(structure, clamp, frame, voxel: float) -> dict:
     worst = max(shortfall) / voxel if shortfall else 0.0
 
     checks = {
-        "stem_traced": {
-            "pass": len(structure.stem_path) >= 3,
-            "detail": f"{len(structure.stem_path)} stem centreline nodes",
-        },
+        "stem_traced": _stem_check(structure),
         "leaves_found": {
             "pass": structure.num_leaves >= 2,
             "detail": (f"{structure.num_leaves} leaf instance(s) from "
@@ -369,6 +426,14 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--min-tip-depth-voxels", type=float, default=8.0,
                         help="Ignore maxima shallower than this. Low on purpose -- persistence "
                              "does the rejecting, so this only screens out surface noise.")
+    parser.add_argument("--architecture", choices=["caulescent", "rosette"],
+                        default="caulescent",
+                        help="What kind of plant this is. caulescent (default): an upright "
+                             "plant with a central stem; leaf depth is measured from the "
+                             "stem tissue. rosette: leaves radiate from a crown at ground "
+                             "level with no stem at all (thistle, sugar beet); the crown is "
+                             "located geometrically and stem labels are ignored. Not "
+                             "inferred -- you know which it is when you shoot it.")
     parser.add_argument("--min-persistence-ratio", type=float, default=0.5,
                         help="A maximum is its own leaf when it survives down through this "
                              "fraction of its own depth before joining another. A real leaf "
@@ -380,7 +445,8 @@ def main(argv: Optional[list] = None) -> None:
     run(workdir=args.workdir, source=args.source,
         contact_voxels=args.contact_voxels, min_leaf_points=args.min_leaf_points,
         min_tip_depth_voxels=args.min_tip_depth_voxels,
-        min_persistence_ratio=args.min_persistence_ratio)
+        min_persistence_ratio=args.min_persistence_ratio,
+        architecture=args.architecture)
 
 
 if __name__ == "__main__":

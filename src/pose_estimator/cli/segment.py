@@ -23,6 +23,8 @@ Requires the "segment" extra plus a SAM2 checkpoint -- see the README.
 
 import argparse
 import json
+
+import cv2
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -50,6 +52,10 @@ def run(
     device: str = "cuda",
     reuse_frames: bool = False,
     prompts_file: Optional[Path] = None,
+    prompt_bank: Optional[Path] = None,
+    dino_model: str = "facebook/dinov3-vitb16-pretrain-lvd1689m",
+    dino_size: int = 896,
+    prompt_points: int = 3,
 ) -> dict:
     workdir.mkdir(parents=True, exist_ok=True)
     frames_dir = workdir / "p1" / "frames"
@@ -136,6 +142,20 @@ def run(
                 f"{sorted(clicked)} but the frames have passes {sorted(per_pass)}. "
                 "Re-run pose-pick-prompts.")
 
+    # A prompt bank locates the plant and the holder by appearance, so one set
+    # of clicks serves every later capture -- pixel coordinates only ever
+    # described one video. Done per pass, on the frame that pass is actually
+    # seeded on: two elevations show the plant in different places, so one
+    # located point cannot serve both.
+    if prompt_bank is not None:
+        if clicked:
+            print(f"  ignoring {prompt_bank}: this workdir has its own clicked prompts")
+        elif plant_point or holder_point:
+            print(f"  ignoring {prompt_bank}: --plant-point/--holder-point given")
+        else:
+            clicked = _locate_per_pass(prompt_bank, per_pass, dino_model, dino_size,
+                                       device, prompt_points)
+
     for pass_index in sorted(per_pass):
         paths = per_pass[pass_index]
         print(f"Segmenting pass {pass_index} ({len(paths)} frames) with SAM2...")
@@ -166,6 +186,12 @@ def run(
 
     print("Scoring the segmentation...")
     report = run_qc(frames_dir, p2_dir, sources=sources)
+    _check_prompts_are_covered(report, clicked or {}, prompts, per_pass, p2_dir)
+    # run_qc has already written qc.json, so anything added afterwards has to
+    # be written again or it exists only on the console -- which is where the
+    # prompt-coverage check spent its first two runs.
+    with open(p2_dir / "qc.json", "w") as f:
+        json.dump(report, f, indent=2)
 
     write_overlays(frames_dir, p2_dir, crop_boxes=all_boxes)
     write_area_plot(p2_dir, report)
@@ -177,6 +203,84 @@ def run(
     print(f"  artifacts + diagnostics in {p2_dir}")
 
     return report
+
+
+
+def _check_prompts_are_covered(report, clicked, fallback, per_pass, p2_dir) -> None:
+    """Did the mask actually grow to cover every point we prompted with?
+
+    None of the other checks can see undersegmentation. `plant_mask_free_of
+    _holder` only measures contamination *by the tool*, so a mask holding one
+    leaf of six passes it cleanly -- which is exactly what happened on
+    thistle2 pass 0, and it was read as success. A prompt that ends up outside
+    the very mask it seeded is direct evidence SAM2 kept only part of the
+    object.
+    """
+    outside, total = [], 0
+    for pass_index, paths in sorted(per_pass.items()):
+        prompts = clicked.get(pass_index, fallback)
+        if prompts is None or not getattr(prompts, "plant", None):
+            continue
+        if getattr(prompts, "space", "crop") != "full_frame":
+            continue           # crop-space points cannot be checked in full-frame masks
+        mask_path = p2_dir / "masks" / "plant" / f"{paths[0].stem}.png"
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            continue
+        height, width = mask.shape
+        for x, y in prompts.plant:
+            total += 1
+            if not (0 <= x < width and 0 <= y < height and mask[y, x] > 127):
+                outside.append((pass_index, int(x), int(y)))
+    if not total:
+        return
+    report["checks"]["mask_covers_its_own_prompts"] = {
+        "pass": not outside,
+        "detail": (f"{len(outside)} of {total} plant prompt(s) fall outside the mask they "
+                   f"seeded{': ' + str(outside) if outside else ''} -- a prompt outside its "
+                   "own mask means SAM2 kept only part of the plant"),
+    }
+    report["all_passed"] = all(c["pass"] for c in report["checks"].values())
+
+
+def _locate_per_pass(prompt_bank, per_pass, dino_model, dino_size, device,
+                     prompt_points: int = 3):
+    """Plant/holder prompts per capture pass, found by appearance.
+
+    Several plant points, not one: a single prompt on a small plant seeds one
+    leaf and SAM2 tracks only that leaf.
+    """
+    from pose_estimator.dino import DinoBackbone
+    from pose_estimator.prompt_seeds import load_prompt_bank, locate_prompts
+
+    vectors, labels = load_prompt_bank(prompt_bank, dino_model)
+    backbone = DinoBackbone(dino_model, device=device, size=dino_size)
+
+    print(f"  plant/holder prompts located by appearance from {prompt_bank}:")
+    located_by_pass = {}
+    for pass_index in sorted(per_pass):
+        first = per_pass[pass_index][0]
+        found = locate_prompts(backbone, cv2.imread(str(first)), vectors, labels,
+                               count=prompt_points)
+        if not found.get("plant"):
+            raise ValueError(
+                f"{prompt_bank} has no 'plant' examples, so there is nothing to seed "
+                "SAM2 with. Re-click it with pose-pick-prompts.")
+        located_by_pass[pass_index] = Prompts(
+            plant=list(found["plant"]),
+            holder=list(found.get("holder", [])),
+            # locate_prompts reads the FULL frame, so these are full-frame
+            # pixels. Leaving the default ("crop") is not a labelling detail:
+            # the coordinates get re-read as crop-relative and shifted by the
+            # crop origin, and -- worse -- the tracking crop then falls back to
+            # the colour prepass, which is the thing the bank exists to
+            # replace. Measured on thistle2: a correct prompt at (771, 607) on
+            # the plant became (1563, 607) on the plier handle.
+            space="full_frame",
+        )
+        detail = "  ".join(f"{k}={len(v)}x {v}" for k, v in found.items())
+        print(f"    pass {pass_index} ({first.stem})   {detail}")
+    return located_by_pass
 
 
 def main(argv: Optional[list] = None) -> None:
@@ -229,6 +333,20 @@ def main(argv: Optional[list] = None) -> None:
         "exists. Unlike --plant-point this works on multi-pass captures, where a single "
         "point cannot serve two passes with different first frames.",
     )
+    parser.add_argument("--prompt-bank", type=Path,
+                        help="p2/prompt_bank.npz from an earlier specimen's pose-pick-prompts. "
+                             "Locates the plant and the holder by appearance rather than "
+                             "by pixel coordinate, so one bank works across videos and "
+                             "poses. Use this whenever the pliers get tracked as the "
+                             "plant. Ignored if this workdir has its own clicked prompts.")
+    parser.add_argument("--dino-model", default="facebook/dinov3-vitb16-pretrain-lvd1689m",
+                        help="model for --prompt-bank; must match the one that built it")
+    parser.add_argument("--prompt-points", type=int, default=3,
+                        help="Plant prompts to place per pass from --prompt-bank. One is "
+                             "enough only when the plant fills the frame; on a small or "
+                             "distant plant a single prompt seeds one leaf and SAM2 "
+                             "tracks just that leaf.")
+    parser.add_argument("--dino-size", type=int, default=896)
     parser.add_argument("--device", default="cuda", help="torch device (cuda or cpu)")
     parser.add_argument(
         "--reuse-frames",
@@ -250,6 +368,10 @@ def main(argv: Optional[list] = None) -> None:
         device=args.device,
         reuse_frames=args.reuse_frames,
         prompts_file=args.prompts_file,
+        prompt_bank=args.prompt_bank,
+        dino_model=args.dino_model,
+        dino_size=args.dino_size,
+        prompt_points=args.prompt_points,
     )
 
 
