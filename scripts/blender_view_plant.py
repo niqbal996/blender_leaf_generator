@@ -16,7 +16,10 @@ Three ways to run it.
 
 What you get, as four collections:
 
-    plant_cloud    the labelled points, in their own colours
+    plant_cloud    the leaf (and unassigned) points, in their own colours
+    plant_root     the P4c root points, split out and drawn larger -- they are
+                   a couple of percent of the cloud and vanish when merged
+    plant_stem_cloud  the P4c stem points (the tissue, not the centreline)
     plant_stem     the stem centreline -- thick, white, unmistakable.
                    On a rosette (thistle, sugar beet) there is no stem: this
                    holds a single sphere at the crown where the leaves meet.
@@ -56,6 +59,12 @@ import numpy as np
 WORKDIR = ""
 
 STEM_RGBA = (1.0, 1.0, 1.0, 1.0)          # deliberately not a leaf colour
+
+# The organ colours P5 writes into structure.ply (cli/structure.py's ROOT_RGB
+# and STEM_RGB), normalised the way read_ply returns them. Used only to split
+# the cloud into separate objects -- the colours themselves come from the file.
+ROOT_RGB01 = (240 / 255.0, 140 / 255.0, 40 / 255.0)
+STEM_RGB01 = (160 / 255.0, 60 / 255.0, 200 / 255.0)
 TIP_RGBA = (0.06, 0.85, 0.30, 1.0)
 VOTED_TIP_RGBA = (1.0, 0.35, 0.85, 1.0)   # magenta: found in 2D, not by P5
 LEAF_RGBA = [
@@ -229,6 +238,16 @@ def collection(name):
     return made
 
 
+def _matches_colour(rgb, target, tolerance=1.5 / 255.0):
+    """Rows of `rgb` equal to `target`, within one 8-bit step.
+
+    P5 writes each organ as a flat colour, so an exact class test is a colour
+    test. The tolerance is there because the values round-trip through uint8
+    and back to float, not because the classes are fuzzy.
+    """
+    return np.all(np.abs(np.asarray(rgb) - np.asarray(target)) <= tolerance, axis=1)
+
+
 def add_point_cloud(xyz, rgb, radius, into, name="plant_cloud", material=None):
     mesh = bpy.data.meshes.new(f"{name}_points")
     mesh.from_pydata([tuple(p) for p in xyz], [], [])
@@ -357,7 +376,28 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True):
     tip_radius = stem_radius * 1.6
 
     if len(xyz):
-        add_point_cloud(xyz, rgb, point_radius, collection("plant_cloud"))
+        # Root and stem go into their own objects rather than being mixed into
+        # one cloud. They are a small share of the points -- 956 root of 56,607
+        # on thistle3, 1.7% -- so merged in they are invisible in practice and
+        # cannot be isolated, soloed or hidden. Root is drawn larger for the
+        # same reason.
+        if rgb is None:
+            add_point_cloud(xyz, rgb, point_radius, collection("plant_cloud"))
+        else:
+            is_root = _matches_colour(rgb, ROOT_RGB01)
+            is_stem = _matches_colour(rgb, STEM_RGB01)
+            rest = ~(is_root | is_stem)
+            if rest.any():
+                add_point_cloud(xyz[rest], rgb[rest], point_radius,
+                                collection("plant_cloud"))
+            if is_stem.any():
+                add_point_cloud(xyz[is_stem], rgb[is_stem], point_radius,
+                                collection("plant_stem_cloud"), name="plant_stem_cloud")
+            if is_root.any():
+                add_point_cloud(xyz[is_root], rgb[is_root], point_radius * 1.8,
+                                collection("plant_root"), name="plant_root")
+            print(f"[plant] cloud split: {int(rest.sum())} leaf/unassigned, "
+                  f"{int(is_stem.sum())} stem, {int(is_root.sum())} root")
 
     if len(stem) > 1:
         add_curve(stem, "plant_stem_line", STEM_RGBA, stem_radius, collection("plant_stem"))
@@ -436,7 +476,8 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True):
     print(f"[plant] origin: {graph.get('origin_definition', 'unknown')}")
     print(f"[plant] extent {extent:.3f}, stem radius {stem_radius:.4f}, "
           f"points {point_radius:.4f}")
-    print("[plant] collections: plant_cloud, plant_stem, plant_midribs, plant_tips")
+    print("[plant] collections: plant_cloud, plant_root, plant_stem_cloud, "
+          "plant_stem, plant_midribs, plant_tips")
     return {"points": len(xyz), "leaves": len(leaves), "stem_nodes": len(stem)}
 
 

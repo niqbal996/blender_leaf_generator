@@ -734,3 +734,384 @@ out-of-range indices are dropped explicitly rather than folded into class 0.
 `--no-normal-weighting` restores plain counting for A/B comparison, and every
 run reports how many points the weighting actually moved — reported, not
 asserted, since a run where it changes nothing is worth seeing.
+
+## 2026-08-26 — P2: the exposed root is tracked as its own SAM2 object
+
+The root kept vanishing from the reconstruction even after prompts were
+clicked on it. The instruction at the time — click the root as an extra
+`1` = plant point — was necessary but measurably insufficient:
+
+- thistle1's clicked prompts spanned y 468–900 and did reach the root, yet
+  the root was in the plant mask only 74/96 frames (pass 0) and 49/96
+  (pass 1) — under the ~86% silhouette agreement P4a demands, so the carve
+  deleted it. Occlusion and blur were both ruled out (the root band is
+  *less* occluded than the plant body, and the sharp pass was equally bad);
+  see DIAGNOSIS_root_loss.md.
+- the mechanism: all plant clicks seed **one** SAM2 object at frame 0, and
+  SAM2 keeps one temporal memory per object. That memory is dominated by the
+  object's large connected mass (foliage), so a disconnected blob — the root,
+  cut off by the clamp jaws — flickers out during propagation. No threshold
+  touches propagation flicker.
+
+**Decision:** `pose-pick-prompts` gains `[3] root`, a *tracking* category,
+not an output class. Root points seed `ROOT_ID = 3`, a third SAM2 object
+with its own memory — a single connected region, which is the case SAM2
+propagation is actually good at — and `segment_sequence` unions its mask
+into `masks/plant` at write time. P2's output contract (plant/holder/
+background) is unchanged, so nothing downstream moves; P4c's semantic root
+class is a different question and stays as it is. Old `prompts_clicked.json`
+files have no `root` key and load unchanged (empty root = the old two-object
+behaviour, exactly).
+
+Consequences that fell out of it:
+
+- **The tracking crop grows to contain clicked points**
+  (`solve_tracking_crop(include_points=…)`). The crop is sized from the
+  colour prepass's foliage blob and the root hangs below it, so a crop
+  sized from the blob alone can cut the root off. The window widens by the
+  clicked points' offset from the tracked centroid, reusing the existing
+  `padding_fraction` — no new constant.
+- **A root point outside the crop is fatal**, like a plant point and unlike
+  a holder point: the solver was told to contain it, so landing outside
+  means the window is wrong — and dropping it silently would re-create the
+  exact silent root loss this exists to fix.
+- **The prompt bank gains a `root` label.** Labels were already free
+  strings, so root clicks store and locate like any class. This is what
+  fixes transfer: a bank whose plant examples are all foliage places
+  foliage prompts — thistle2's three located prompts all sat at y 472–549,
+  none below the jaws, and its root left every phase. Appearance drift
+  (dirt on the root) is coverage, not a threshold: vectors are stored
+  individually and scored by best match, so clicking one dirty root adds an
+  example rather than diluting the clean one. If no patch out-scores the
+  other classes, no root prompt is placed and `root_tracked_below_the_jaws`
+  flags the pass — the fallback is one click.
+- `mask_covers_its_own_prompts` now checks root prompts against the plant
+  mask too (the union makes that the right mask to check).
+
+## 2026-08-26 — P2: a lost root object is re-acquired from the prompt bank
+
+The `[3] root` tracking object (previous entry) was necessary but not
+sufficient. Measured on thistle1 re-clicked with root prompts (4 per pass):
+the root object went **empty for 42 consecutive frames** in pass 0 (frame 54
+to the end -- 157° of arc, including the plier-opposite side where the root
+is fully visible) and for 8 frames in pass 1. Coverage 74/96 and 79/96,
+under P4a's ~86% floor, so the carve still deleted it: root 9.1% of 2D
+pixels, 0.0% of 3D points. The mechanism is SAM2's per-object memory
+decaying through the occlusion (the pliers cross in front once per
+rotation); whether the object is re-acquired afterwards is luck -- pass 1
+got lucky, pass 0 did not. The P2 tracking crop was ruled out: it is
+full-height (1080 of 1080) on this footage.
+
+**Decision:** after propagation, maximal runs of frames whose root mask is
+*exactly empty* (a binary condition, not a threshold) are scanned with the
+prompt bank's root examples (`best_patch`: same margin-against-rivals rule
+as prompt placement, restricted to the tracking crop). Each round, every
+empty run gets one new conditioning point -- its best not-yet-used
+positive-margin frame -- then propagation is re-run and the empty runs are
+recomputed. Iteration is not optional: a conditioning frame's repair
+reaches only ~5-7 neighbouring frames (measured: pass 1's 8-frame gap
+needed one seed; pass 0's 42-frame gap recovered just the seeded frame),
+so a long stretch converges by rounds as each recovery shrinks its run.
+DINO scores are cached per frame and each round consumes a scored
+candidate or stops, so the loop terminates. A run with no positive margin
+is left alone: that is what genuine occlusion looks like, and holder
+pixels already count as no-evidence downstream. Reseeds are logged to
+`p2/prompts.json` (`root_reseeds`) because they were placed by appearance
+matching rather than a human.
+
+Validated against the failed frames before wiring: the bank finds a
+positive-margin root patch on every probed lost frame (margins 0.21-0.34),
+and the hits land on root strands or the dirt-covered root ball -- checked
+visually, which also settled the "dirt changes the root's colour" worry:
+DINO features match the dirty root ball to dirty-root click examples
+without any tuning.
+
+**Trap found on the first live run: the reseed was silently a no-op without
+`predictor.add_all_frames_to_correct_as_cond = True`.** SAM2 treats a click
+on an already-tracked frame as a *correction* and stores its mask as a
+non-conditioning output; the next `propagate_in_video` recomputes that frame
+from the same decayed memory and discards the click. Verified the hard way:
+the reseed points landed on the root ball (checked visually), yet the
+re-propagated masks came back byte-identical -- 74/96 and 79/96, medians
+equal to three decimals -- including zero root area on the clicked frames
+themselves. The flag is SAM2's own switch for promoting correction clicks
+to conditioning frames.
+
+**Trap found on the second live run: appearance cannot tell the plant's
+dirt-covered root ball from the pile of dirt lying on the turntable.**
+Three of pass 0's nine re-seeds landed on that pile (it out-scored the true
+root on DINO margin in those frames) and SAM2 grew it into a 41k-147k px
+"root" against the true root's ~9k, blowing the mask-area QC to a 224%
+frame-to-frame jump. What separates the two is not appearance but
+*structure*: the jaws grip the real root, so its mask touches the holder or
+the foliage in the image, and a detached pile touches neither. The guard is
+applied at exactly one place -- where the risk enters: a machine-placed
+seed is accepted only if the mask SAM2 predicts for the click (returned by
+`add_new_points_or_box` before any propagation is spent) has a component
+attached to the plant or holder (`_attached_root_binary`); otherwise it is
+cleared on the spot and the run's next-best candidate is tried. Human
+clicks are never second-guessed, and the write path stays the plain union.
+An earlier draft also filtered every frame's root mask by attachment at
+write time and used attachment as the loop's presence test -- reverted:
+real root slivers whose jaw contact is occluded are detached in 2D, and
+that draft re-flagged tracked frames and burned a propagation round per
+rejected candidate. Cleaner captures (no loose dirt on the table) remain
+the better fix; this guard just keeps one bad frame from poisoning an
+unattended batch run.
+
+Two adjacent fixes in the same change:
+
+- **The root's mask cedes pixels the holder also claims**
+  (`root & ~holder` at write time). The jaws grip the root, so their shared
+  boundary is where SAM2 blurs; this run had 8.4% plant/holder overlap and
+  19% colour contamination. Holder pixels are occlusion (not
+  anti-evidence) in P4a/P4b, so ceding them costs the root nothing.
+**Withdrawn from this entry: moving a rosette's crown to the clamp line.**
+It shipped here and was reverted the same day, unvalidated -- see
+"2026-08-26 -- REVERTED: locating a rosette's crown at the clamp line".
+P5's rosette crown is the betweenness hot set's centre, as before.
+
+## 2026-08-26 — P1: still photos as a capture pass
+
+Stills are now a first-class input (`--photos <dir>`, one directory per
+pass, mixable with `--video`). The whole integration is at P1: photos are
+copied/resized into `p1/frames/frame_XXXX.jpg` and registered in
+`p1/sources.json`, after which no later phase can tell a photo capture from
+a video one. Nothing downstream changed.
+
+**Filename order is capture order.** SAM2 propagates frame to frame and P3
+fits a circle to the camera centres; both assume consecutive frames are
+neighbouring angles. Stills carry no other ordering, and a camera's
+sequential numbering supplies it for free.
+
+**No sharpest-frame selection, by necessity.** A video gives P1 ~30 frames
+per angular bin to choose from; a photo directory has exactly one shot per
+angle. So each photo's sharpness is measured (the same
+variance-of-Laplacian P1 uses on video, at a common 1600px scale so numbers
+compare across sessions) and outliers are *named* rather than dropped:
+culling a soft photo also widens the angular gap `full_rotation_covered`
+measures, and that trade is the operator's to make. On
+`/mnt/d/Turn_table_plant_scans/test_weed_2`, 80 photos scored a median of
+10.3 with one shot at 5.1.
+
+**Photos are resized to a 1920px long edge by default**
+(`--photo-max-edge 0` opts out). This matches the video path that every
+downstream default was fitted against, and at current settings discards
+nothing: SAM2 resizes its input to 1024, P3 caps SIFT at
+`--max-image-size` (1920), P4b trains at `--downsample` (2). What 24 MP
+frames do change is cost -- 11x the pixels through P4a's carve and P4b's
+rasteriser, a VRAM wall rather than a slow run on an 8 GB card.
+
+Intrinsics are safe at either setting, which was checked rather than
+assumed: COLMAP records the camera at the image's true dimensions even when
+`max_image_size` makes it extract features on a smaller internal copy
+(verified with pycolmap on these photos -- 6000x4000 in, 6000x4000 camera),
+so full-size frames are never silently mismatched against their full-size
+masks.
+
+### Measured on test_weed_2 (80 photos, 24 MP, a different specimen and rig
+### session from any video capture)
+
+P2 seeded itself from thistle1's `prompt_bank.npz` -- no clicks -- and
+tracked the plant, not the pliers: 0.08% holder contamination, 0.31%
+plant/holder overlap, and the overlays show clean plant/tool separation
+across the orbit. That is the batch-automation claim holding across capture
+*style*, not just across specimens.
+
+Two QC checks fail on this specimen and both are false alarms worth
+recording, because they are exactly the sort of thing that must not gate an
+unattended batch (and do not -- see the gate entry below):
+
+- `area_temporally_smooth` (44% worst jump): a two-leaf seedling's
+  projected area genuinely halves between broad-side (26k px) and edge-on
+  (12k px) views. The 15% limit was fitted on larger plants; foreshortening
+  dominates on a small flat one. The jumps oscillate rather than stepping
+  once, which is the signature of real geometry rather than tracking loss.
+- `root_tracked_below_the_jaws` (5/80 frames): this seedling has no exposed
+  root -- the jaws grip at the base. The bank correctly placed no root
+  prompt (`root=0x`), since no patch out-scored the rivals.
+
+### P3 on those same photos: 22/80 registered, and the cause is exposure
+
+The ingest is sound and P2 is clean, but this photo set does not solve.
+Sharpness measured *inside the region P3 actually extracts features from*
+(the rotating-region mask, not the whole frame, which is mostly black
+backdrop) separates the two groups cleanly:
+
+| frames | median Laplacian variance in the P3 mask |
+|---|---|
+| registered (22) | 23.1 |
+| unregistered (58) | 12.6 |
+
+EXIF says why: **0.5 s at f/10, ISO 100**, shots 4 s apart -- a manual
+rotate-and-shoot with a half-second exposure. Anything still settling after
+the turntable is turned by hand, or any shake from pressing the shutter,
+smears the frame. The registered frames come in arcs (19-29, 44-46, 59-65)
+with a 70 deg gap, which is what a few lucky still moments look like.
+
+Two things this is *not*, both checked before blaming exposure:
+
+- **Not misfocus.** The plant is the sharpest region in every frame sampled
+  (93-121 against 15-38 for the table), so focus was on the subject. Only
+  whole-frame sharpness looks bad, because the plant is 0.8% of the frame.
+- **Not the camera moving.** Backdrop corners differ by 1-8 DN across
+  photos 0-78, so the rig was static as the method requires. (`DSC_0319`
+  differs by 74 DN and is numbered outside the 0222-0316 run -- a stray
+  shot after the camera moved, and it should be deleted rather than
+  ingested.)
+
+Capture-side fixes, in order of leverage: use the self-timer or a remote so
+the shutter press cannot shake the rig, and let the table settle before
+firing; raise ISO to 800-1600 and open to f/8 to buy a 1/15-1/30 s exposure
+(this sensor is clean there, and SIFT cares far more about smear than about
+noise); add light if you have it. Keep f/8-f/11 for depth of field -- the
+f/16 frames later in the set trade sharpness for it on a 24 MP APS-C.
+
+Also: the turntable in this set carries the same **plain checkerboard** that
+defeated thistle2's solve. It is worth replacing with a random,
+non-repeating texture (speckle, torn newsprint) rather than removing
+outright -- the plant is a small, smooth, feature-poor subject, so most of
+P3's usable features come from whatever the turntable surface carries, and
+a non-periodic pattern gives abundant features that cannot alias.
+
+## 2026-08-26 — Bank paths resolve from a workdir; --skip-to judges what it skipped
+
+Two usability failures from one real command, both fixed where they happen
+rather than documented around.
+
+**1. `--seed-bank <workdir>` died as `IsADirectoryError` from inside
+`numpy.load`, after the DINO weights had already loaded.** Pointing at the
+run directory is the natural mistake: it is the path already on the command
+line from the run that produced the bank, and both banks live at a fixed
+place inside one. `banks.resolve_bank` now accepts either the `.npz` or its
+run directory, prints the substitution rather than making it silently (the
+wrong specimen's workdir is a mistake worth seeing), and is called *before*
+the backbone loads. It also names the specific error for a missing path, a
+directory with no bank in it, and -- the quiet one -- being handed the
+*other* bank: both are `.npz` holding `vectors`/`labels`, so a prompt bank
+passed as `--seed-bank` loads cleanly and then classifies leaves as
+"plant".
+
+**2. `--skip-to` skipped the QC gate along with the phases.** The same
+command reached P4c on a workdir whose P3 had failed its circle fit
+(2.14% deviation, a 130 deg angular gap, 16/27 frames registered) and whose
+`p4/` and `p4b/` did not exist at all -- the gate added earlier only fires
+for phases the invocation actually runs. Skipping in partway is precisely
+when the phases below are being taken on trust, so their QC on disk is now
+gated before the first phase executes. The same command now stops in a
+second with the circle fit named, instead of after a model load and a pass
+over the frames.
+
+Also: `--skip-to`/`--stop-after` given twice now print which value won. The
+command that prompted this had `--skip-to p3 --skip-to p4c`, and silently
+took p4c -- which is why P4a and P4b never ran.
+
+## 2026-08-26 — Why thistle spines are missing, and why no threshold fixes it
+
+Asked whether the smoothed-out leaf prickles are an inference problem in
+P2 or P4c. They are neither: they are a resolution budget, and the numbers
+say where it is spent. Measured on thistle1 (`frame_0140`):
+
+| stage | detail it can represent |
+|---|---|
+| **SAM2 mask cell (P2)** | **4.22 px** |
+| P4a hull voxel, projected | 2.82 px |
+| DINOv3 patch (P4c) | 16 px -- but see below |
+| a thistle spine | ~4-10 px |
+
+**P4c is not involved.** It assigns organ labels to points that already
+exist and cannot move or add geometry, so its (much coarser) patches
+affect only where "leaf" stops and "stem" starts. `--dino-size` sharpens
+that boundary; `--stride` is frame subsampling, not spatial resolution.
+
+**P2 is the bottleneck, and it is architectural.** SAM2's mask decoder
+emits 256x256 whatever it is given, and P2 stretches that over the
+tracking crop. The crop is 1080 px, so one mask cell covers 4.22 image
+pixels -- about one spine. Overlaying the mask contour on the photograph
+shows exactly that: the boundary follows the leaf *lobes* correctly and
+cuts straight across the bases of the spines.
+
+**The crop is the only real lever, and it is nearly exhausted.** Cell size
+is crop/256, and the crop cannot be smaller than the subject, so the gain
+available is whatever padding wastes. Tested by re-running P2 at
+`--roi-padding 0.12` against 0.45:
+
+| | crop | px/cell | boundary complexity (P^2/4piA) |
+|---|---|---|---|
+| default 0.45 | 1080, 1080 | 4.22 | 7.12 |
+| tight 0.12 | 1080, 977 | 4.22 / 3.82 | 7.47 |
+
+A 5% gain in boundary detail, still no spines, and two holder prompts fell
+outside the crop. Pass 0 did not shrink at all -- it is clamped by the
+frame height. The default is therefore left alone: the cost is real and
+the gain is not.
+
+Note the interaction with root clicks: the crop must contain the root
+(`solve_tracking_crop(include_points=...)`), and the root hangs well below
+the foliage, so including it enlarges the span and *costs* foliage
+resolution. That trade is settled in the root's favour -- a missing root
+loses an organ, missing spines lose decoration.
+
+**Even a perfect mask would not carry spines all the way through.** The
+carve keeps a voxel only where it is inside the silhouette in 86% of the
+views that judged it. A spine is a thin protrusion, sharp from a few
+angles and edge-on or occluded from most -- the same geometry that had the
+root sitting at 0.56 agreement and being deleted. `hull_vs_mask` diagnostics
+confirm the foliage silhouette itself is reproduced well (IoU 0.81 on
+frame_0114); essentially all of the 19% the hull misses is the root, not
+the leaf margins.
+
+**Conclusion: not worth chasing at the current architecture.** Spines
+contribute nothing to what P5/P6 actually measure -- midribs, insertion
+angles, arclengths, width profiles. Making them appear would need new
+machinery (per-leaf SAM2 crops, or a guided-filter/matting refinement that
+snaps the boundary to image gradients), and that means new tunables in a
+pipeline that has deliberately removed them. Recorded here so the
+measurement is not repeated.
+
+## 2026-08-26 — REVERTED: locating a rosette's crown at the clamp line
+
+Attempted and backed out the same day. Recorded because the *problem* is
+real and someone will try this again.
+
+**The problem.** `find_clamp_height` looks for the band of stem the pliers
+hid, and occlusion-aware carving retired that signal: a holder pixel now
+carries no evidence rather than carving the plant away, so the tissue
+behind the jaws is reconstructed and the gap closes. thistle3 and thistle4
+both report "no clamp gap", so the rosette crown falls back to the
+leaf-attachment centroid -- which sat 28% and 48% of plant height above the
+base on those two runs. The crown *should* be where the jaws grip.
+
+**What was tried.** Two pieces: `clamp_height_from_holder`, scoring each
+point by the fraction of views in which it projects onto the holder mask
+and taking the peak height band; and a rosette crown placed at z=0 with x/y
+from the centroid of shoot tissue in a thin band around that height.
+
+**Why it was reverted.** The x/y derivation is wrong by construction. At
+the clamp line there is almost no shoot tissue -- that is where the plant
+emerges -- so the band collects whatever droops to that height, which on a
+spreading rosette is outer leaf tips far off-axis. Their centroid is a
+point in open space, and that is what it produced. `shoot` also excludes
+root points, so the tissue actually at the clamp was not even in the set.
+
+**What survived the test and is worth keeping if this is retried.** The
+holder-score signal itself is clean and needs no threshold: on thistle3 the
+mean score decays monotonically from 0.125 in the lowest height band to
+0.000 above 40% of plant height, and it located a clamp on both specimens
+where the gap test found none (thistle3 z=0.076, thistle4 z=0.307, against
+plant heights of 1.21 and 3.49). It is also robust to bad organ labels,
+which the root-junction alternative is not -- thistle4's transferred seed
+bank put "root" on the plier jaws, which would have placed the crown in
+mid-air.
+
+**If retried:** take the crown from the gripped tissue in all three
+coordinates -- a score-weighted centroid of the peak band, weighting each
+point by its own holder fraction -- rather than from a height band over a
+tissue class. And validate on a scratch copy of a workdir: this went out
+after a partial run on a live one, which left `stem_graph.json` rewritten
+and `p5.json` stale.
+
+**Also still open, and not caused by this change:** thistle4's plant frame
+is tilted, because `solve_up_direction` resolves "up" against the table
+plane and that specimen is held nearly horizontal. Confirmable by checking
+whether the tilt predates any of this on a stashed tree.

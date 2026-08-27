@@ -118,6 +118,8 @@ def test_round_trip_through_the_file(tmp_path):
     session.add(20, 20)
     session.set_class(1)
     session.add(40, 30)
+    session.set_class(2)
+    session.add(22, 38)
     session.step_pass(1)
     session.set_class(0)
     session.add(31, 26)
@@ -128,10 +130,26 @@ def test_round_trip_through_the_file(tmp_path):
     assert sorted(loaded) == [0, 1]
     assert loaded[0].plant == [(20, 20)]
     assert loaded[0].holder == [(40, 30)]
+    assert loaded[0].root == [(22, 38)]
     assert loaded[1].plant == [(31, 26)]
+    assert loaded[1].root == []
     # Full-frame is what makes the file convertible once a crop exists; a file
     # in crop coordinates could not be reinterpreted if the crop changed.
     assert loaded[0].space == "full_frame"
+
+
+def test_a_file_from_before_the_root_category_still_loads(tmp_path):
+    """Root points are additive: prompt files clicked before [3] existed have
+    no "root" key and must keep loading, with the old two-object behaviour."""
+    path = tmp_path / "prompts_clicked.json"
+    path.write_text(json.dumps({
+        "version": 1, "space": "full_frame",
+        "passes": {"0": {"frame": "frame_0000", "plant": [[20, 20]], "holder": [[40, 30]]}},
+    }))
+
+    loaded = load_prompts(path)
+    assert loaded[0].plant == [(20, 20)]
+    assert loaded[0].root == []
 
 
 def test_a_pass_without_a_plant_point_is_rejected_on_load(tmp_path):
@@ -186,6 +204,23 @@ def test_a_holder_point_outside_the_crop_is_dropped():
     assert converted.holder == []
 
 
+def test_root_points_convert_like_plant_points():
+    prompts = Prompts(plant=[(952, 476)], root=[(970, 900)], space="full_frame")
+    converted = prompts.to_crop((408, 0, 1488, 1080))
+
+    assert converted.root == [(562, 900)]
+
+
+def test_a_root_point_outside_the_crop_is_fatal():
+    """Unlike the holder, a dropped root point silently re-creates the root
+    loss this category exists to fix -- the crop solver is told to contain
+    it, so falling outside means the window is wrong, not the click."""
+    prompts = Prompts(plant=[(952, 476)], root=[(952, 1500)], space="full_frame")
+
+    with pytest.raises(ValueError, match="root prompt"):
+        prompts.to_crop((408, 0, 1488, 1080))
+
+
 # --------------------------------------------------------------------------
 # The continuity tracker
 # --------------------------------------------------------------------------
@@ -206,6 +241,35 @@ def test_nearest_component_prefers_continuity_over_area():
     assert tracked is not None
     assert tracked[50, 30]        # on the small, near blob
     assert not tracked[50, 150]   # not on the large, far one
+
+
+def test_tracking_crop_grows_to_contain_clicked_points(tmp_path):
+    """The crop is sized from the colour prepass's foliage blob, and the
+    exposed root hangs below the jaws outside that blob. Without growth the
+    root click lands outside the window and `to_crop` (correctly) refuses to
+    run -- so the solver must widen the window to what was clicked."""
+    import cv2
+
+    from pose_estimator.segmentation import solve_tracking_crop
+
+    frame = np.zeros((300, 300, 3), np.uint8)
+    frame[40:80, 60:100] = (0, 200, 0)  # the foliage blob the prepass sees
+    paths = []
+    for i in range(3):
+        path = tmp_path / f"frame_{i:04d}.jpg"
+        cv2.imwrite(str(path), frame)
+        paths.append(path)
+
+    root_click = (80, 250)  # far below the blob, like a root below the jaws
+    without = solve_tracking_crop(paths)
+    with_root = solve_tracking_crop(paths, include_points=[root_click])
+
+    def contains(box, point):
+        x0, y0, x1, y1 = box
+        return x0 <= point[0] < x1 and y0 <= point[1] < y1
+
+    assert not contains(without.boxes[0], root_click)
+    assert contains(with_root.boxes[0], root_click)
 
 
 def test_nearest_component_returns_none_on_an_empty_mask():

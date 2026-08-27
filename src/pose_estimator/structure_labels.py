@@ -462,6 +462,66 @@ def instance_by_tips(
 # --------------------------------------------------------------------------
 
 
+def crown_from_root(root_points, foliage_points, voxel: float,
+                    top_fraction: float = 0.05, bin_voxels: float = 6.0):
+    """The crown: the lowest foliage sitting directly above the root.
+
+    A rosette has no stem to trace, but it does have a root, and the jaws grip
+    exactly where the root ends and the shoot begins. That band is *occluded*
+    -- the tool is in front of it from every angle -- so the junction itself is
+    never reconstructed and cannot be measured directly. What can be measured
+    is the tissue on either side of the hole, and the first foliage above it is
+    the closest thing to the crown the data contains.
+
+    Measured on thistle3, in a 6-voxel column about the root's own axis:
+
+        z 0.150-0.330   root                <- root body
+        z 0.330-0.360   nothing at all      <- the pliers
+        z 0.360-0.420   stem, then leaf     <- foliage bottom
+
+    Three details, each of which the data forced:
+
+    * **The column matters.** A rosette's outer leaves droop well below the
+      crown -- thistle3 has leaf tissue down at z=0.087, far under the root's
+      top -- so "the lowest foliage" without a horizontal restriction returns a
+      blade tip off to one side. Confining the search to a column about the
+      root's axis is what makes "above the root" mean above *the root*.
+
+    * **Unassigned tissue is excluded** by the caller passing only foliage that
+      P5 actually attached to a leaf, plus stem. The tissue P4c labels leaf but
+      P5 attaches to nothing sits *inside* the root band on thistle3 (z
+      0.150-0.330, interleaved with root), so leaving it in lets it spoof a
+      foliage bottom 0.2 units too low.
+
+    * **The root's top is a quantile**, not its highest point: thistle3 has a
+      stray root point at z=0.494, inside the band the jaws occlude, and a max
+      would put the floor above the foliage it is meant to sit under.
+
+    Neither knob is delicate. Across bin radii of 4-12 voxels and
+    `top_fraction` of 0.05-0.10 the crown moved from z=0.386 to z=0.368 and
+    settled on the same point, against a plant 1.2 units tall.
+
+    Returns None when there is no root to stand on, or nothing above it in the
+    column, leaving the caller's own fallback in charge.
+    """
+    if root_points is None or len(root_points) == 0 or len(foliage_points) == 0:
+        return None
+
+    heights = root_points[:, 2]
+    root_top = float(np.quantile(heights, 1.0 - top_fraction))
+    upper = root_points[heights >= root_top]
+    if not len(upper):
+        return None
+    centre_x, centre_y = upper[:, 0].mean(), upper[:, 1].mean()
+
+    across = np.hypot(foliage_points[:, 0] - centre_x, foliage_points[:, 1] - centre_y)
+    above = (across <= voxel * bin_voxels) & (foliage_points[:, 2] > root_top)
+    if not above.any():
+        return None
+    candidates = foliage_points[above]
+    return candidates[int(np.argmin(candidates[:, 2]))]
+
+
 def root_anchor(root_points: np.ndarray, shoot_points: np.ndarray):
     """Where the root meets the shoot: the shoot point closest to the root.
 
@@ -928,7 +988,20 @@ def build_from_labels(
     # no thistle has.
     rosette = architecture == "rosette"
     if rosette and instancing.base is not None:
-        stem_path = np.asarray(instancing.base.center, float).reshape(1, 3)
+        # Prefer the root->shoot walk: it names the anatomical base directly.
+        # The betweenness centre is where the *leaves* meet, which stays the
+        # depth field's zero but is a poorer answer for "where does this plant
+        # come out of the ground" -- and it is all there is when the specimen
+        # was clamped above its root, or the root was never labelled.
+        # Foliage means tissue P5 actually attached to a leaf, plus stem --
+        # not every leaf-labelled point. The unattached remainder lies in the
+        # root band and would masquerade as the foliage bottom.
+        attached = leaf_points[instancing.owner >= 0] if len(leaf_points) else leaf_points
+        foliage = np.vstack([attached, stem_points]) if len(stem_points) else attached
+        crown = crown_from_root(root_points, foliage, voxel)
+        if crown is None:
+            crown = instancing.base.center
+        stem_path = np.asarray(crown, float).reshape(1, 3)
 
     # Persistence says how many leaves there are, and does that well. Where the
     # tip *is* is a different question, and geodesic depth answers it badly: on

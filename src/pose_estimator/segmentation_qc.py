@@ -239,7 +239,7 @@ def run_qc(
                     for p, s in sorted(root_summary.items()))
                 + (f" -- pass(es) {', '.join(starved)} lost the root. SAM2 was seeded on "
                    f"foliage only; the jaws cut the root into a separate blob that needs "
-                   f"its own prompt (pose-pick-prompts, click the root with 1=plant)."
+                   f"its own tracked object (pose-pick-prompts, click the root with 3=root)."
                    if starved else "")
             ) if root_summary else "no holder mask -- cannot locate the jaws",
         },

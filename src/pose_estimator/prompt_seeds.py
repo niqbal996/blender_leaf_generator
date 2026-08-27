@@ -207,6 +207,67 @@ def locate_prompts(backbone, bgr: np.ndarray, vectors: np.ndarray,
     return out
 
 
+def best_patch(backbone, bgr: np.ndarray, vectors: np.ndarray, labels: Sequence[str],
+               name: str,
+               within: Optional[Tuple[int, int, int, int]] = None,
+               exclude_border: float = 0.02) -> Optional[Tuple[int, int, float]]:
+    """The single best patch for class `name` by margin, or None.
+
+    Same rules as `locate_prompts` -- margin against every other bank class
+    plus the frame-border background, frame edge excluded -- reduced to one
+    class and one answer. P2 uses it to re-acquire the root object when SAM2
+    loses it mid-sequence: candidate frames are scanned and the best positive
+    margin wins, which is a rank rule with nothing to tune. Returns None when
+    no patch out-scores the rivals, which is the honest answer on a frame
+    where the class is occluded.
+
+    `within` restricts the search to a full-frame pixel box -- the tracking
+    crop, because a conditioning point outside the crop cannot be handed to
+    SAM2 at all.
+    """
+    features = backbone.features(bgr)
+    grid = backbone.grid
+    height, width = bgr.shape[:2]
+    similarity = features @ vectors
+
+    classes = list(dict.fromkeys(labels))
+    if name not in classes:
+        return None
+    best_of: Dict[str, np.ndarray] = {}
+    for cls in classes:
+        columns = [i for i, other in enumerate(labels) if other == cls]
+        best_of[cls] = similarity[:, columns].max(axis=1)
+
+    edge = max(int(grid * exclude_border), 1)
+    keep = np.zeros((grid, grid), bool)
+    keep[edge:grid - edge, edge:grid - edge] = True
+    allowed = keep.ravel()
+    background = _border_background(features, similarity, ~allowed)
+
+    rivals = [best_of[o] for o in classes if o != name]
+    if background is not None:
+        rivals.append(background)
+    margin = best_of[name] - (np.max(np.stack(rivals), axis=0) if rivals else 0.0)
+
+    if within is not None:
+        x0, y0, x1, y1 = within
+        cx = (np.arange(grid) + 0.5) / grid * width
+        cy = (np.arange(grid) + 0.5) / grid * height
+        inside = ((cy[:, None] >= y0) & (cy[:, None] < y1)
+                  & (cx[None, :] >= x0) & (cx[None, :] < x1))
+        allowed = allowed & inside.ravel()
+    if not allowed.any():
+        return None
+
+    field = np.where(allowed, margin, -np.inf)
+    flat = int(np.argmax(field))
+    value = float(field[flat])
+    if not np.isfinite(value) or value <= 0:
+        return None
+    gy, gx = divmod(flat, grid)
+    return (int((gx + 0.5) / grid * width), int((gy + 0.5) / grid * height), value)
+
+
 def save_prompt_bank(path: Union[str, Path], vectors: np.ndarray, labels: Sequence[str],
                      model: str, size: int) -> Path:
     path = Path(path)

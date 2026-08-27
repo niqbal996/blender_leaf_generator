@@ -4,6 +4,14 @@ its holder in every frame, via SAM2 video propagation.
     pose-segment --video /path/DSC_0009.MOV --workdir runs/plant_9/ \\
         --checkpoint checkpoints/sam2.1_hiera_large.pt
 
+Still photos work too -- one directory per capture pass, filenames in
+capture order around the turntable:
+
+    pose-segment --photos /path/plant_9_shots/ --workdir runs/plant_9/
+
+Everything downstream reads p1/frames + p1/sources.json and cannot tell
+which kind of capture produced them.
+
 Writes into <workdir>:
     p1/frames/frame_XXXX.jpg     sharpest frame per angular bin
     p2/masks/plant/*.png         binary silhouettes, full-frame coords
@@ -28,7 +36,7 @@ import cv2
 from pathlib import Path
 from typing import Optional, Tuple
 
-from pose_estimator.frames import extract_sharpest_frames
+from pose_estimator.frames import extract_sharpest_frames, ingest_photos
 from pose_estimator.segmentation import Prompts, segment_sequence
 from pose_estimator.segmentation_qc import run_qc, write_area_plot, write_overlays
 
@@ -44,11 +52,14 @@ def run(
     workdir: Path,
     checkpoint: Path,
     video_paths: Optional[list] = None,
+    photo_dirs: Optional[list] = None,
+    photo_max_edge: int = 1920,
     num_frames: int = 96,
     use_roi: bool = True,
     roi_padding: float = 0.45,
     plant_point: Optional[Tuple[int, int]] = None,
     holder_point: Optional[Tuple[int, int]] = None,
+    root_point: Optional[Tuple[int, int]] = None,
     device: str = "cuda",
     reuse_frames: bool = False,
     prompts_file: Optional[Path] = None,
@@ -72,13 +83,23 @@ def run(
         print(f"Reusing {len(existing)} frames already in {frames_dir}")
         if sources_file.exists():
             sources = json.loads(sources_file.read_text())
-    elif video_paths:
+    elif video_paths or photo_dirs:
+        # One pass per source, whichever kind it is: a video is sampled down
+        # to its sharpest frame per angular bin, a photo directory is already
+        # one shot per angle and is taken as it stands. Everything after this
+        # point sees only frame_XXXX.jpg + sources.json and cannot tell which
+        # was which.
         groups = []
-        for index, video in enumerate(video_paths):
+        for index, source in enumerate(list(video_paths or []) + list(photo_dirs or [])):
             start = sum(len(g) for g in groups)
-            print(f"Pass {index}: sharpest of {num_frames} angular bins from {video.name}...")
-            written = extract_sharpest_frames(video, frames_dir, target_frame_count=num_frames,
-                                              start_index=start)
+            if source.is_dir():
+                print(f"Pass {index}: still photos from {source.name}/...")
+                written = ingest_photos(source, frames_dir, start_index=start,
+                                        max_edge=photo_max_edge)
+            else:
+                print(f"Pass {index}: sharpest of {num_frames} angular bins from {source.name}...")
+                written = extract_sharpest_frames(source, frames_dir, target_frame_count=num_frames,
+                                                  start_index=start)
             print(f"  wrote {len(written)} frames (frame_{start:04d} onward)")
             groups.append(written)
             for path in written:
@@ -86,11 +107,12 @@ def run(
         sources_file.parent.mkdir(parents=True, exist_ok=True)
         sources_file.write_text(json.dumps(sources, indent=2))
     elif existing:
-        print(f"No --video given; using the {len(existing)} frames already in {frames_dir}")
+        print(f"No --video/--photos given; using the {len(existing)} frames already in {frames_dir}")
         if sources_file.exists():
             sources = json.loads(sources_file.read_text())
     else:
-        raise FileNotFoundError(f"No --video given and no frames found in {frames_dir}")
+        raise FileNotFoundError(
+            f"No --video or --photos given and no frames found in {frames_dir}")
 
     if not sources:
         sources = {p.stem: 0 for p in sorted(frames_dir.glob("frame_*.jpg"))}
@@ -111,17 +133,19 @@ def run(
         clicked = load_prompts(prompts_file)
 
     prompts = None
-    if plant_point or holder_point:
+    if plant_point or holder_point or root_point:
         if clicked:
             raise ValueError(
-                f"--plant-point/--holder-point conflict with the clicked prompts in "
+                f"--plant-point/--holder-point/--root-point conflict with the clicked prompts in "
                 f"{prompts_file}. Use one or the other.")
         prompts = Prompts(
             plant=[plant_point] if plant_point else [],
             holder=[holder_point] if holder_point else [],
+            root=[root_point] if root_point else [],
         )
         if not prompts.plant:
-            raise ValueError("--holder-point given without --plant-point; the plant prompt is required")
+            raise ValueError("--holder-point/--root-point given without --plant-point; "
+                             "the plant prompt is required")
 
     # One SAM2 session per pass. Propagation carries temporal memory between
     # consecutive frames, so running it across a cut between two videos would
@@ -148,13 +172,27 @@ def run(
     # seeded on: two elevations show the plant in different places, so one
     # located point cannot serve both.
     if prompt_bank is not None:
+        from pose_estimator.banks import resolve_bank
+
+        # Resolved even when it will be ignored below: a path that names the
+        # wrong thing is worth hearing about now rather than on the next run
+        # where nothing overrides it.
+        prompt_bank = resolve_bank(prompt_bank, "--prompt-bank")
         if clicked:
             print(f"  ignoring {prompt_bank}: this workdir has its own clicked prompts")
-        elif plant_point or holder_point:
-            print(f"  ignoring {prompt_bank}: --plant-point/--holder-point given")
+        elif plant_point or holder_point or root_point:
+            print(f"  ignoring {prompt_bank}: --plant-point/--holder-point/--root-point given")
         else:
             clicked = _locate_per_pass(prompt_bank, per_pass, dino_model, dino_size,
                                        device, prompt_points)
+
+    # The bank that re-acquires a lost root object mid-sequence. Explicit
+    # --prompt-bank wins; otherwise the bank pose-pick-prompts wrote next to
+    # the clicked coordinates. Loaded lazily -- the DINO weights only load if
+    # a root actually goes missing.
+    reseed_bank = prompt_bank if prompt_bank is not None else (p2_dir / "prompt_bank.npz")
+    reacquire = (_root_reacquirer(reseed_bank, dino_model, dino_size, device)
+                 if Path(reseed_bank).exists() else None)
 
     for pass_index in sorted(per_pass):
         paths = per_pass[pass_index]
@@ -168,6 +206,7 @@ def run(
             roi_padding=roi_padding,
             device=device,
             frame_paths=paths,
+            reacquire_root=reacquire,
         )
         combined_stats.extend(result["per_frame"])
         crops[str(pass_index)] = result["crop"]
@@ -228,7 +267,10 @@ def _check_prompts_are_covered(report, clicked, fallback, per_pass, p2_dir) -> N
         if mask is None:
             continue
         height, width = mask.shape
-        for x, y in prompts.plant:
+        # Root prompts are checked against the same plant mask: the tracked
+        # root object is unioned into it, so a root prompt outside the plant
+        # mask means the root object failed to attach.
+        for x, y in list(prompts.plant) + list(getattr(prompts, "root", [])):
             total += 1
             if not (0 <= x < width and 0 <= y < height and mask[y, x] > 127):
                 outside.append((pass_index, int(x), int(y)))
@@ -241,6 +283,40 @@ def _check_prompts_are_covered(report, clicked, fallback, per_pass, p2_dir) -> N
                    "own mask means SAM2 kept only part of the plant"),
     }
     report["all_passed"] = all(c["pass"] for c in report["checks"].values())
+
+
+def _root_reacquirer(prompt_bank, dino_model, dino_size, device):
+    """A lazy `(bgr, crop_box) -> (x, y, margin) or None` root locator.
+
+    Everything heavy -- the bank file, the DINO weights -- loads on the first
+    call, which only happens when the root object actually loses a stretch of
+    frames. A bank without root examples, or DINO weights that cannot load
+    (gated repo, no token), degrade to "no re-acquisition" with a printed
+    note rather than failing the run: the segmentation itself never needed
+    DINO.
+    """
+    holder = {}
+
+    def locate(bgr, box):
+        if "fn" not in holder:
+            holder["fn"] = None
+            try:
+                from pose_estimator.dino import DinoBackbone
+                from pose_estimator.prompt_seeds import best_patch, load_prompt_bank
+
+                vectors, labels = load_prompt_bank(prompt_bank, dino_model)
+                if "root" not in labels:
+                    print(f"  {prompt_bank} has no root examples -- a lost root cannot "
+                          "be re-acquired. Re-click with pose-pick-prompts ([3] = root).")
+                else:
+                    backbone = DinoBackbone(dino_model, device=device, size=dino_size)
+                    holder["fn"] = lambda b, bx: best_patch(
+                        backbone, b, vectors, labels, "root", within=bx)
+            except (Exception, SystemExit) as exc:
+                print(f"  root re-acquisition unavailable ({exc}) -- continuing without it")
+        return holder["fn"](bgr, box) if holder["fn"] else None
+
+    return locate
 
 
 def _locate_per_pass(prompt_bank, per_pass, dino_model, dino_size, device,
@@ -269,6 +345,11 @@ def _locate_per_pass(prompt_bank, per_pass, dino_model, dino_size, device,
         located_by_pass[pass_index] = Prompts(
             plant=list(found["plant"]),
             holder=list(found.get("holder", [])),
+            # Root examples in the bank place a root prompt the same way. A
+            # bank whose plant examples are all foliage never seeds the root
+            # -- measured on thistle2, all 3 located prompts landed at
+            # y 472-549, none below the jaws, and the root left every phase.
+            root=list(found.get("root", [])),
             # locate_prompts reads the FULL frame, so these are full-frame
             # pixels. Leaving the default ("crop") is not a labelling detail:
             # the coordinates get re-read as crop-relative and shifted by the
@@ -290,6 +371,18 @@ def main(argv: Optional[list] = None) -> None:
                         help="Turntable video(s). Give several to merge capture passes at "
                              "different elevations into one workdir; each is tracked separately "
                              "and they are solved together in P3. Omit to reuse existing frames.")
+    parser.add_argument("--photos", type=Path, nargs="+", metavar="DIR",
+                        help="Directory of still photos instead of (or alongside) --video, one "
+                             "directory per capture pass. Filename order must be capture order "
+                             "around the turntable. Photos are used as they are -- there is no "
+                             "redundancy to pick a sharpest frame from, so cull hopeless shots "
+                             "yourself; each one's sharpness is printed on ingest.")
+    parser.add_argument("--photo-max-edge", type=int, default=1920,
+                        help="Resize ingested photos so the long edge is at most this many "
+                             "pixels (0 = keep original). The default matches the video path, "
+                             "which every downstream default was fitted against; a 24MP frame "
+                             "is 11x the pixels through P4a/P4b for detail that SAM2 (1024px) "
+                             "and P3 (--max-image-size) discard anyway.")
     parser.add_argument(
         "--checkpoint",
         type=Path,
@@ -326,6 +419,13 @@ def main(argv: Optional[list] = None) -> None:
     )
     parser.add_argument("--holder-point", type=str, help="Override the auto-derived holder prompt, as X,Y")
     parser.add_argument(
+        "--root-point",
+        type=str,
+        help="Seed the exposed root as its own tracked SAM2 object, as X,Y (same pixel space "
+        "as --plant-point). The root's mask is unioned into the plant mask; without a root "
+        "seed a root cut off by the jaws drops out of the mask and everything downstream.",
+    )
+    parser.add_argument(
         "--prompts-file",
         type=Path,
         help="Clicked SAM2 seeds from pose-pick-prompts, one set per capture pass, in "
@@ -360,11 +460,14 @@ def main(argv: Optional[list] = None) -> None:
         workdir=args.workdir,
         checkpoint=args.checkpoint,
         video_paths=args.video,
+        photo_dirs=args.photos,
+        photo_max_edge=args.photo_max_edge,
         num_frames=args.num_frames,
         use_roi=not args.no_roi,
         roi_padding=args.roi_padding,
         plant_point=_parse_point(args.plant_point),
         holder_point=_parse_point(args.holder_point),
+        root_point=_parse_point(args.root_point),
         device=args.device,
         reuse_frames=args.reuse_frames,
         prompts_file=args.prompts_file,

@@ -79,6 +79,14 @@ def build_dino_classifier(
     frames_dir = workdir / "p1" / "frames"
     mask_dir = workdir / "p2" / "masks" / "plant"
 
+    # Before the weights, not after: loading DINO takes long enough that a
+    # bad path discovered afterwards wastes the wait, and this one used to
+    # surface as IsADirectoryError from inside numpy.load.
+    if seed_bank is not None:
+        from pose_estimator.banks import resolve_bank
+
+        seed_bank = resolve_bank(seed_bank, "--seed-bank")
+
     print(f"Loading {dino_model} ...")
     backbone = DinoBackbone(dino_model, device=device, size=dino_size, token=hf_token)
     print(f"  patch grid {backbone.grid}x{backbone.grid} "

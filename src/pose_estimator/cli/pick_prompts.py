@@ -3,14 +3,18 @@
     pose-pick-prompts --workdir runs/plant_9/
 
 Opens the first frame of each capture pass -- the frame SAM2 is actually
-seeded on. Click the plant, press 2 and click the holder, press n for the
-next pass, press s to save.
+seeded on. Click the plant, press 2 and click the holder, press 3 and click
+the exposed root, press n for the next pass, press s to save.
 
-Two classes only, plant and holder, because that is all P2 decides. The root
-is *part of the plant*: click it with [1], not with a class of its own. It
-does need its own click -- the holder usually sits between foliage and root,
-leaving the root a disconnected blob that SAM2 will not reach from a leaf
-point. Which parts of the plant are leaf, stem or root is a separate question
+[3] root is a *tracking* category, not a third output class: the root is part
+of the plant, and P2's masks stay plant/holder. It gets its own key because
+the jaws cut the root into a disconnected blob, and a blob sharing the
+foliage object's SAM2 memory drops out of the mask intermittently -- measured
+on thistle1, root points clicked as plant held the root in only 51-77% of
+frames, under the ~86% silhouette agreement P4a needs, so the carve deleted
+it anyway. Seeded as its own SAM2 object the root is one connected region
+with its own memory, and its mask is unioned into the plant mask at write
+time. Which parts of the plant are leaf, stem or root is a separate question
 that pose-pick-seeds answers at P4c. Writes <workdir>/p2/prompts_clicked.json, which
 pose-segment picks up automatically:
 
@@ -39,7 +43,8 @@ one, read the coordinates off a frame in any image viewer and write the file
 by hand -- it is three lines per pass:
 
     {"version": 1, "space": "full_frame",
-     "passes": {"0": {"frame": "frame_0000", "plant": [[952, 470]], "holder": [[1541, 840]]}}}
+     "passes": {"0": {"frame": "frame_0000", "plant": [[952, 470]],
+                      "holder": [[1541, 840]], "root": [[970, 905]]}}}
 
 Coordinates are full-frame pixels (1920x1080 here), NOT the cropped frame.
 """
@@ -79,7 +84,7 @@ def run(
 
     print(f"  {len(passes)} capture pass(es): "
           + ", ".join(f"pass {p.index} -> {p.frame}" for p in passes))
-    print("  click = add point    1 = plant    2 = holder    u = undo    c = clear")
+    print("  click = add point    1 = plant    2 = holder    3 = root    u = undo    c = clear")
     print("  n / p = next / previous pass       s = save and quit    q = quit")
     print("  Faint grey crosses are what the colour heuristic picked -- if they are on")
     print("  the holder, that is the bug you are fixing.")
@@ -89,11 +94,12 @@ def run(
     print("  For the reusable bank, place THREE OR MORE plant points per pass, on")
     print("  different parts of the plant. One example transfers to a new video badly")
     print("  (1 frame in 12 in a measured test); three per frame got 11 in 12.")
-    print("  ROOTS: there is no root class here and there should not be -- the root is")
-    print("  part of the plant, so click it with [1] plant. It needs its OWN point:")
-    print("  the jaws sit between foliage and root, so the root is a separate blob and")
-    print("  SAM2 cannot grow into it from a leaf. Without a click there the root is")
-    print("  absent from the mask, the hull, the cloud, and every phase after.")
+    print("  ROOTS: click the exposed root with [3] root, once per pass. The jaws cut")
+    print("  it into a separate blob, and as extra plant points it flickered out of the")
+    print("  mask in a quarter to half of the frames -- [3] gives it its own SAM2 object,")
+    print("  and P2 folds that mask back into the plant mask on write. Without a root")
+    print("  point the root is absent from the mask, the hull, the cloud, and every")
+    print("  phase after; P4c cannot put it back.")
     print("  leaf/stem/root is a different question, answered later by pose-pick-seeds.\n")
 
     session = pick(passes, max_display=max_display, show_auto=show_auto,
@@ -113,6 +119,9 @@ def run(
         if not counts["holder"]:
             print("      no holder point -- P2 will not track the holder separately for this pass,"
                   " so it cannot subtract it from the plant mask")
+        if not counts.get("root"):
+            print("      no root point -- if this specimen has an exposed root below the jaws,"
+                  " it will be missing from the mask and everything downstream ([3] = root)")
     if bank:
         _write_bank(workdir, session, bank_out, dino_model, dino_size, device, hf_token)
     print(f"\n  next:  pose-segment --workdir {workdir} --reuse-frames")

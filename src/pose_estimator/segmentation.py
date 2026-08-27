@@ -38,6 +38,18 @@ import numpy as np
 # (and in saved label images) that keeping it free is worth one integer.
 PLANT_ID = 1
 HOLDER_ID = 2
+# The exposed root is tracked as its own SAM2 object, not as extra points on
+# the plant. SAM2 keeps one temporal memory per object id, and that memory is
+# dominated by the object's big connected mass: seeding the foliage object
+# with a point on the root -- a separate blob, cut off by the clamp jaws --
+# held the root in only 51-77% of thistle1's frames, under the ~86%
+# silhouette agreement P4a needs, so the carve deleted it anyway. A root
+# with its own memory is tracked as the single connected region it is.
+#
+# It is a tracking aid, not a class: the root *is* plant, so its mask is
+# unioned into masks/plant at write time and ROOT_ID never appears in the
+# output. (Which parts of the plant are leaf/stem/root is P4c's question.)
+ROOT_ID = 3
 CLASS_NAMES = {PLANT_ID: "plant", HOLDER_ID: "holder"}
 
 
@@ -222,6 +234,11 @@ def plant_color_mask(bgr: np.ndarray, exg_threshold: float = 0.06) -> np.ndarray
 class Prompts:
     plant: List[Tuple[int, int]] = field(default_factory=list)
     holder: List[Tuple[int, int]] = field(default_factory=list)
+    # Root points seed ROOT_ID, a separate SAM2 object whose mask is unioned
+    # into the plant mask -- see the note above ROOT_ID for why the root
+    # cannot ride along as extra plant points. Optional: empty means the old
+    # two-object behaviour, exactly.
+    root: List[Tuple[int, int]] = field(default_factory=list)
     # Which pixel space the coordinates live in. Auto-derived prompts are read
     # off the already-cropped frame, but clicked ones cannot be: the crop is
     # solved from the same colour prepass that mis-seeds, so at click time it
@@ -234,6 +251,7 @@ class Prompts:
         return {
             "plant": [list(p) for p in self.plant],
             "holder": [list(p) for p in self.holder],
+            "root": [list(p) for p in self.root],
             "space": self.space,
         }
 
@@ -271,6 +289,23 @@ class Prompts:
                 )
             plant.append(moved)
 
+        # Root points are fatal outside the crop, like plant points and unlike
+        # holder points: the crop solver is given them to contain
+        # (`solve_tracking_crop(include_points=...)`), so one landing outside
+        # means the window failed at exactly the job it was resized for --
+        # and silently dropping it would re-create the silent root loss this
+        # class of prompt exists to fix.
+        root = []
+        for point in self.root:
+            moved = inside(point)
+            if moved is None:
+                raise ValueError(
+                    f"root prompt {tuple(point)} falls outside the tracking crop {box} -- "
+                    "the crop did not grow to contain the root. Re-run pose-pick-prompts, "
+                    "or pass --no-roi to segment full frames."
+                )
+            root.append(moved)
+
         holder = [m for m in (inside(p) for p in self.holder) if m is not None]
         dropped = len(self.holder) - len(holder)
         if dropped:
@@ -279,7 +314,7 @@ class Prompts:
                                        " end up inside the plant mask; click the jaws where they"
                                        " grip the stem to keep the point in frame."))
 
-        return Prompts(plant=plant, holder=holder, space="crop")
+        return Prompts(plant=plant, holder=holder, root=root, space="crop")
 
 
 def derive_prompts(bgr: np.ndarray, n_points: int = 3) -> Prompts:
@@ -404,6 +439,7 @@ def solve_tracking_crop(
     padding_fraction: float = 0.45,
     smooth_window: int = 9,
     seed_point: Optional[Tuple[int, int]] = None,
+    include_points: Optional[Sequence[Tuple[int, int]]] = None,
 ) -> TrackingCrop:
     """Solve a plant-following crop window for every frame.
 
@@ -425,6 +461,15 @@ def solve_tracking_crop(
     `padding_fraction` is generous by default so the crop also catches the
     clamp jaws gripping the stem -- P2 has to segment the holder where it
     touches the plant, which is precisely where confusing the two matters.
+
+    `include_points` are full-frame coordinates on the *first* frame that the
+    window must contain -- clicked plant and root prompts. The span above
+    comes from the colour prepass's foliage blob, and the exposed root hangs
+    below the jaws, outside that blob, so a crop sized from the blob alone
+    can cut the root off -- at which point the prompt on it is (correctly)
+    fatal in `Prompts.to_crop`. The window is widened by the points' offset
+    from the tracked centroid rather than clamped to them, so the same
+    `padding_fraction` margin applies and no new constant appears.
     """
     centroids, sizes, (frame_w, frame_h) = plant_centroids(frame_paths, seed_point=seed_point)
     if np.isnan(centroids).all():
@@ -440,6 +485,9 @@ def solve_tracking_crop(
     # appears -- a per-frame size would rescale the subject frame to frame,
     # which is exactly the kind of apparent motion that confuses tracking.
     span = float(np.nanmax(sizes))
+    if include_points:
+        offsets = np.abs(np.asarray(include_points, float) - centroids[0])
+        span = max(span, 2.0 * float(offsets.max()))
     side = int(min(min(frame_w, frame_h), span * (1.0 + 2.0 * padding_fraction)))
     side = max(side, 64)
 
@@ -516,6 +564,7 @@ def segment_sequence(
     device: str = "cuda",
     offload_to_cpu: bool = True,
     frame_paths: Optional[Sequence[Path]] = None,
+    reacquire_root=None,
 ) -> dict:
     """Run SAM2 video propagation over `frames_dir` and write P2 artifacts.
 
@@ -525,6 +574,16 @@ def segment_sequence(
       alpha/frame_XXXX.png         soft plant matte (sigmoid of the logits)
       roi.json                     crop window + frame size
       prompts.json                 the seed points actually used
+
+    Root prompts, when present, seed a third SAM2 object (see ROOT_ID) whose
+    mask is unioned into masks/plant here -- downstream phases still see
+    exactly two classes.
+
+    `reacquire_root(bgr_full_frame, crop_box) -> (x, y, margin) or None` is
+    an appearance-based locator (the P2 prompt bank). When given and a root
+    object is tracked, stretches of frames where the root mask went empty are
+    scanned with it and the best hit becomes a new SAM2 conditioning point --
+    see `_reacquire_lost_root` for why frame-0 seeding alone is not enough.
     """
     import torch
     from sam2.build_sam import build_sam2_video_predictor
@@ -547,8 +606,14 @@ def segment_sequence(
     # prepass confident enough to centre the crop correctly would not have
     # needed clicking in the first place.
     seed_point = prompts.plant[0] if (prompts and prompts.space == "full_frame" and prompts.plant) else None
+    include_points = (
+        list(prompts.plant) + list(prompts.root)
+        if (prompts and prompts.space == "full_frame")
+        else None
+    )
     crop = (
-        solve_tracking_crop(frame_paths, padding_fraction=roi_padding, seed_point=seed_point)
+        solve_tracking_crop(frame_paths, padding_fraction=roi_padding, seed_point=seed_point,
+                            include_points=include_points)
         if use_roi
         else None
     )
@@ -574,7 +639,8 @@ def segment_sequence(
             "No plant prompt point could be derived from the first frame. Pass --plant-point X,Y "
             "explicitly (coordinates are in the cropped ROI unless --no-roi)."
         )
-    print(f"  prompts: plant={prompts.plant} holder={prompts.holder or 'none found'}")
+    print(f"  prompts: plant={prompts.plant} holder={prompts.holder or 'none found'}"
+          f" root={prompts.root or 'none'}")
 
     predictor = build_sam2_video_predictor(_resolve_model_cfg(checkpoint), str(checkpoint), device=device)
 
@@ -587,7 +653,8 @@ def segment_sequence(
         )
         predictor.reset_state(state)
 
-        for obj_id, points in ((PLANT_ID, prompts.plant), (HOLDER_ID, prompts.holder)):
+        for obj_id, points in ((PLANT_ID, prompts.plant), (HOLDER_ID, prompts.holder),
+                               (ROOT_ID, prompts.root)):
             if not points:
                 continue
             predictor.add_new_points_or_box(
@@ -598,12 +665,22 @@ def segment_sequence(
                 labels=np.ones(len(points), dtype=np.int32),  # all positive clicks
             )
 
-        logits_by_frame: Dict[int, Dict[int, np.ndarray]] = {}
-        for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(state):
-            logits_by_frame[frame_idx] = {
-                int(obj_id): mask_logits[i, 0].float().cpu().numpy()
-                for i, obj_id in enumerate(obj_ids)
-            }
+        def propagate() -> Dict[int, Dict[int, np.ndarray]]:
+            out: Dict[int, Dict[int, np.ndarray]] = {}
+            for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(state):
+                out[frame_idx] = {
+                    int(obj_id): mask_logits[i, 0].float().cpu().numpy()
+                    for i, obj_id in enumerate(obj_ids)
+                }
+            return out
+
+        logits_by_frame = propagate()
+
+        root_reseeds: List[dict] = []
+        if prompts.root and reacquire_root is not None:
+            logits_by_frame = _reacquire_lost_root(
+                predictor, state, propagate, logits_by_frame,
+                frame_paths, crop, reacquire_root, root_reseeds)
 
     # --- write artifacts, pasted back into full-frame coordinates ---
     for sub in ("masks/plant", "masks/holder", "alpha"):
@@ -615,17 +692,39 @@ def segment_sequence(
         box = crop.boxes[i] if crop is not None else None
         stats = {"frame": path.name, "index": i, "crop_box": list(box) if box else None}
 
+        # The tracked root object folds into the plant class here, and only
+        # here: it exists so the disconnected root blob has its own SAM2
+        # memory, not so downstream sees a third class. Pixels the holder
+        # object also claims are ceded to it first: the jaws grip the root,
+        # so their shared boundary is exactly where SAM2 blurs -- and a
+        # holder pixel counts as occlusion (no evidence) downstream, so the
+        # root loses nothing.
+        root_logit = logits.get(ROOT_ID)
+        holder_logit = logits.get(HOLDER_ID)
+        root_binary = None
+        if root_logit is not None:
+            root_binary = root_logit > 0
+            if holder_logit is not None:
+                root_binary = root_binary & ~(holder_logit > 0)
+            stats["root_area_px"] = int(root_binary.sum())
+
         for obj_id, name in CLASS_NAMES.items():
             crop_logit = logits.get(obj_id)
             if crop_logit is None:
                 shape = (crop.height, crop.width) if crop else (full_h, full_w)
                 crop_logit = np.full(shape, -1e3, np.float32)
-            binary = _paste(crop_logit > 0, box, full_h, full_w).astype(np.uint8) * 255
+            crop_binary = crop_logit > 0
+            if obj_id == PLANT_ID and root_binary is not None:
+                crop_binary = crop_binary | root_binary
+            binary = _paste(crop_binary, box, full_h, full_w).astype(np.uint8) * 255
             cv2.imwrite(str(out_dir / "masks" / name / f"{path.stem}.png"), binary)
             stats[f"{name}_area_px"] = int((binary > 0).sum())
 
             if obj_id == PLANT_ID:
-                soft = _paste(_sigmoid(crop_logit), box, full_h, full_w, fill=0.0)
+                soft_crop = _sigmoid(crop_logit)
+                if root_binary is not None:
+                    soft_crop = np.maximum(soft_crop, np.where(root_binary, _sigmoid(root_logit), 0.0))
+                soft = _paste(soft_crop, box, full_h, full_w, fill=0.0)
                 cv2.imwrite(str(out_dir / "alpha" / f"{path.stem}.png"), (soft * 255).astype(np.uint8))
 
         per_frame_stats.append(stats)
@@ -637,7 +736,13 @@ def segment_sequence(
             indent=2,
         )
     with open(out_dir / "prompts.json", "w") as f:
-        json.dump(prompts.to_dict(), f, indent=2)
+        payload = prompts.to_dict()
+        if root_reseeds:
+            # An audit trail, because these points were placed by appearance
+            # matching rather than by a human: check them against p2/diag/
+            # before trusting a re-acquired root.
+            payload["root_reseeds"] = root_reseeds
+        json.dump(payload, f, indent=2)
 
     return {
         "per_frame": per_frame_stats,
@@ -645,6 +750,169 @@ def segment_sequence(
         "frame_width": full_w,
         "frame_height": full_h,
     }
+
+
+def _attached_root_binary(
+    root_logit: Optional[np.ndarray],
+    plant_logit: Optional[np.ndarray],
+    holder_logit: Optional[np.ndarray],
+) -> Optional[np.ndarray]:
+    """Root pixels belonging to a component that touches the plant or holder.
+
+    Appearance cannot tell the plant's dirt-covered root ball from a pile of
+    dirt lying on the turntable -- measured on thistle1, a re-seed that
+    landed on such a pile grew a 147k px "root" against the true root's ~9k.
+    Physical attachment can: the jaws grip the root, so a real root
+    component is adjacent to the holder (or to the foliage above it) in the
+    image, while a detached pile touches neither. Filtering is per
+    component, so a frame holding both keeps the real root and drops the
+    pile. The dilation is 2 px of adjacency tolerance for boundary
+    compression artifacts, not a tunable.
+    """
+    if root_logit is None:
+        return None
+    root = root_logit > 0
+    if not root.any():
+        return root
+    support = np.zeros_like(root)
+    if plant_logit is not None:
+        support |= plant_logit > 0
+    if holder_logit is not None:
+        support |= holder_logit > 0
+    if not support.any():
+        return np.zeros_like(root)
+    support = cv2.dilate(support.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    count, components = cv2.connectedComponents(root.astype(np.uint8), connectivity=8)
+    keep = np.zeros_like(root)
+    for c in range(1, count):
+        component = components == c
+        if (component & support).any():
+            keep |= component
+    return keep
+
+
+def _reacquire_lost_root(
+    predictor, state, propagate, logits_by_frame,
+    frame_paths: Sequence[Path],
+    crop: Optional[TrackingCrop],
+    locate,
+    reseeds: Optional[List[dict]] = None,
+) -> Dict[int, Dict[int, np.ndarray]]:
+    """Re-seed the root object on stretches where its mask went empty.
+
+    A frame-0 seed is not enough for the root, and the failure is specific:
+    the pliers cross in front of it once per rotation, SAM2's per-object
+    memory decays through the occlusion, and whether the object is
+    re-acquired afterwards is luck. Measured on thistle1: one pass re-found
+    the root after an 8-frame gap, the other lost it at frame 54 and never
+    got it back -- 42 frames, including the plier-opposite arc where the
+    root is fully visible. That put the root under P4a's ~86% silhouette
+    floor and out of the reconstruction entirely.
+
+    So: find maximal runs of frames where the root mask is empty (exactly
+    empty -- a binary condition, not a threshold), scan each run with the
+    appearance locator, and hand the best positive-margin hit to SAM2 as a
+    new conditioning point for the root object. A run where no frame
+    produces a positive margin is left alone -- that is what genuine
+    occlusion looks like, and holder-covered pixels already count as
+    no-evidence downstream.
+
+    One seed per run per round, then re-propagate, then look again.
+    Measured on thistle1: a conditioning frame's repair reaches roughly 5-7
+    neighbouring frames (pass 1's 8-frame gap needed one seed; pass 0's
+    42-frame gap recovered only the seeded frame itself), so a long stretch
+    converges by rounds -- each recovery shrinks the run, and the next round
+    seeds what is left. DINO scores are computed once per frame and cached;
+    each round consumes at least one scored candidate or stops, so the loop
+    terminates.
+
+    A candidate is accepted only if the mask SAM2 predicts for the click,
+    returned by `add_new_points_or_box` before any propagation is spent, has
+    a component attached to the plant or holder (`_attached_root_binary`) --
+    root-lookalikes lying on the table pass the appearance test but fail
+    that one. Rejected candidates are cleared on the spot and the next-best
+    candidate in the run is tried. Human clicks are never second-guessed;
+    only these machine-placed seeds are.
+    """
+    # Without this flag the reseed is silently a no-op. SAM2 treats a click
+    # on an already-tracked frame as a "correction" and stores its mask as a
+    # NON-conditioning output -- which the next propagate_in_video recomputes
+    # from the same decayed memory, discarding the click entirely (verified:
+    # byte-identical masks on thistle1). The flag is SAM2's own switch for
+    # promoting correction clicks to conditioning frames, whose memory every
+    # other frame attends to.
+    predictor.add_all_frames_to_correct_as_cond = True
+    scores: Dict[int, Optional[Tuple[int, int, float]]] = {}
+    used: set = set()
+    while True:
+        empty = []
+        for i in range(len(frame_paths)):
+            logit = logits_by_frame.get(i, {}).get(ROOT_ID)
+            if logit is None or not (logit > 0).any():
+                empty.append(i)
+        runs: List[List[int]] = []
+        for i in empty:
+            if runs and i == runs[-1][-1] + 1:
+                runs[-1].append(i)
+            else:
+                runs.append([i])
+
+        added = 0
+        for run in runs:
+            fresh = [i for i in run if i not in scores]
+            for i in fresh:
+                bgr = cv2.imread(str(frame_paths[i]))
+                box = crop.boxes[i] if crop is not None else None
+                scores[i] = None if bgr is None else locate(bgr, box)
+
+            candidates = sorted((i for i in run if i not in used and scores.get(i) is not None),
+                                key=lambda j: -scores[j][2])
+            if not candidates:
+                if fresh:  # say it once, when the run is first seen
+                    print(f"  root mask empty on frames {run[0]}-{run[-1]}; the bank found "
+                          "no confident root patch there -- left alone (occluded, most likely)")
+                continue
+            for i in candidates:
+                x, y, margin = scores[i]
+                if crop is not None:
+                    x0, y0, _, _ = crop.boxes[i]
+                    x, y = x - x0, y - y0
+                used.add(i)
+                # The click returns this frame's predicted mask immediately,
+                # so a candidate is accepted or discarded before any
+                # propagation is spent on it. The test is attachment, not
+                # appearance: the jaws grip the real root, so its mask
+                # touches the holder or the foliage, while a root-lookalike
+                # on the table (the dirt pile, measured at 147k px against
+                # the true root's ~9k) touches neither.
+                _, obj_ids, click_masks = predictor.add_new_points_or_box(
+                    inference_state=state,
+                    frame_idx=i,
+                    obj_id=ROOT_ID,
+                    points=np.array([[x, y]], dtype=np.float32),
+                    labels=np.ones(1, dtype=np.int32),
+                )
+                click_logit = click_masks[list(obj_ids).index(ROOT_ID), 0].float().cpu().numpy()
+                attached = _attached_root_binary(click_logit,
+                                                 logits_by_frame.get(i, {}).get(PLANT_ID),
+                                                 logits_by_frame.get(i, {}).get(HOLDER_ID))
+                if attached is not None and attached.any():
+                    print(f"  root mask empty on frames {run[0]}-{run[-1]}; re-seeding the "
+                          f"root object on frame {i} at ({x}, {y}), margin {margin:.3f}")
+                    if reseeds is not None:
+                        reseeds.append({"frame": frame_paths[i].stem, "index": i,
+                                        "point_crop_space": [int(x), int(y)],
+                                        "margin": round(float(margin), 4),
+                                        "run": [run[0], run[-1]]})
+                    added += 1
+                    break
+                print(f"  frame {i}: best patch at ({x}, {y}) segments something detached "
+                      "from the plant -- discarded")
+                predictor.clear_all_prompts_in_frame(state, i, ROOT_ID, need_output=False)
+
+        if not added:
+            return logits_by_frame
+        logits_by_frame = propagate()
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:

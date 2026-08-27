@@ -44,10 +44,19 @@ from pose_estimator.pose import rotating_region_mask
 from pose_estimator.segmentation import Prompts, derive_prompts
 
 PROMPT_FILE_VERSION = 1
-CLASSES = ("plant", "holder")
+# "root" is a tracking category, not a third output class: the root is part
+# of the plant, but the jaws cut it into a separate blob, and a blob sharing
+# the foliage object's SAM2 memory flickers out of the mask (51-77% of frames
+# on thistle1, under the 86% the carve needs). Rooted in its own object id it
+# is a single connected region, which SAM2 tracks well; P2 unions it back
+# into masks/plant at write time. Old prompt files without root points load
+# unchanged, so the file version stays at 1.
+CLASSES = ("plant", "holder", "root")
 
 # BGR, matching the colours p2/diag overlays already use for the two masks.
-CLASS_BGR = {"plant": (60, 220, 60), "holder": (220, 60, 220)}
+# Root is drawn orange -- it becomes part of the green plant mask, but at
+# click time it must be legible as its own category.
+CLASS_BGR = {"plant": (60, 220, 60), "holder": (220, 60, 220), "root": (40, 150, 255)}
 
 
 @dataclass
@@ -156,7 +165,7 @@ class PromptSession:
     def as_prompts(self, pass_index: int) -> Prompts:
         by_class = self.points[pass_index]
         return Prompts(plant=list(by_class["plant"]), holder=list(by_class["holder"]),
-                       space="full_frame")
+                       root=list(by_class.get("root", [])), space="full_frame")
 
     def to_payload(self) -> dict:
         return {
@@ -167,6 +176,7 @@ class PromptSession:
                     "frame": spec.frame,
                     "plant": [list(p) for p in self.points[spec.index]["plant"]],
                     "holder": [list(p) for p in self.points[spec.index]["holder"]],
+                    "root": [list(p) for p in self.points[spec.index].get("root", [])],
                 }
                 for spec in self.passes
             },
@@ -232,6 +242,7 @@ def load_prompts(path: Union[str, Path]) -> Dict[int, Prompts]:
             raise SystemExit(f"{path}: pass {key} has no plant point")
         prompts[int(key)] = Prompts(plant=plant,
                                     holder=[tuple(p) for p in entry.get("holder", [])],
+                                    root=[tuple(p) for p in entry.get("root", [])],
                                     space="full_frame")
     if not prompts:
         raise SystemExit(f"{path} contains no passes")
@@ -289,7 +300,7 @@ def _render(
     todo = session.passes_missing_plant()
     status = f"needs a plant point: pass {', '.join(map(str, todo))}" if todo else "ready to save"
     cv2.putText(bar, f"pass {session.position + 1}/{len(session.passes)} ({spec.frame})   "
-                     f"click=add  1-2=class  u=undo  c=clear  n/p=pass  s=save  q=quit   [{status}]",
+                     f"click=add  1-3=class  u=undo  c=clear  n/p=pass  s=save  q=quit   [{status}]",
                 (12, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (170, 170, 170), 1, cv2.LINE_AA)
     if message:
         colour = {"!": (90, 90, 235), "?": (60, 190, 235)}.get(message[0], (150, 220, 150))

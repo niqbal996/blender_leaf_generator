@@ -414,14 +414,23 @@ you are looking at.
 - click **three or more** points on different parts of the plant (one click
   is not enough for the reusable bank -- see the numbers
   [below](#when-the-pliers-get-segmented-as-the-plant))
-- **click the root too, with `1` = plant.** There is no root class here and
-  there should not be: P2 only decides which object is the plant, and the
-  root is part of it. It needs its *own* click because the jaws usually sit
-  between foliage and root, leaving the root a disconnected blob that SAM2
-  cannot reach from a leaf point. Miss it and the root is absent from the
-  mask, the hull, the cloud and every phase after -- P4c cannot put it back,
-  because P4c only labels points that already exist. Measured on thistle1:
-  nine plant clicks, all on foliage, and no root anywhere downstream
+- **press `3` and click the exposed root, once per pass.** The root is part
+  of the plant, but it cannot ride along as an extra `1` = plant click: the
+  jaws cut it into a disconnected blob, and SAM2 keeps one temporal memory
+  per tracked object, dominated by the object's big connected mass -- root
+  points clicked as plant held the root in only 51-77% of thistle1's frames,
+  under the ~86% silhouette agreement P4a needs, so the carve deleted it
+  anyway. `3` = root seeds the blob as its *own* SAM2 object with its own
+  memory, and P2 unions that mask back into the plant mask on write --
+  downstream still sees exactly two classes. Miss the click and the root is
+  absent from the mask, the hull, the cloud and every phase after -- P4c
+  cannot put it back, because P4c only labels points that already exist.
+  If SAM2 still drops the root mid-orbit -- the pliers cross in front once
+  per rotation, and re-acquiring a small object after occlusion is luck --
+  `pose-segment` re-seeds it on its own: stretches of empty root mask are
+  scanned with the prompt bank's root examples and the best match becomes a
+  new SAM2 conditioning point, logged as `root_reseeds` in
+  `p2/prompts.json` so it can be audited against `p2/diag/`
 - press `2`, click the plier **jaws** where they grip the stem, not the far
   end of the handle: the tracking crop is sized to the plant, and a point
   outside it is dropped
@@ -477,9 +486,11 @@ agree on an axis.
 
 **Step 6 -- click the organ seeds for P4c.** A different set of clicks from
 step 3: those said *which object is the plant*, these say *which parts of the
-plant are leaf, stem and root*. This is where `root` becomes a class -- at P2
-the root was simply part of the plant. The window opens on the plant cropped exactly
-as the classifier crops it, and clicks off the plant are refused.
+plant are leaf, stem and root*. This is where `root` becomes a semantic
+class -- step 3's `3` = root was a tracking aid that folded straight back
+into the plant mask; here the label survives into the coloured cloud. The
+window opens on the plant cropped exactly as the classifier crops it, and
+clicks off the plant are refused.
 
 ```bash
 pose-pick-seeds --workdir runs/thistle1
@@ -578,6 +589,19 @@ pose-structure --workdir runs/thistle1/
 pose-leaf      --workdir runs/thistle1/
 ```
 
+The driver stops at a phase whose QC shows a **catastrophic** failure -- P2
+tracking the tool instead of the plant, a failed P3 circle fit or rotation
+coverage, a hull that does not match the masks on disk. Nothing after such a
+failure can be right, and letting the run finish is how a plier hull once
+became an empty Blender scene with no error anywhere. Advisory QC failures
+(and good runs do have them) never stop a run; `--keep-going` pushes past a
+stop when a partial result is wanted knowingly. One related rule of thumb:
+**do not re-run a phase while a pipeline is still executing on the same
+workdir** -- phases read each other's artifacts from disk, and a concurrent
+fix produces a mix no QC number describes (measured: a P3 solved from masks
+being rewritten mid-run registered half the frames and fit a 42%-deviant
+circle on a perfectly good video).
+
 Other flags on `run_pipeline.sh`: `--skip-p4b` halves the runtime by labelling
 the P4a hull instead of a trained surface (blobbier, and P5 cannot
 skeletonise it afterwards without going back); `--backend sam
@@ -602,7 +626,7 @@ Fix it by clicking the plant once, per capture pass:
 
 ```bash
 export HF_TOKEN=hf_xxx                      # REQUIRED, see below
-pose-pick-prompts --workdir runs/thistle1   # click plant, press 2, click the plier jaws
+pose-pick-prompts --workdir runs/thistle1   # click plant, 2 = plier jaws, 3 = exposed root
 pose-segment --workdir runs/thistle1 --reuse-frames    # redo P2 only, keeping the frames
 ./run_pipeline.sh --workdir runs/thistle1 --skip-to p3
 ```
@@ -676,6 +700,20 @@ plant_6, 0/12 on plant_9. Only the plant prompt is required, so a run still
 segments; what you lose is P2 subtracting the tracked holder from the plant
 mask. Click the holder per specimen if you need that, or check
 `plant_mask_free_of_holder` in `p2/qc.json` and only go back when it fails.
+
+**Root examples carry the same way.** A bank whose plant examples are all
+foliage will only ever place foliage prompts -- that is what lost thistle2's
+root: all three located prompts landed at y 472-549, none below the jaws.
+`3` = root clicks store as their own bank label, so on a later specimen the
+root prompt is placed at the most root-like patch and seeds the separately
+tracked root object. Appearance drift -- dirt stuck to one specimen's root
+where the bank's example was clean -- is handled the same way as everything
+else in the bank: click that root too, into the same bank. Vectors are kept
+individually and scored by best match, so a dirty example *adds* coverage
+rather than diluting the clean one, and there is no similarity threshold to
+tune. When no patch out-scores the other classes, no root prompt is placed
+and `root_tracked_below_the_jaws` in `p2/qc.json` flags the pass -- the
+fallback is one click, which also widens the bank.
 
 If the tool changes -- a clamp instead of pliers, a pot instead of a holder --
 click a fresh bank rather than editing a threshold. There is no colour rule
@@ -874,6 +912,53 @@ them degrades the solve. Two extra checks appear in `p3/poses.json`:
 `passes_share_a_rotation_axis` (the evidence the passes actually merged --
 nothing in the solve enforces it) and `passes_are_at_different_elevations`
 (the extra footage only buys anything if it was shot from somewhere new).
+
+### Still photos instead of video
+
+A directory of JPEGs is a capture pass, exactly like a video:
+
+```bash
+./run_pipeline.sh --photos /data/plant_9_shots --workdir runs/plant_9 --stop-after p1p2
+pose-segment --photos /data/plant_9_shots --workdir runs/plant_9     # or the phase alone
+```
+
+Give several directories for several passes, and mix them with `--video`
+freely. After P1 there is no difference at all: every later phase reads
+`p1/frames/frame_XXXX.jpg` plus `p1/sources.json` and cannot tell which kind
+of capture produced them.
+
+Three things to know, all consequences of stills having no redundancy:
+
+- **Filename order must be capture order** around the turntable. SAM2
+  propagates from one frame to the next and P3 checks the camera traces a
+  circle; both assume consecutive frames are neighbouring angles. Cameras
+  number shots sequentially, so this is usually free -- but a folder mixing
+  two shoots, or renamed files, will break it silently.
+- **Every photo is used as it is.** A video gets sampled down to the sharpest
+  frame of each angular bin; a photo directory has one shot per angle and no
+  alternative to fall back on. Each photo's sharpness is printed on ingest
+  and anything far below the median is named. Deleting a hopeless shot is
+  your call, and it is a real trade: a dropped photo widens the angular gap
+  `full_rotation_covered` measures. A soft frame that still registers is
+  usually worth keeping over a hole in the orbit.
+- **Photos are resized to a 1920px long edge** by default, matching the video
+  path that every downstream default was fitted against. At current settings
+  this costs nothing -- SAM2 resizes to 1024 regardless, P3 caps SIFT at
+  `--max-image-size`, P4b trains at `--downsample` -- while a 24MP frame is
+  11x the pixels through P4a's carve and P4b's rasteriser, which is a VRAM
+  wall rather than a slow run on an 8GB card. `--photo-max-edge 0` keeps the
+  original size; raise P3's and P4b's settings to match, or the extra
+  resolution reaches nothing. Intrinsics are safe either way: COLMAP records
+  the camera at the image's real dimensions even when it extracts features
+  on a smaller internal copy.
+
+The blur trade-off is worth stating plainly, because it is the usual reason
+to shoot stills in the first place: handheld photos can be *sharper* than
+video frames, but they must still be **one static camera and a rotating
+subject**. P3 identifies what is rigidly attached to the turntable from
+per-pixel temporal variance, so a camera that moves between shots breaks the
+assumption the whole solve rests on -- the backdrop stops being static and
+there is nothing left to separate subject from scene.
 
 ### Removed: the older single-shot prototype
 

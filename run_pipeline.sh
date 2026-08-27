@@ -29,6 +29,23 @@
 # existing workdir; --stop-after <phase> ends early. P4c looks for clicked
 # seeds at <workdir>/p4c/seeds.json and uses them without being told.
 #
+# The run STOPS at a phase whose QC shows a catastrophic failure (P2 tracking
+# the tool instead of the plant, a failed P3 circle fit, a hull that does not
+# match the masks) -- everything after would silently build on garbage.
+# Advisory QC failures never stop a run. --keep-going pushes past a stop when
+# a partial or salvage result is wanted knowingly.
+#
+# Still photos instead of video: --photos <dir> takes a directory of JPEGs as
+# one capture pass, in filename order (which must be capture order around the
+# turntable). Give several directories for several passes, and mix with
+# --video freely -- after P1 everything reads frames from disk and cannot tell
+# the difference. A video is sampled down to its sharpest frame per angular
+# bin; photos have no such redundancy, so each one's sharpness is printed and
+# culling a hopeless shot is your call (it widens that angular gap).
+#
+#   ./run_pipeline.sh --photos /data/plant_9_shots --workdir runs/plant_9 \
+#       --stop-after p1p2
+#
 # Several --video files are capture passes of the *same* plant, shot at
 # different camera elevations. They share one workdir: frames are numbered
 # consecutively, each pass is tracked and variance-masked on its own, and
@@ -111,11 +128,11 @@
 
 set -euo pipefail
 
-VIDEOS=(); WORKDIR=""; SEED_FRAME=""; HF_TOKEN_ARG="${HF_TOKEN:-}"
+VIDEOS=(); PHOTOS=(); WORKDIR=""; SEED_FRAME=""; HF_TOKEN_ARG="${HF_TOKEN:-}"
 DINO_MODEL="facebook/dinov3-vitb16-pretrain-lvd1689m"
 SEEDS=(); SKIP_TO=""; SEED_BANK=""; SEEDS_FILE=""; SKIP_P4B=0
 BACKEND="dino"; SAM_CHECKPOINT=""; STOP_AFTER=""
-PROMPT_BANK=""; PROMPT_ROOT=""; NO_PROMPT_BANK=0; USE_GPU=0; ARCHITECTURE=""; PERSISTENCE=""; PROMPT_POINTS=""
+PROMPT_BANK=""; PROMPT_ROOT=""; NO_PROMPT_BANK=0; USE_GPU=0; ARCHITECTURE=""; PERSISTENCE=""; PROMPT_POINTS=""; KEEP_GOING=0
 
 # Print the comment block at the top of this file, however long it is, so the
 # help text cannot drift out of sync with a hard-coded line range.
@@ -127,12 +144,15 @@ usage() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --video)        shift; while [[ $# -gt 0 && "$1" != --* ]]; do VIDEOS+=("$1"); shift; done ;;
+        --photos)       shift; while [[ $# -gt 0 && "$1" != --* ]]; do PHOTOS+=("$1"); shift; done ;;
         --workdir)      WORKDIR="$2"; shift 2 ;;
         --seed-frame)   SEED_FRAME="$2"; shift 2 ;;
         --hf-token)     HF_TOKEN_ARG="$2"; shift 2 ;;
         --dino-model)   DINO_MODEL="$2"; shift 2 ;;
-        --skip-to)      SKIP_TO="$2"; shift 2 ;;
-        --stop-after)   STOP_AFTER="$2"; shift 2 ;;
+        --skip-to)      [[ -n "$SKIP_TO" ]] && echo "  note: --skip-to given twice ($SKIP_TO then $2); the last one wins" >&2
+                        SKIP_TO="$2"; shift 2 ;;
+        --stop-after)   [[ -n "$STOP_AFTER" ]] && echo "  note: --stop-after given twice ($STOP_AFTER then $2); the last one wins" >&2
+                        STOP_AFTER="$2"; shift 2 ;;
         --seed-bank)    SEED_BANK="$2"; shift 2 ;;
         --prompt-bank)  PROMPT_BANK="$2"; shift 2 ;;
         --prompt-points) PROMPT_POINTS="$2"; shift 2 ;;
@@ -145,6 +165,7 @@ while [[ $# -gt 0 ]]; do
         --backend)      BACKEND="$2"; shift 2 ;;
         --sam-checkpoint) SAM_CHECKPOINT="$2"; shift 2 ;;
         --skip-p4b)     SKIP_P4B=1; shift ;;
+        --keep-going)   KEEP_GOING=1; shift ;;
         --use-gpu)      USE_GPU=1; shift ;;
         --seeds)        shift; while [[ $# -gt 0 && "$1" != --* ]]; do SEEDS+=("$1"); shift; done ;;
         -h|--help)      usage 0 ;;
@@ -153,8 +174,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$WORKDIR" ]] || { echo "--workdir is required" >&2; usage 1; }
-[[ ${#VIDEOS[@]} -gt 0 || -d "$WORKDIR/p1/frames" ]] || {
-    echo "--video is required unless $WORKDIR/p1/frames already exists" >&2; usage 1; }
+[[ ${#VIDEOS[@]} -gt 0 || ${#PHOTOS[@]} -gt 0 || -d "$WORKDIR/p1/frames" ]] || {
+    echo "--video or --photos is required unless $WORKDIR/p1/frames already exists" >&2
+    usage 1; }
 
 # Seeds clicked with pose-pick-seeds land here by default, so finding them is
 # not something you should have to tell the script about.
@@ -299,9 +321,53 @@ done
 
 phase() { printf '\n\033[1m=== %s ===\033[0m\n' "$1"; }
 
+# Stop the run when a phase's QC shows a failure nothing downstream can
+# absorb. Only catastrophic signatures gate -- advisory failures happen on
+# good runs (a root blinking behind the pliers fails area smoothness, a root
+# ball in front of the yellow handle fails the colour contamination check)
+# and never stop anything. Each signature below was measured in a real
+# disaster that previously ran to completion and produced an empty result:
+# a "plant" mask that was 99% pliers, and a hull carved at IoU 0.026 against
+# masks rewritten mid-run. --keep-going pushes past a gate knowingly.
+gate() {  # gate <phase> <qc-json>
+    local why=""
+    why="$($PY "$REPO_ROOT/scripts/qc_gate.py" "$1" "$2")" || true
+    if [[ -z "$why" ]]; then
+        return 0
+    fi
+    echo "" >&2
+    echo "  FATAL QC after $1 -- the failures below poison every later phase:" >&2
+    while IFS= read -r line; do echo "    $line" >&2; done <<< "$why"
+    if [[ "$KEEP_GOING" == 1 ]]; then
+        echo "    --keep-going given -- continuing anyway." >&2
+        return 0
+    fi
+    echo "    Fix this phase, then resume with --skip-to <next phase>" >&2
+    echo "    (see README: Recovering after a bad P2). To push on anyway: --keep-going" >&2
+    exit 1
+}
+
+# --skip-to means the earlier phases are being taken on trust from a previous
+# run, so their QC on disk is the only evidence about what this run builds on
+# -- and it is evidence nothing else would look at, because the gate below
+# only fires for phases this invocation actually executes. Skipping into the
+# middle of a broken workdir is exactly how a run reaches P4c on a solve that
+# failed its circle fit half an hour earlier.
+if [[ -n "$SKIP_TO" ]]; then
+    for name in "${ORDER[@]}"; do
+        [[ "$name" == "$SKIP_TO" ]] && break
+        case "$name" in
+            p1p2) gate p1p2 "$WORKDIR/p2/qc.json" ;;
+            p3)   gate p3   "$WORKDIR/p3/poses.json" ;;
+            p4a)  gate p4a  "$WORKDIR/p4/hull.json" ;;
+        esac
+    done
+fi
+
 if should_run p1p2; then
     phase "P1+P2  sharpest frames + SAM2 plant/holder masks   -> $WORKDIR/p1, p2"
-    [[ ${#VIDEOS[@]} -gt 1 ]] && echo "  ${#VIDEOS[@]} capture passes, tracked separately, solved together in P3"
+    n_passes=$(( ${#VIDEOS[@]} + ${#PHOTOS[@]} ))
+    [[ $n_passes -gt 1 ]] && echo "  $n_passes capture passes, tracked separately, solved together in P3"
     if ! SAM_CKPT="$(find_sam_checkpoint)"; then
         echo "ERROR: SAM2 checkpoint not found (looked for sam2.1_hiera_large.pt in" >&2
         echo "  \$SAM2_CHECKPOINT, $REPO_ROOT/checkpoints/," >&2
@@ -323,22 +389,26 @@ if should_run p1p2; then
         echo "    The P2 bank is p2/prompt_bank.npz, written by pose-pick-prompts." >&2
     fi
     $PY -m pose_estimator.cli.segment \
-        ${VIDEOS[0]:+--video} ${VIDEOS[@]+"${VIDEOS[@]}"} --workdir "$WORKDIR" \
+        ${VIDEOS[0]:+--video} ${VIDEOS[@]+"${VIDEOS[@]}"} \
+        ${PHOTOS[0]:+--photos} ${PHOTOS[@]+"${PHOTOS[@]}"} --workdir "$WORKDIR" \
         --checkpoint "$SAM_CKPT" \
         ${PROMPT_BANK:+--prompt-bank "$PROMPT_BANK"} \
         ${PROMPT_BANK:+--dino-model "$DINO_MODEL"} \
         ${PROMPT_POINTS:+--prompt-points "$PROMPT_POINTS"}
+    gate p1p2 "$WORKDIR/p2/qc.json"
 fi
 
 if should_run p3; then
     phase "P3     camera poses, masked COLMAP                 -> $WORKDIR/p3"
     $PY -m pose_estimator.cli.pose --workdir "$WORKDIR" \
         $([[ "$USE_GPU" == 1 ]] && echo --use-gpu)
+    gate p3 "$WORKDIR/p3/poses.json"
 fi
 
 if should_run p4a; then
     phase "P4a    visual hull by silhouette carving           -> $WORKDIR/p4"
     $PY -m pose_estimator.cli.hull --workdir "$WORKDIR" --resolution 256
+    gate p4a "$WORKDIR/p4/hull.json"
 fi
 
 if should_run p4b && [[ "$SKIP_P4B" == 0 ]]; then
