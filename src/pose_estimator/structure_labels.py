@@ -57,6 +57,13 @@ from scipy.spatial import cKDTree
 # not delicate. Halfway between flat and vertical is the natural place for it.
 HEART_LEAF_ELEVATION = 45.0
 
+# Persistence above which a maximum is a leaf beyond argument, so the
+# leaf/noise cut is never made among them. This was the whole rule once, as a
+# fixed cut; it survives as the ceiling on where the adaptive cut may fall.
+# Measured: thistle3's leaves score 1.00-0.37 and thistle1's 1.00-0.35, while
+# the noise on both begins at 0.17 and below.
+CERTAIN_TIP_PERSISTENCE = 0.5
+
 
 @dataclass
 class Instancing:
@@ -325,14 +332,31 @@ def select_tips(
     order = np.argsort(-ratios)
     sorted_ratios = ratios[order]
 
-    # The widest step down the ranking is the boundary between "leaf" and
-    # "bump on a leaf". The ranking is extended with a virtual zero so that
-    # "they are all leaves" is expressible: four identical leaves score
-    # identically, every gap between them is 0, and without the final step
-    # down to nothing the widest gap would be a tie at the top and only the
-    # first leaf would survive.
-    gaps = np.diff(np.concatenate([sorted_ratios, [0.0]]).astype(float)) * -1.0
-    cut = int(np.argmax(gaps)) + 1
+    # Anything this persistent is a leaf, full stop, and the cut is never
+    # made among them. Below it, the widest step down the ranking separates
+    # the remaining leaves from bumps on a leaf.
+    #
+    # Cutting at the widest gap over the *whole* ranking was tried and does
+    # not generalise. It reads thistle3 correctly (8 leaves; the leaves run
+    # 1.00-0.37 and the noise starts at 0.10, a 0.27 chasm) and misreads
+    # thistle1 badly (2 leaves): that plant's leaves touch each other more,
+    # which raises their saddles and spreads their scores to 1.00 0.93 0.69
+    # 0.55 0.52 0.35, so the widest gap in the ranking falls *between two
+    # real leaves* (0.93 -> 0.69) rather than at the leaf/noise boundary
+    # (0.35 -> 0.17). The old fixed 0.5 read thistle1 better than the gap
+    # rule did, which is what this keeps.
+    #
+    # The virtual zero at the end lets "they are all leaves" be expressed:
+    # four identical leaves have no gap between them, and without a final
+    # step down to nothing the widest gap would be a tie and only the first
+    # would survive.
+    certain = int((sorted_ratios > CERTAIN_TIP_PERSISTENCE).sum())
+    remainder = sorted_ratios[certain:]
+    if len(remainder) < 2:
+        cut = max(certain, 1)
+    else:
+        gaps = np.diff(np.concatenate([remainder, [0.0]]).astype(float)) * -1.0
+        cut = certain + int(np.argmax(gaps)) + 1
     return np.array(candidates, np.int64), index[order[:cut]]
 
 
@@ -627,6 +651,32 @@ def instance_by_tips(
 # --------------------------------------------------------------------------
 
 
+def _largest_cluster(points: np.ndarray, radius: float) -> Optional[np.ndarray]:
+    """The biggest blob of `points`, joining anything within `radius`.
+
+    A plain connected-components pass over a radius graph. Used to separate a
+    plant's real root from tissue that merely carries the root label -- dirt
+    on the table, or shadow under the jaws -- which is common enough that the
+    crown cannot be derived from the label alone.
+    """
+    if points is None or len(points) == 0:
+        return points
+    if len(points) == 1:
+        return points
+    from scipy.sparse import coo_matrix
+
+    tree = cKDTree(points)
+    pairs = np.array(list(tree.query_pairs(radius)), dtype=np.int64)
+    if not len(pairs):
+        return points
+    graph = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])),
+                       shape=(len(points), len(points))).tocsr()
+    count, label = connected_components(graph, directed=False)
+    if count <= 1:
+        return points
+    return points[label == int(np.argmax(np.bincount(label)))]
+
+
 def crown_from_root(root_points, foliage_points, voxel: float,
                     top_fraction: float = 0.05, bin_voxels: float = 6.0):
     """The crown: the lowest foliage sitting directly above the root.
@@ -670,6 +720,21 @@ def crown_from_root(root_points, foliage_points, voxel: float,
     column, leaving the caller's own fallback in charge.
     """
     if root_points is None or len(root_points) == 0 or len(foliage_points) == 0:
+        return None
+
+    # The root's *main mass*, not every point wearing the root label. Dirt on
+    # the turntable classifies as root, and on thistle1 that put 189 stray
+    # root points up at z 0.85-0.94 among the leaves, against a real root
+    # body of 0.00-0.43. This function walks to the top of the root by
+    # design, so those strays became the top and the crown followed them into
+    # the foliage. A quantile cannot save it -- they were 2% of the label but
+    # a third of everything above the cut.
+    #
+    # Keeping the largest cluster is enough, and needs no threshold beyond
+    # the sampling the cloud already has: real root tissue is contiguous, a
+    # cloud of misread dirt in the canopy is not connected to it.
+    root_points = _largest_cluster(root_points, voxel * 4.0)
+    if root_points is None or len(root_points) == 0:
         return None
 
     heights = root_points[:, 2]
