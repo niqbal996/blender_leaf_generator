@@ -562,18 +562,44 @@ If they do not, delete `runs/thistle1/p1/` and start from step 1.
 
 ### Running the rest of the batch
 
-Once one plant is done, its two seed files carry to the others and there is
-nothing left to click:
+Once one plant is done, its **two** banks carry to the others and there is
+nothing left to click. Pass both, and you are never relying on a search
+finding the right file:
 
 ```bash
 ./run_pipeline.sh --video /data/DSC_0010.MOV --workdir runs/thistle2 \
-    --seed-bank runs/thistle1/p4c/seed_bank.npz
+    --prompt-bank runs/thistle1/p2/prompt_bank.npz \
+    --seed-bank   runs/thistle1/p4c/seed_bank.npz
 ```
 
-The plant/holder prompt bank is picked up on its own: `run_pipeline.sh` looks
-for the newest `*/p2/prompt_bank.npz` beside the workdir, so `runs/thistle2`
-finds `runs/thistle1`'s. `--prompt-bank <path>` names a particular one,
-`--prompt-root <dir>` says where to look, `--no-prompt-bank` turns it off.
+They are different files answering different questions, and **passing only
+one of them is the most common way to lose an afternoon**:
+
+| flag | file | answers |
+|---|---|---|
+| `--prompt-bank` | `p2/prompt_bank.npz` | which object in the scene is the plant (P2) |
+| `--seed-bank` | `p4c/seed_bank.npz` | which parts of it are leaf/stem/root (P4c) |
+
+`--seed-bank` alone leaves P2 with nothing, so it falls back to the colour
+rule and can track the pliers for a whole pass. That failure is loud -- the
+run prints `WARNING: no plant/holder prompts -- falling back to the COLOUR
+RULE` before it starts, and stops at the QC gate afterwards with something
+like *"89% of the plant mask sits on holder plastic"* -- but only if you are
+reading the first ten lines of the log.
+
+**The prompt bank is found automatically only between sibling workdirs.**
+`run_pipeline.sh` searches the newest `*/p2/prompt_bank.npz` one level above
+the workdir, so `runs/thistle2` finds `runs/thistle1`'s. A bank kept
+somewhere else entirely -- another drive, another project folder -- is
+**not** found, and nothing says so beyond the warning above. `--prompt-root
+<dir>` points the search elsewhere; `--no-prompt-bank` turns it off.
+
+A bank also has to have been built with the same DINO backbone it is loaded
+under, since the vectors mean nothing across models; a mismatch is refused
+rather than silently used. And note the P2 bank carries **root** examples
+when they were clicked -- that is what gives a new specimen's root its own
+tracked object, so a bank clicked without roots will lose the root on every
+plant it seeds.
 
 Individual phases can also be run directly, which is what to do when
 debugging one of them:
