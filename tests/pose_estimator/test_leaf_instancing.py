@@ -13,7 +13,6 @@ import pytest
 from pose_estimator.structure_labels import (
     claim_orphans,
     depth_from_stem,
-    grow_from_tips,
     instance_by_tips,
     leaf_graph,
     leaf_midrib,
@@ -116,24 +115,14 @@ def bridged_chain(n=18, bridge=8):
     return graph, depth, np.array([bridge], np.int64)
 
 
-def test_growth_stops_at_the_stem():
-    """A front that reaches the stem must not continue up the far side --
-    that is what put a bud on the end of an unrelated leaf's midrib."""
-    graph, _depth, contact = bridged_chain()
-    tip = np.array([0])
-
-    unblocked, _ = grow_from_tips(graph, tip, graph.shape[0])
-    blocked, _ = grow_from_tips(graph, tip, graph.shape[0], blocked_at=contact)
-
-    assert (unblocked >= 0).all(), "without the block it runs the whole chain"
-    assert (blocked[:9] >= 0).all(), "it still claims its own side, up to the junction"
-    assert (blocked[9:] < 0).all(), "and nothing past the junction"
-
-
 def test_orphan_tissue_becomes_its_own_leaf_not_someone_elses_tail():
     graph, depth, contact = bridged_chain()
     tip = np.array([0])
-    owner, distance = grow_from_tips(graph, tip, graph.shape[0], blocked_at=contact)
+    # One leaf holding its own side, the far side unclaimed. Built directly
+    # rather than grown, so this tests `claim_orphans` and nothing else.
+    owner = np.full(graph.shape[0], -1, np.int64)
+    owner[:9] = 0
+    distance = np.where(owner >= 0, np.arange(graph.shape[0]) * 0.01, np.inf)
     assert (owner < 0).any(), "the far side should start out unclaimed"
 
     owner, distance, new_tips = claim_orphans(

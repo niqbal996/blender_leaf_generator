@@ -50,6 +50,14 @@ from scipy.sparse.csgraph import connected_components, dijkstra
 from scipy.spatial import cKDTree
 
 
+# Above this elevation of the crown-to-tip line, a leaf is treated as one of
+# the upright "heart" leaves at the centre of a rosette. Measured on
+# thistle3, whose leaves sit at -22, -18, -18, -14, +9, +55, +56 and +80
+# degrees: the split falls in a 46-degree empty band, so the exact value is
+# not delicate. Halfway between flat and vertical is the natural place for it.
+HEART_LEAF_ELEVATION = 45.0
+
+
 @dataclass
 class Instancing:
     """Every step of the tip-driven split, kept for inspection."""
@@ -275,66 +283,209 @@ def tip_persistence(graph: csr_matrix, depth: np.ndarray) -> List[Tuple[int, flo
 def select_tips(
     records: Sequence[Tuple[int, float, float]],
     min_depth: float,
-    min_persistence_ratio: float = 0.5,
+    min_persistence_ratio: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Split the maxima into real leaf tips and bumps on a blade.
 
     Returns (all candidates above `min_depth`, the accepted subset).
 
     A maximum is its own leaf when it survives down through most of its own
-    depth -- `(peak - saddle) / peak` above the ratio. Expressed as a fraction
-    of the peak rather than in voxels so a small leaf is judged by the same
-    rule as a large one.
+    depth -- `(peak - saddle) / peak`, a fraction of the peak so a small leaf
+    is judged by the same rule as a large one.
+
+    **Where the line falls is read off the plant, not fixed.** A constant was
+    tried first and is a knife-edge. Ranking thistle3's candidates by that
+    ratio gives
+
+        1.00 0.96 0.90 0.88 0.73 0.57 | 0.48 0.37 | 0.10 0.09 0.08 0.07 ...
+
+    -- real leaves down to 0.37, then nothing until the bumps at 0.10 and
+    below. The old fixed 0.5 cut lands *inside* the run of real leaves and
+    discards two of them, one by 0.02: a leaf fused to its neighbour partway
+    along scores lower than a free-standing one, and how much lower depends
+    on the specimen, not on anything universal.
+
+    So cut at the widest gap in the sorted ratios instead. Leaves and bumps
+    separate by a chasm (0.27 here, against 0.02-0.16 between neighbouring
+    leaves), and the gap is a property of this plant's own distribution, so
+    it needs no refitting across sizes or species. Pass
+    `min_persistence_ratio` to override with a fixed cut.
     """
-    candidates, accepted = [], []
-    for index, peak, saddle in sorted(records, key=lambda r: -r[1]):
-        if peak < min_depth:
+    ranked = sorted((r for r in records if r[1] >= min_depth), key=lambda r: -r[1])
+    candidates = [int(index) for index, _, _ in ranked]
+    if not candidates:
+        return np.array([], np.int64), np.array([], np.int64)
+
+    ratios = np.array([(peak - saddle) / max(peak, 1e-12) for _, peak, saddle in ranked])
+    index = np.array([int(i) for i, _, _ in ranked], np.int64)
+
+    if min_persistence_ratio is not None:
+        return np.array(candidates, np.int64), index[ratios > min_persistence_ratio]
+
+    order = np.argsort(-ratios)
+    sorted_ratios = ratios[order]
+
+    # The widest step down the ranking is the boundary between "leaf" and
+    # "bump on a leaf". The ranking is extended with a virtual zero so that
+    # "they are all leaves" is expressible: four identical leaves score
+    # identically, every gap between them is 0, and without the final step
+    # down to nothing the widest gap would be a tie at the top and only the
+    # first leaf would survive.
+    gaps = np.diff(np.concatenate([sorted_ratios, [0.0]]).astype(float)) * -1.0
+    cut = int(np.argmax(gaps)) + 1
+    return np.array(candidates, np.int64), index[order[:cut]]
+
+
+def own_by_subtree(graph: csr_matrix, tips: np.ndarray, contact: np.ndarray,
+                  n_points: int) -> np.ndarray:
+    """Which leaf each point is on, following the plant's own branching.
+
+    The rule this replaces was "whichever tip is nearest across the surface",
+    and it splits two leaves at the *midpoint between their tips* rather than
+    where they separate. That is only the same place when both leaves are the
+    same length. Measured on thistle3, whose tips sit 53 to 163 voxels from
+    the crown: the shortest leaf's territory reached 55 voxels up every
+    neighbour's stalk, so one instance held 29% of all leaf tissue and wrapped
+    357 degrees around the crown, against 24-43 degrees for a real leaf. The
+    midribs fitted to those instances inherited the borrowed stalks.
+
+    Blocking travel through the contact points was meant to stop exactly this
+    and cannot: on thistle3 that is 198 nodes out of 54,670, and the tissue
+    around a crown is a continuous sheet, so a front simply walks around them.
+
+    So ask a structural question instead of a metric one. Grow a
+    shortest-path forest out from the base and look at what lies *beyond*
+    each point:
+
+      exactly one tip beyond it   -> it is on that leaf
+      two or more tips beyond it  -> it is crown or trunk, shared, no leaf
+      no tip beyond it            -> a dead end; it belongs where its parent does
+
+    Returns (owner, shared). `shared` is the crown/trunk tissue -- the points
+    with two or more leaves beyond them, plus the base itself. It is reported
+    separately because "no leaf owns this" and "no leaf reaches this" need
+    different handling downstream: the first is an anatomical fact about a
+    crown and must stay unclaimed, the second is a fragment that may deserve
+    an instance of its own.
+
+    Boundaries then land where the stalks actually diverge, whatever the leaf
+    lengths, and nothing here carries a length, a count or a tuned constant --
+    it is the branching itself doing the deciding.
+    """
+    distance, predecessor, _ = dijkstra(graph, directed=False, indices=contact,
+                                        min_only=True, return_predecessors=True)
+    reachable = np.isfinite(distance)
+    outward = np.argsort(np.where(reachable, distance, -np.inf))
+
+    beyond = np.zeros(n_points, np.int64)     # accepted tips past this point
+    which = np.full(n_points, -1, np.int64)   # the one tip, while there is one
+    for rank, tip in enumerate(tips):
+        beyond[int(tip)] += 1
+        which[int(tip)] = rank
+
+    for node in outward[::-1]:                # deepest first: gather toward the base
+        parent = predecessor[node]
+        if parent < 0 or not reachable[node] or beyond[node] == 0:
             continue
-        candidates.append(int(index))
-        if (peak - saddle) / max(peak, 1e-12) > min_persistence_ratio:
-            accepted.append(int(index))
-    return np.array(candidates, np.int64), np.array(accepted, np.int64)
+        if beyond[parent] == 0:
+            which[parent] = which[node]
+        elif which[parent] != which[node]:
+            which[parent] = -1
+        beyond[parent] += beyond[node]
 
-
-def grow_from_tips(
-    graph: csr_matrix, tips: np.ndarray, n_points: int,
-    blocked_at: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Claim leaf tissue for the tip that reaches it with least travel.
-
-    Growing inward from the tips rather than outward from the stem is what
-    separates two blades fused at the apex: their fronts meet at the fusion
-    instead of being decided by a contact patch they share.
-
-    `blocked_at` -- the leaf points touching the stem -- may be *reached* but
-    not travelled through. Without that, a front runs down its own blade,
-    arrives at the stem and simply keeps going up whatever it meets next, so a
-    tiny bud on the far side ends up on the end of another leaf's midrib. A
-    leaf's territory has to stop where the leaf does.
-    """
-    if blocked_at is not None and len(blocked_at):
-        graph = graph.tolil(copy=True)
-        for point in blocked_at:
-            graph.rows[int(point)] = []
-            graph.data[int(point)] = []
-        graph = graph.tocsr()
-        directed = True
-    else:
-        directed = False
-
-    best = np.full(n_points, np.inf)
     owner = np.full(n_points, -1, np.int64)
-    for instance, tip in enumerate(tips):
-        distances = dijkstra(graph, directed=directed, indices=[int(tip)], min_only=True)
-        closer = distances < best
-        best[closer] = distances[closer]
-        owner[closer] = instance
-    return owner, best
+    shared = np.zeros(n_points, bool)
+    for node in outward:                      # base first: hand ownership outward
+        if not reachable[node]:
+            continue
+        if beyond[node] >= 2:
+            shared[node] = True
+        elif beyond[node] == 1:
+            owner[node] = which[node]
+        elif predecessor[node] >= 0:
+            owner[node] = owner[predecessor[node]]
+            shared[node] = shared[predecessor[node]]
+        else:
+            shared[node] = True               # a base node with nothing beyond it
+    return owner, shared
+
+
+def distance_to_own_tip(graph: csr_matrix, tips: np.ndarray, owner: np.ndarray,
+                        n_points: int) -> np.ndarray:
+    """Geodesic distance from each point to the tip of the leaf it is on.
+
+    Separate from ownership now that the two are decided differently: the
+    midrib fit needs how far a point is along *its own* leaf, which is no
+    longer the distance to the nearest tip.
+    """
+    out = np.full(n_points, np.inf)
+    for rank, tip in enumerate(tips):
+        mine = owner == rank
+        if not mine.any():
+            continue
+        reach = dijkstra(graph, directed=False, indices=[int(tip)], min_only=True)
+        out[mine] = reach[mine]
+    return out
+
+
+def keep_largest_blob(graph: csr_matrix, owner: np.ndarray,
+                      spacing_factor: float = 3.0) -> Tuple[np.ndarray, List[dict]]:
+    """Reduce each leaf to its own connected blob, releasing the rest.
+
+    Ownership is decided by walking the plant's branching, and where two
+    leaves touch, the branching itself is wrong: the surface joins them, so a
+    stretch of one leaf can hang off the other's subtree. What that produces
+    is recognisable -- an instance made of one large blob, its real leaf, plus
+    a small detached blob sitting over a neighbour, with a clear gap between
+    the two because the tissue joining them near the crown is shared and owned
+    by neither.
+
+    Being detached is the evidence. A leaf is one connected piece of plant, so
+    a component that does not touch the instance's main body is not part of
+    that leaf whatever the graph said. The minority is released rather than
+    reassigned: it is nearly always the neighbour's, but "nearly always" is
+    not a thing to encode, and released tissue is picked up by the midrib fit
+    of whichever leaf actually runs through it.
+
+    Connectivity has to be judged by distance, not by the kNN graph: that
+    graph always joins the ten nearest neighbours however far away they are,
+    so it bridges the very gap this is looking for, and components taken
+    straight off it never split. Edges longer than `spacing_factor` times the
+    instance's own median edge are cut first -- a ratio against the plant's
+    own sampling, so it carries no length and does not care how big the
+    specimen is. Swept on thistle3 the split is identical from 1.5 to 4.0 and
+    stops firing at 4.5, so the default sits in the middle of a wide plateau
+    rather than on an edge.
+    """
+    released: List[dict] = []
+    for instance in range(int(owner.max()) + 1 if (owner >= 0).any() else 0):
+        member = np.nonzero(owner == instance)[0]
+        if len(member) < 2:
+            continue
+        sub = graph[member][:, member].tocoo()
+        lengths = sub.data[sub.data > 0]
+        if not len(lengths):
+            continue
+        limit = spacing_factor * float(np.median(lengths))
+        near = sub.data <= limit
+        pruned = csr_matrix((sub.data[near], (sub.row[near], sub.col[near])),
+                            shape=sub.shape)
+        count, component = connected_components(pruned, directed=False)
+        if count <= 1:
+            continue
+        sizes = np.bincount(component)
+        main = int(np.argmax(sizes))
+        stray = member[component != main]
+        owner[stray] = -1
+        released.append({"instance": instance, "kept": int(sizes[main]),
+                         "released": int(len(stray)), "blobs": int(count)})
+    return owner, released
 
 
 def claim_orphans(
     graph: csr_matrix, owner: np.ndarray, distance: np.ndarray,
     depth: np.ndarray, min_points: int, min_depth: float,
+    exclude: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[int]]:
     """Give leftover tissue its own instance rather than someone else's.
 
@@ -351,7 +502,14 @@ def claim_orphans(
     block just cut off. Anything failing either test stays honestly
     unassigned rather than being attached to a leaf it does not belong to.
     """
+    # `exclude` is the crown/trunk: tissue that genuinely belongs to no single
+    # leaf because several pass through it. Left in, it is one big connected
+    # component that clears both bars and becomes a "leaf" wrapping the whole
+    # plant -- measured on thistle3 as a 5,952-point instance spanning 357
+    # degrees, which is the crown wearing a leaf's colour.
     free = owner < 0
+    if exclude is not None:
+        free &= ~exclude
     if not free.any():
         return owner, distance, []
 
@@ -385,7 +543,7 @@ def instance_by_tips(
     k_neighbors: int = 10,
     min_points: int = 150,
     min_tip_depth: float = 0.0,
-    min_persistence_ratio: float = 0.5,
+    min_persistence_ratio: Optional[float] = None,
     architecture: str = "caulescent",
 ) -> Instancing:
     """Split leaf tissue into leaves, keeping every intermediate.
@@ -426,9 +584,16 @@ def instance_by_tips(
 
     records = tip_persistence(graph, depth)
     candidates, tips = select_tips(records, min_tip_depth, min_persistence_ratio)
-    owner, distance_from_tip = grow_from_tips(graph, tips, n, blocked_at=contact)
+    owner, shared = own_by_subtree(graph, tips, contact, n)
+    distance_from_tip = distance_to_own_tip(graph, tips, owner, n)
     owner, distance_from_tip, orphan_tips = claim_orphans(
-        graph, owner, distance_from_tip, depth, min_points, min_tip_depth)
+        graph, owner, distance_from_tip, depth, min_points, min_tip_depth,
+        exclude=shared)
+
+    # Second pass, after the instances exist: a leaf is one connected piece,
+    # so anything of an instance that is detached from its main body was
+    # taken from a neighbour across a contact.
+    owner, _released = keep_largest_blob(graph, owner)
     if orphan_tips:
         tips = np.concatenate([tips, np.array(orphan_tips, np.int64)])
 
@@ -756,26 +921,37 @@ def _crown_base(leaf_points, stem_points, graph, k_neighbors):
 
 
 def chord_midrib(points: np.ndarray, base: np.ndarray, tip: np.ndarray,
+                 spare: Optional[np.ndarray] = None, heart: bool = False,
                  num_stations: int = 14, degree: int = 3,
                  min_bin: int = 3) -> np.ndarray:
     """A midrib built as a bend applied to the straight base-to-tip line.
 
-    The previous construction chained centroids of geodesic shells. On a
-    merged or cupped instance those centroids can sit anywhere -- shells far
-    from the tip contain tissue from two different blades, so their centroid
-    lands between them -- and the resulting polyline loops, doubles back, or
-    crosses a neighbouring leaf. Nothing in it forces progress from base to
-    tip.
+    Every point is projected onto the chord, so stations advance from base to
+    tip and cannot reverse. The only freedom is lateral, and it is forced to
+    vanish at both ends, so the curve begins exactly at the base and ends
+    exactly at the tip whatever the data does.
 
-    Here the chord *is* the parameter. Every point is projected onto it, so
-    stations advance from base to tip by construction and cannot reverse. The
-    only freedom is lateral: two offset functions of t, each forced to vanish
-    at both ends, so the curve begins exactly at the base and ends exactly at
-    the tip whatever the data does. Fitting them as low-order polynomials
-    caps how much the curve can wriggle -- a leaf midrib is a gentle arc, and
-    a cubic cannot tie a knot.
+    `heart` switches which of two situations this leaf is in, and it matters
+    because the right answer is opposite in each:
 
-    Returns a polyline from `base` to `tip`.
+    * **A normal leaf** has tissue along most of its length. Its own points
+      describe its shape, so the bend is fitted across the whole chord, with
+      shared tissue standing in for the few stations it lacks.
+    * **A heart leaf** -- one of the small upright leaves at the centre of a
+      rosette -- is the straight chord, end to end, and none of its points
+      are consulted. Seen from above the cloud closes over the middle of the
+      plant slightly higher than those leaves attach, so about half their
+      length is not reconstructed at all; and what does survive is a
+      one-sided sliver rather than a blade seen from both edges. A station's
+      centre is the midpoint of the tissue in it, so lopsided tissue puts the
+      station off the vein, and the curve waves from station to station. The
+      leaves this applies to are short and near-upright, so the straight line
+      between crown and tip is already a good midrib for them -- better than
+      one bent toward whichever side happened to be reconstructed.
+
+    Applying the heart-leaf rule to every leaf was tried and is wrong: a
+    well-supported leaf loses the part of its shape that its own points were
+    perfectly able to describe.
     """
     base = np.asarray(base, float).reshape(3)
     tip = np.asarray(tip, float).reshape(3)
@@ -785,42 +961,73 @@ def chord_midrib(points: np.ndarray, base: np.ndarray, tip: np.ndarray,
         return np.vstack([base, tip])
     u = axis / length
 
-    # two directions across the chord, so lateral offset has two components
+    if heart:
+        # Straight, and deliberately without looking at the points: see above.
+        return base + np.outer(np.linspace(0.0, 1.0, 40), axis)
+
+    def project(cloud):
+        rel = np.asarray(cloud, float) - base
+        t = (rel @ u) / length
+        inside = (t >= 0.0) & (t <= 1.0)
+        return t[inside], rel[inside]
+
+    t, rel = project(points)
+    if len(t) < min_bin:
+        return np.vstack([base, tip])
+    t_spare, rel_spare = project(spare) if spare is not None and len(spare) else (
+        np.zeros(0), np.zeros((0, 3)))
+
+    # A heart leaf bends only over the stretch it actually occupies; a normal
+    # leaf over the whole chord. `lift` is the power the offset basis starts
+    # at: 2 makes the curve leave the chord tangentially at the join, which
+    # only matters when there is a join.
+    origin_t, lift, span = 0.0, 1, 1.0
+
     helper = np.array([0.0, 0.0, 1.0])
     if abs(u @ helper) > 0.9:
         helper = np.array([1.0, 0.0, 0.0])
     e1 = np.cross(u, helper); e1 /= np.linalg.norm(e1)
     e2 = np.cross(u, e1)
 
-    rel = points - base
-    t = (rel @ u) / length
-    inside = (t >= 0.0) & (t <= 1.0)
-    if inside.sum() < min_bin:
-        return np.vstack([base, tip])
-    t, rel = t[inside], rel[inside]
-
-    edges = np.linspace(0.0, 1.0, num_stations + 1)
+    edges = np.linspace(origin_t, 1.0, num_stations + 1)
     ts, o1, o2 = [], [], []
+    own_stations = 0
     for a, b in zip(edges[:-1], edges[1:]):
         m = (t >= a) & (t < b) if b < 1.0 else (t >= a) & (t <= b)
-        if m.sum() < min_bin:
+        if m.sum() >= min_bin:
+            station_t, centre = float(t[m].mean()), rel[m].mean(axis=0)
+            own_stations += 1
+        elif len(t_spare):
+            # Shared tissue nearest this leaf's own line -- its petiole --
+            # standing in where the instance has nothing. Never for a heart
+            # leaf: there the shared tissue is what pulls the curve off.
+            n = (t_spare >= a) & (t_spare < b) if b < 1.0 else (t_spare >= a) & (t_spare <= b)
+            if n.sum() < min_bin:
+                continue
+            here = rel_spare[n]
+            lateral = np.linalg.norm(here - np.outer((here @ u), u), axis=1)
+            closest = np.argsort(lateral)[:max(min_bin, len(here) // 8)]
+            station_t = float(t_spare[n][closest].mean())
+            centre = np.median(here[closest], axis=0)
+        else:
             continue
-        ts.append(float(t[m].mean()))
-        ts_rel = rel[m].mean(axis=0)
-        o1.append(float(ts_rel @ e1))
-        o2.append(float(ts_rel @ e2))
+        ts.append((station_t - origin_t) / span)
+        o1.append(float(centre @ e1))
+        o2.append(float(centre @ e2))
     if len(ts) < 2:
         return np.vstack([base, tip])
 
-    # basis t^k (1 - t): every term is zero at t=0 and t=1, so the endpoints
-    # are exact rather than fitted.
+    # One polynomial term per three stations of this leaf's own tissue, so a
+    # curve never carries more bend than the evidence behind it.
+    degree = int(np.clip(max(own_stations, len(ts)) // 3, 1, degree))
     ts = np.asarray(ts)
-    design = np.stack([ts ** k * (1.0 - ts) for k in range(1, degree + 1)], axis=1)
+    design = np.stack([ts ** k * (1.0 - ts) for k in range(lift, degree + lift)], axis=1)
     c1, *_ = np.linalg.lstsq(design, np.asarray(o1), rcond=None)
     c2, *_ = np.linalg.lstsq(design, np.asarray(o2), rcond=None)
 
     grid = np.linspace(0.0, 1.0, 40)
-    basis = np.stack([grid ** k * (1.0 - grid) for k in range(1, degree + 1)], axis=1)
+    tau = np.clip((grid - origin_t) / span, 0.0, 1.0).reshape(-1, 1)
+    basis = np.concatenate([tau ** k * (1.0 - tau) for k in range(lift, degree + lift)], axis=1)
     return (base + np.outer(grid * length, u)
             + np.outer(basis @ c1, e1) + np.outer(basis @ c2, e2))
 
@@ -927,7 +1134,7 @@ def build_from_labels(
     contact_voxels: float = 3.0,
     min_leaf_points: int = 150,
     min_tip_depth_voxels: float = 8.0,
-    min_persistence_ratio: float = 0.5,
+    min_persistence_ratio: Optional[float] = None,
     k_neighbors: int = 10,
     architecture: str = "caulescent",
 ) -> LabelledStructure:
@@ -1088,11 +1295,39 @@ def build_from_labels(
         # everything between them advances, and on a merged instance it does
         # not. Projecting onto the chord makes progress structural.
         if base_point is not None and len(curve) > 1:
-            chorded = chord_midrib(leaf_points[member], base_point, curve[-1])
+            # To the tip itself, not to the blade chain's last station. That
+            # station is a shell *centroid*, so it stops a shell short of the
+            # leaf's actual end -- which is why the midrib and its chord
+            # agreed with each other and both fell short of the tip.
+            # A heart leaf: one of the small upright ones at the centre of
+            # the rosette, told apart by how steeply the crown-to-tip line
+            # rises out of the ground plane. They are the leaves the cloud
+            # fails to reconstruct near the crown, and the only ones the
+            # straight-chord rule belongs to.
+            rise = np.asarray(tip, float) - np.asarray(base_point, float)
+            reach = float(np.linalg.norm(rise))
+            elevation = np.degrees(np.arcsin(np.clip(rise[2] / max(reach, 1e-9), -1.0, 1.0)))
+            chorded = chord_midrib(leaf_points[member], base_point, tip,
+                                   spare=leaf_points[instancing.owner < 0],
+                                   heart=elevation >= HEART_LEAF_ELEVATION)
+            # Always the chord construction now. Selecting between it and
+            # the geodesic station chain was tried and is subtly wrong: the
+            # chain is built from real points, so "which curve sits closer to
+            # this leaf's tissue" always picks it -- including across the
+            # attachment gap, where the chain gets there by detouring around
+            # the hole. That detour is the outward bow. The chord fit crosses
+            # the gap on the shared tissue lying along this leaf's own line,
+            # and follows the blade wherever the blade exists.
             if len(chorded) > 1:
                 curve = chorded
+                chorded_fit = True
 
-        if len(curve) > 3:
+        # Only the station chain needs smoothing. `chord_midrib` already
+        # returns an analytic cubic that meets the base and the tip exactly,
+        # so running a smoothing spline over it does nothing but drag those
+        # endpoints off -- which is what left the midrib stopping short and
+        # then taking an elbow to reach its tip.
+        if not chorded_fit and len(curve) > 3:
             thickness = float(np.median(cKDTree(leaf_points[member]).query(curve)[0]))
             curve = fit_smooth_curve(curve, tolerance=max(2.0 * thickness, voxel))
 
@@ -1102,7 +1337,9 @@ def build_from_labels(
         # starting 3.3 to 11.9 voxels away from a crown they were supposed to
         # begin at. Every tip has to reach the base or the skeleton is not
         # connected.
-        if base_point is not None and len(curve):
+        # Only the smoothed chain needs its base put back; the chord fit
+        # already starts there.
+        if not chorded_fit and base_point is not None and len(curve):
             curve = np.vstack([np.asarray(base_point, float).reshape(1, 3), curve[1:]])
         axes.append(curve)
         tips.append(tip)

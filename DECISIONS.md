@@ -1115,3 +1115,82 @@ and `p5.json` stale.
 is tilted, because `solve_up_direction` resolves "up" against the table
 plane and that specimen is held nearly horizontal. Confirmable by checking
 whether the tilt predates any of this on a stashed tree.
+
+## 2026-08-28 — P5 midribs: heart leaves, and three open questions
+
+State at the end of this session, and what is deliberately unresolved.
+
+### What changed
+
+- **Leaf ownership follows the branching, not distance.** `own_by_subtree`
+  replaces "nearest tip across the surface". The old rule split two leaves
+  at the *midpoint between their tips*, which is the crown only when both
+  are the same length -- so the shortest leaf annexed its neighbours'
+  stalks. On thistle3 one instance held 29% of all leaf tissue and wrapped
+  357 degrees around the crown, against 24-43 degrees for a real leaf.
+- **Tip acceptance is cut at the widest gap** in the ranked persistence
+  ratios rather than at a fixed 0.5. Measured on thistle3 the real leaves
+  ran 1.00 0.96 0.90 0.88 0.73 0.57 0.48 0.37 and the noise began at 0.10:
+  the old constant sat *inside* the run of real leaves and discarded two of
+  them, one by 0.02.
+- **`keep_largest_blob`** releases any part of an instance detached from its
+  main body, which is tissue taken from a neighbour across a contact.
+  Connectivity is judged after cutting edges longer than 3x the instance's
+  own median edge -- the kNN graph joins the ten nearest neighbours however
+  far apart, so components taken straight off it never split. Identical
+  result from 1.5 to 4.0, stops firing at 4.5.
+- **Heart leaves are drawn as the straight crown-to-tip chord**, points not
+  consulted, selected by `HEART_LEAF_ELEVATION` (45 degrees of crown-to-tip
+  rise). Seen from above the cloud closes over the middle of a rosette
+  slightly higher than the central leaves attach, so about half their length
+  is not reconstructed and what survives is a one-sided sliver. A station is
+  the midpoint of the tissue in it, so lopsided tissue puts every station
+  off the vein and the fitted curve waves between them. These leaves are
+  short and near-upright, so the chord is the better estimate.
+
+### Open question 1: "steep" is not the same as "poorly supported"
+
+`HEART_LEAF_ELEVATION` classifies on angle alone, which is what the operator
+specified, and on thistle3 it catches one leaf it arguably should not:
+
+| leaf | points | elevation | chord supported by its own tissue |
+|---|---|---|---|
+| 1 | 12,761 | +55 deg | **72%** |
+| 4 | 2,123 | +56 deg | 49% |
+| 7 | 470 | +80 deg | 48% |
+
+`p5/diag/heart_leaf_check.png` plots both candidate midribs against the
+points for exactly these leaves. It shows the distinction clearly: on leaf 1
+the fitted curve is a gentle 2-voxel bow that tracks its own tissue and is
+mildly *better* than the chord; on leaves 4 and 7 the fitted curve arcs 5-8
+voxels through regions that are almost entirely *unassigned* tissue
+belonging to other leaves. So requiring **steep and poorly supported** would
+be more correct -- support splits 72% against 49%/48%, a clean gap.
+
+Not done because the gain is one 2-voxel bow on one leaf, against a second
+constant to re-check per species. Revisit if a specimen turns up with large
+upright leaves that visibly need their curvature.
+
+### Open question 2: tissue with no tip of its own is claimed by a neighbour
+
+`own_by_subtree` hands a dead-end branch to whichever leaf its parent
+belongs to. The rule it replaced blocked travel through the base contact so
+that such tissue stayed unclaimed and `claim_orphans` could promote it. On a
+real plant the junction usually has two leaves beyond it and comes out
+shared, and `keep_largest_blob` releases detached remnants -- but a bud with
+no tip of its own, still connected, will now join a neighbour rather than
+becoming its own instance. That is the failure the deleted
+`test_growth_stops_at_the_stem` guarded against, and nothing covers it now.
+
+### Open question 3: `min_leaf_points` is the last size-dependent constant
+
+An absolute point count (150). Everything else in this stage is a ratio, a
+rank or a comparison. It should become a fraction of total leaf tissue
+before the pipeline meets a much denser or sparser cloud.
+
+### Removed as dead
+
+`grow_from_tips` (superseded by `own_by_subtree`), and `get_camera_data` /
+`CameraView` in `reconstruction.py`, which served the Gaussian-splat trainer
+deleted earlier. `read_tips` is kept: nothing in-repo calls it, but it is
+the reader for `p4c/tips3d.json`, which `pose-tips` still writes.

@@ -307,17 +307,36 @@ silently treated as certain.
 3. Find the peaks of that distance that survive all the way down to the stem
    before merging with another peak (`tip_persistence`). Those are leaf tips.
    Two bumps on one blade join high up on that blade; two genuinely different
-   leaves can only join by descending to where they both meet the stem.
-4. Grow inward from each tip. Every leaf point joins whichever tip it reaches
-   first (`grow_from_tips`). Growth cannot travel *through* the stem contact
-   points, so one leaf's territory stops where the leaf does.
+   leaves can only join by descending to where they both meet the stem. How
+   far a peak must survive to count is read off the plant rather than fixed:
+   the peaks are ranked and split at the widest gap in that ranking
+   (`select_tips`).
+4. Walk outward from the base and ask, at each point, which leaf lies beyond
+   it (`own_by_subtree`). One leaf beyond it means the point is on that leaf;
+   two or more means it is crown or trunk, shared, and on no leaf. Deciding
+   by *nearest* tip instead splits two leaves at the midpoint between their
+   tips, which is where they meet only if both are the same length -- so the
+   shorter leaf took the base of every longer one.
+5. Finally, release any part of an instance that is detached from its main
+   body (`keep_largest_blob`): a leaf is one connected piece of plant, so a
+   separate blob was taken from a neighbour where the two touch.
 
 Output `p5/leaf_points.npy` — an instance id per leaf point. That is what gets
 coloured per leaf.
 
 The midrib of each leaf is then the centroid of successive shells of geodesic
 distance from its tip, carried on past the blade to the fork where it leaves
-the stem (`leaf_midrib`, `trunk_and_attachments`).
+the stem (`leaf_midrib`, `trunk_and_attachments`), and finally rebuilt as a
+bend on the straight base-to-tip chord (`chord_midrib`) so that it advances
+from base to tip and cannot double back.
+
+The small upright leaves at the centre of a rosette are the exception: they
+are drawn as the straight chord, points not consulted. Seen from above the
+cloud closes over the middle of the plant slightly higher than they attach,
+so roughly half their length is never reconstructed and what survives is a
+one-sided sliver -- and a station placed at the midpoint of lopsided tissue
+sits off the vein, which makes the fitted curve wave. They are told apart by
+how steeply the crown-to-tip line rises (`HEART_LEAF_ELEVATION`).
 
 ---
 

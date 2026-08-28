@@ -13,17 +13,6 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 
 
-@dataclass
-class CameraView:
-    """One registered image's camera, for feeding a Gaussian Splat trainer."""
-
-    image_path: Path
-    width: int
-    height: int
-    K: np.ndarray  # (3, 3) intrinsics
-    world_to_camera: np.ndarray  # (4, 4) extrinsics
-
-
 def build_sparse_reconstruction(
     image_dir: Union[str, Path],
     output_dir: Union[str, Path],
@@ -144,26 +133,3 @@ def get_registered_camera_poses(reconstruction) -> Tuple[np.ndarray, np.ndarray,
     return np.array(centers), np.array(directions), names
 
 
-def get_camera_data(reconstruction, images_dir: Union[str, Path]) -> List[CameraView]:
-    """Per-registered-image intrinsics/extrinsics/image path, for the
-    Gaussian Splat trainer's training views.
-    """
-    images_dir = Path(images_dir)
-    views = []
-    for image_id in reconstruction.reg_image_ids():
-        image = reconstruction.images[image_id]
-        camera = reconstruction.cameras[image.camera_id]
-
-        world_to_camera = np.eye(4)
-        world_to_camera[:3, :] = image.cam_from_world().matrix()
-
-        views.append(
-            CameraView(
-                image_path=images_dir / image.name,
-                width=camera.width,
-                height=camera.height,
-                K=camera.calibration_matrix(),
-                world_to_camera=world_to_camera,
-            )
-        )
-    return views

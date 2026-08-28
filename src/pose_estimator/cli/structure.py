@@ -37,6 +37,12 @@ from pose_estimator.structure_viz import (
 )
 
 STEM_RGB = (160, 60, 200)
+# A rosette has no stem. P4c still labels its crown "stem" -- the crown is
+# thick and not lamina, so that is a reasonable thing for a patch classifier
+# to say -- but exporting it as a stem draws a organ the plant does not have,
+# sitting in among the leaves. On a rosette it is written in the crown's own
+# grey instead, which is what it anatomically is.
+CROWN_RGB = (200, 200, 200)
 ROOT_RGB = (240, 140, 40)
 PALETTE = np.array([[230, 60, 60], [60, 200, 100], [70, 130, 240], [240, 190, 60],
                     [200, 90, 220], [70, 210, 210], [240, 140, 80], [150, 220, 80]], np.uint8)
@@ -48,7 +54,7 @@ def run(
     contact_voxels: float = 3.0,
     min_leaf_points: int = 150,
     min_tip_depth_voxels: float = 8.0,
-    min_persistence_ratio: float = 0.5,
+    min_persistence_ratio: Optional[float] = None,
     architecture: str = "caulescent",
 ) -> dict:
     import pycolmap
@@ -136,7 +142,8 @@ def run(
     stem_ids = [i for i, n in enumerate(class_order) if n in ("stem", "petiole", "branch")]
     stem_points = upright[np.isin(labels, stem_ids)]
 
-    _write_outputs(p5_dir, structure, stem_points, frame, clamp)
+    _write_outputs(p5_dir, structure, stem_points, frame, clamp,
+                   stem_rgb=CROWN_RGB if architecture == "rosette" else STEM_RGB)
     _write_instancing_artifacts(p5_dir, structure, voxel)
 
     # A "leaf tip" seed class, if the seeds defined one, written as its own
@@ -254,7 +261,8 @@ def _ply(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
         "blue": rgb[:, 2].astype(np.uint8)})
 
 
-def _write_outputs(p5_dir: Path, structure, stem_points: np.ndarray, frame, clamp) -> None:
+def _write_outputs(p5_dir: Path, structure, stem_points: np.ndarray, frame, clamp,
+                   stem_rgb=STEM_RGB) -> None:
     graph = {
         "plant_frame": frame.to_dict(),
         "clamp_detected": clamp is not None,
@@ -316,7 +324,7 @@ def _write_outputs(p5_dir: Path, structure, stem_points: np.ndarray, frame, clam
 
     parts = [(structure.leaf_points, leaf_colors)]
     if len(stem_points):
-        parts.append((stem_points, np.tile(np.array([STEM_RGB], np.uint8), (len(stem_points), 1))))
+        parts.append((stem_points, np.tile(np.array([stem_rgb], np.uint8), (len(stem_points), 1))))
     if structure.root_points is not None and len(structure.root_points):
         parts.append((structure.root_points,
                       np.tile(np.array([ROOT_RGB], np.uint8), (len(structure.root_points), 1))))
@@ -434,12 +442,13 @@ def main(argv: Optional[list] = None) -> None:
                              "level with no stem at all (thistle, sugar beet); the crown is "
                              "located geometrically and stem labels are ignored. Not "
                              "inferred -- you know which it is when you shoot it.")
-    parser.add_argument("--min-persistence-ratio", type=float, default=0.5,
-                        help="A maximum is its own leaf when it survives down through this "
-                             "fraction of its own depth before joining another. A real leaf "
-                             "only joins at the stem, so its ratio is near 1; a second high "
-                             "point on one blade joins high up and scores low. On plant_9 the "
-                             "leaf count holds at 7 across 0.4-0.5.")
+    parser.add_argument("--min-persistence-ratio", type=float, default=None,
+                        help="Override the automatic tip cut with a fixed persistence "
+                             "ratio. By default the cut is read off this plant: the "
+                             "candidates are ranked by persistence and split at the widest "
+                             "gap, which separates leaves from bumps without a constant. "
+                             "A fixed value is a knife-edge -- on thistle3 the old 0.5 "
+                             "default discarded a real leaf scoring 0.48.")
     args = parser.parse_args(argv)
 
     run(workdir=args.workdir, source=args.source,

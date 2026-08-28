@@ -357,7 +357,37 @@ def frame_view(centre, extent):
                 space.clip_end = max(extent * 1000.0, 100.0)
 
 
+def clear_startup_scene():
+    """Remove Blender's default Cube, Camera and Light before building.
+
+    This script is always launched into a fresh Blender, so what is in the
+    scene at this point is the startup file and nothing of the user's. The
+    cube in particular is not harmless decoration: it sits at the origin, at
+    a size comparable to a plant, and the framing step below sizes the view
+    to everything visible.
+
+    Only the three startup objects are touched, and only when they still look
+    like the defaults -- a mesh named "Cube" with 8 vertices. Anything the
+    user has since made or renamed is left alone.
+    """
+    # `scene.objects`, not `scene.collection.objects`: the startup file puts
+    # its three objects inside a child collection named "Collection", so the
+    # scene's own collection is empty and a direct loop finds nothing.
+    scene = bpy.context.scene
+    removed = []
+    for obj in list(scene.objects):
+        default_cube = (obj.type == "MESH" and obj.name == "Cube"
+                        and len(obj.data.vertices) == 8)
+        if default_cube or (obj.type in {"CAMERA", "LIGHT"}
+                            and obj.name in {"Camera", "Light"}):
+            removed.append(obj.name)
+            bpy.data.objects.remove(obj, do_unlink=True)
+    if removed:
+        print("[plant] cleared startup objects: " + ", ".join(removed))
+
+
 def build(workdir, point_radius=None, stem_radius=None, frame=True):
+    clear_startup_scene()
     loaded = load(workdir)
     if loaded is None:
         return None
@@ -493,7 +523,22 @@ def resolve_workdir(argv):
     return os.environ.get("PLANT_WORKDIR", "")
 
 
+def hide_splash():
+    """Stop the splash screen ("what kind of new file?") from opening.
+
+    Startup `--python` scripts run before the first window draw, so clearing
+    the preference here takes effect for this launch. It is set on the
+    running session only and never saved, so the user's own preference file
+    is left as they set it.
+    """
+    try:
+        bpy.context.preferences.view.show_splash = False
+    except Exception:
+        pass          # a Blender build without the preference is not worth failing over
+
+
 def main():
+    hide_splash()
     target = resolve_workdir(list(sys.argv))
     if not target:
         # Printed, never raised: SystemExit here would close Blender, which is
