@@ -59,6 +59,10 @@ import numpy as np
 WORKDIR = ""
 
 STEM_RGBA = (1.0, 1.0, 1.0, 1.0)          # deliberately not a leaf colour
+# The two ends of the stem line, drawn as balls in colours nothing else uses,
+# so "is the crown in the right place?" can be answered by looking.
+CROWN_RGBA = (1.0, 0.85, 0.10, 1.0)       # yellow: foot of the stem, above the root
+HEART_RGBA = (0.10, 0.75, 1.0, 1.0)       # cyan: top of the stem, where leaves start
 
 # The organ colours P5 writes into structure.ply (cli/structure.py's ROOT_RGB
 # and STEM_RGB), normalised the way read_ply returns them. Used only to split
@@ -225,17 +229,37 @@ def vertex_colour_material(name):
     return mat
 
 
+# Collections this run has already emptied. Clearing has to happen once per
+# run, not once per call: `collection()` is a lookup, and several things go
+# into the same collection -- the stem line, the crown and the heart all land
+# in plant_stem. Clearing on every call meant the second caller deleted what
+# the first had just drawn.
+_PREPARED = set()
+
+
+def _in_scene(coll):
+    """Whether `coll` hangs anywhere under the current scene."""
+    root = bpy.context.scene.collection
+    return coll is root or coll in root.children_recursive
+
+
 def collection(name):
-    if name in bpy.data.collections:
-        existing = bpy.data.collections[name]
+    existing = bpy.data.collections.get(name)
+    if existing is None:
+        made = bpy.data.collections.new(name)
+        bpy.context.scene.collection.children.link(made)
+        _PREPARED.add(name)
+        return made
+    if name not in _PREPARED:
+        # First touch this run: throw away what the previous run left, so
+        # re-running in an open Blender replaces the build instead of
+        # stacking a second copy on top of it.
         for obj in list(existing.objects):
             bpy.data.objects.remove(obj, do_unlink=True)
-        if not existing.users_scene:
-            bpy.context.scene.collection.children.link(existing)
-        return existing
-    made = bpy.data.collections.new(name)
-    bpy.context.scene.collection.children.link(made)
-    return made
+        _PREPARED.add(name)
+    if not _in_scene(existing):
+        bpy.context.scene.collection.children.link(existing)
+    return existing
 
 
 def _matches_colour(rgb, target, tolerance=1.5 / 255.0):
@@ -387,6 +411,7 @@ def clear_startup_scene():
 
 
 def build(workdir, point_radius=None, stem_radius=None, frame=True):
+    _PREPARED.clear()
     clear_startup_scene()
     loaded = load(workdir)
     if loaded is None:
@@ -431,7 +456,18 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True):
 
     if len(stem) > 1:
         add_curve(stem, "plant_stem_line", STEM_RGBA, stem_radius, collection("plant_stem"))
-    elif len(stem) == 1:
+
+    # Named ends, when P5 measured them (the upright path). Bigger than the
+    # line is thick, so they read as landmarks and not as kinks in it.
+    for key, name, rgba in (("crown_xyz", "plant_crown", CROWN_RGBA),
+                            ("heart_xyz", "plant_heart", HEART_RGBA)):
+        point = graph.get(key)
+        if point:
+            add_sphere(np.array(point, float), name, rgba, stem_radius * 2.5,
+                       collection("plant_stem"))
+            print(f"[plant] {name} at {np.round(point, 4).tolist()}")
+
+    if len(stem) == 1:
         # A rosette: P5 reports its base as one node because the leaves meet at
         # a crown rather than along a stem. Drawn as a curve that would be an
         # elbow of pipe no thistle has, so it gets a sphere instead.

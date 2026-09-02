@@ -98,7 +98,17 @@ def run(
     sparse = np.array([p.xyz for p in reconstruction.points3D.values()])
 
     orbit_origin, orbit_rotation = orbit_frame(orbit)
-    frame, clamp = solve_plant_frame(cloud, sparse, orbit_origin, orbit_rotation, voxel)
+    # Holder masks, so which way is up can be read off where the tool grips
+    # rather than guessed from a table plane the foliage outvotes.
+    cameras = None
+    holder_dir = workdir / "p2" / "masks" / "holder"
+    if holder_dir.is_dir() and any(holder_dir.iterdir()):
+        from pose_estimator.hull import load_carve_cameras
+
+        cameras = load_carve_cameras(reconstruction, workdir / "p2" / "masks" / "plant",
+                                     occluder_dir=holder_dir)
+    frame, clamp = solve_plant_frame(cloud, sparse, orbit_origin, orbit_rotation, voxel,
+                                     cameras=cameras)
     upright = frame.apply(cloud)
 
     if clamp is not None:
@@ -270,6 +280,10 @@ def _write_outputs(p5_dir: Path, structure, stem_points: np.ndarray, frame, clam
                               else "lowest point -- clamp not detectable"),
         "source": "p4c labels",
         "stem_path_xyz": structure.stem_path.tolist(),
+        # The two ends of an upright plant's stem line, named, so they can be
+        # drawn and argued with rather than inferred from the polyline.
+        "crown_xyz": None if structure.crown is None else np.asarray(structure.crown).tolist(),
+        "heart_xyz": None if structure.heart is None else np.asarray(structure.heart).tolist(),
         "leaves": [
             {
                 "id": i,
@@ -353,6 +367,17 @@ def _stem_check(structure) -> dict:
             "detail": (f"not applicable: --architecture rosette, leaves meet at a crown "
                        f"({spread:.1%} of extent) rather than along a stem"),
         }
+    if structure.crown is not None and structure.heart is not None:
+        # The upright path measures the stem line rather than tracing it, so
+        # it is two nodes by construction and a node count says nothing. What
+        # can fail is the two ends landing on top of each other, which is what
+        # this asks instead.
+        length = float(np.linalg.norm(np.asarray(structure.heart) - np.asarray(structure.crown)))
+        return {
+            "pass": length > 0.0,
+            "detail": (f"crown to heart, measured: {length:.4f} long "
+                       f"(z {structure.crown[2]:.4f} -> {structure.heart[2]:.4f})"),
+        }
     return {
         "pass": len(structure.stem_path) >= 3,
         "detail": f"{len(structure.stem_path)} stem centreline nodes",
@@ -434,7 +459,7 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--min-tip-depth-voxels", type=float, default=8.0,
                         help="Ignore maxima shallower than this. Low on purpose -- persistence "
                              "does the rejecting, so this only screens out surface noise.")
-    parser.add_argument("--architecture", choices=["caulescent", "rosette"],
+    parser.add_argument("--architecture", choices=["upright", "rosette", "caulescent"],
                         default="caulescent",
                         help="What kind of plant this is. caulescent (default): an upright "
                              "plant with a central stem; leaf depth is measured from the "
@@ -455,6 +480,8 @@ def main(argv: Optional[list] = None) -> None:
         contact_voxels=args.contact_voxels, min_leaf_points=args.min_leaf_points,
         min_tip_depth_voxels=args.min_tip_depth_voxels,
         min_persistence_ratio=args.min_persistence_ratio,
+        # "caulescent" is the old name for "upright", kept as an alias so
+        # existing commands and scripts keep working.
         architecture=args.architecture)
 
 

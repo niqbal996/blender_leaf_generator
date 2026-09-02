@@ -38,6 +38,8 @@ def run(
     num_threads: int = 8,
     max_image_size: int = 1920,
     use_gpu: bool = False,
+    low_texture: bool = False,
+    cameras: str = "single",
     reuse_sparse: bool = False,
     single_camera: bool = True,
 ) -> dict:
@@ -105,6 +107,8 @@ def run(
             num_threads=num_threads,
             max_image_size=max_image_size,
             use_gpu=use_gpu,
+            low_texture=low_texture,
+            cameras=cameras,
             single_camera=single_camera,
         )
 
@@ -141,6 +145,20 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--workdir", required=True, type=Path, help="Specimen run directory (must already have p1/ and p2/)")
     parser.add_argument("--num-threads", type=int, default=8, help="Threads for SIFT extraction")
     parser.add_argument(
+        "--cameras", choices=["single", "per-image", "auto"], default="single",
+        help="How COLMAP groups intrinsics. 'single' (default) is right when every "
+             "frame came from one camera at one zoom -- the normal rig. Use "
+             "'per-image' if the lens was zoomed or swapped between passes: one "
+             "shared focal cannot fit two, and the passes come back interleaved.")
+    parser.add_argument(
+        "--low-texture",
+        action="store_true",
+        help="Spend more time on features so more frames register. Turns on COLMAP's "
+             "viewpoint- and scale-robust descriptors (estimate_affine_shape, "
+             "domain_size_pooling), keeps weaker maxima and runs guided matching. "
+             "Use when frames fail to register on a small, smooth or softly-focused "
+             "subject; costs roughly 3-5x the extraction time.")
+    parser.add_argument(
         "--max-image-size",
         type=int,
         default=1920,
@@ -168,6 +186,8 @@ def main(argv: Optional[list] = None) -> None:
         workdir=args.workdir,
         num_threads=args.num_threads,
         max_image_size=args.max_image_size,
+        low_texture=args.low_texture,
+        cameras=args.cameras,
         use_gpu=args.use_gpu,
         reuse_sparse=args.reuse_sparse,
         single_camera=not args.per_image_cameras,

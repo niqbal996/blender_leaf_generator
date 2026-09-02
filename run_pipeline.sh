@@ -20,6 +20,12 @@
 #   ./run_pipeline.sh --video <file> --workdir runs/plant_9 \
 #       --backend sam --sam-checkpoint checkpoints/sam2.1_hiera_large.pt
 #
+#   --low-texture  spend more time on features so more frames register: COLMAP's
+#               viewpoint- and scale-robust descriptors, weaker maxima kept, and
+#               guided matching. For a small, smooth or softly-focused subject.
+#               Measured: 13/27 -> 26/27 frames on one capture, 11/54 -> 47/54 on
+#               another. Costs roughly 3-5x the feature-extraction time.
+#
 #   --use-gpu   run P3's SIFT on the GPU. Needs a CUDA pycolmap build
 #               (pip install pycolmap-cuda) with its bundled CUDA runtime on
 #               LD_LIBRARY_PATH -- setup_env.sh arranges both. Without it,
@@ -100,7 +106,11 @@
 # from the plant's base, so it needs a base to start from -- and which kind
 # you have is a property of the specimen, so you pass it in:
 #
-#   --architecture caulescent   (default) upright, with a central stem; leaf
+#   --architecture upright      (default) a central stem with leaves branching
+#                               off it; leaf depth is measured out from the
+#                               stem tissue P4c labelled. "caulescent" is the
+#                               old name for this and still works.
+#   --architecture caulescent   (deprecated alias for upright); leaf
 #                               depth is measured from the stem tissue P4c
 #                               labelled
 #   --architecture rosette      leaves radiate from a crown at ground level
@@ -132,7 +142,7 @@ VIDEOS=(); PHOTOS=(); WORKDIR=""; SEED_FRAME=""; HF_TOKEN_ARG="${HF_TOKEN:-}"
 DINO_MODEL="facebook/dinov3-vitb16-pretrain-lvd1689m"
 SEEDS=(); SKIP_TO=""; SEED_BANK=""; SEEDS_FILE=""; SKIP_P4B=0
 BACKEND="dino"; SAM_CHECKPOINT=""; STOP_AFTER=""
-PROMPT_BANK=""; PROMPT_ROOT=""; NO_PROMPT_BANK=0; USE_GPU=0; ARCHITECTURE=""; PERSISTENCE=""; PROMPT_POINTS=""; KEEP_GOING=0
+PROMPT_BANK=""; PROMPT_ROOT=""; NO_PROMPT_BANK=0; USE_GPU=0; LOW_TEXTURE=0; ARCHITECTURE=""; PERSISTENCE=""; PROMPT_POINTS=""; KEEP_GOING=0
 
 # Print the comment block at the top of this file, however long it is, so the
 # help text cannot drift out of sync with a hard-coded line range.
@@ -159,6 +169,7 @@ while [[ $# -gt 0 ]]; do
         --prompt-root)  PROMPT_ROOT="$2"; shift 2 ;;
         --no-prompt-bank) NO_PROMPT_BANK=1; shift ;;
         --use-gpu)      USE_GPU=1; shift ;;
+        --low-texture)  LOW_TEXTURE=1; shift ;;
         --architecture) ARCHITECTURE="$2"; shift 2 ;;
         --min-persistence-ratio) PERSISTENCE="$2"; shift 2 ;;
         --seeds-file)   SEEDS_FILE="$2"; shift 2 ;;
@@ -401,7 +412,8 @@ fi
 if should_run p3; then
     phase "P3     camera poses, masked COLMAP                 -> $WORKDIR/p3"
     $PY -m pose_estimator.cli.pose --workdir "$WORKDIR" \
-        $([[ "$USE_GPU" == 1 ]] && echo --use-gpu)
+        $([[ "$USE_GPU" == 1 ]] && echo --use-gpu) \
+        $([[ "$LOW_TEXTURE" == 1 ]] && echo --low-texture)
     gate p3 "$WORKDIR/p3/poses.json"
 fi
 

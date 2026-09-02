@@ -55,6 +55,54 @@ class PlantFrame:
         }
 
 
+def up_from_holder(hull_points: np.ndarray, heights: np.ndarray, cameras) -> Optional[int]:
+    """Which way is up, from where the tool grips: +1, -1, or None.
+
+    The rig grips the plant at its base, so the gripped end is the bottom.
+    That is a property of how a specimen is mounted rather than of what it
+    looks like, which makes it a far steadier cue than the one below.
+
+    Each point is scored by the fraction of views in which it projects onto
+    the holder mask -- gripped tissue lands on the tool from every angle,
+    tissue further up only occasionally -- and the score-weighted mean height
+    is compared against the plant's own. Up is whichever direction puts the
+    grip underneath.
+
+    Returns None when there are no holder masks to read, leaving the caller's
+    fallback in charge.
+    """
+    occluders = [c for c in cameras or [] if getattr(c, "occluder", None) is not None]
+    if not occluders or len(hull_points) == 0:
+        return None
+
+    hits = np.zeros(len(hull_points))
+    seen = np.zeros(len(hull_points))
+    for camera in occluders:
+        pixels, valid = camera.project(hull_points)
+        height_px, width_px = camera.occluder.shape
+        x = np.round(pixels[:, 0]).astype(int)
+        y = np.round(pixels[:, 1]).astype(int)
+        inside = valid & (x >= 0) & (x < width_px) & (y >= 0) & (y < height_px)
+        if not inside.any():
+            continue
+        seen[inside] += 1.0
+        hits[inside] += camera.occluder[y[inside], x[inside]].astype(np.float64)
+
+    observed = seen > 0
+    if not observed.any():
+        return None
+    score = np.zeros(len(hull_points))
+    score[observed] = hits[observed] / seen[observed]
+    if score.sum() <= 0:
+        return None
+
+    gripped = float((heights * score).sum() / score.sum())
+    middle = float(heights[observed].mean())
+    if abs(gripped - middle) < 1e-9:
+        return None
+    return -1 if gripped > middle else 1
+
+
 def solve_up_direction(hull_points: np.ndarray, sparse_points: np.ndarray) -> int:
     """+1 or -1: which way along the orbit axis is up, in the orbit frame.
 
@@ -104,6 +152,7 @@ def solve_plant_frame(
     orbit_origin: np.ndarray,
     orbit_rotation: np.ndarray,
     voxel: float,
+    cameras=None,
 ) -> Tuple[PlantFrame, Optional[float]]:
     """Build the upright plant frame, with its origin on the clamp line.
 
@@ -114,7 +163,15 @@ def solve_plant_frame(
     hull_orbit = (hull_points - orbit_origin) @ orbit_rotation.T
     sparse_orbit = (sparse_points - orbit_origin) @ orbit_rotation.T
 
-    up = solve_up_direction(hull_orbit, sparse_orbit)
+    # Where the tool grips first, the table plane only as a fallback. The
+    # table is estimated as the commonest height in the sparse cloud, and on
+    # a leafy specimen the foliage outnumbers the table: measured on
+    # sugarbeet_4's video capture, that put the "table" at z=0.279 inside the
+    # plant, read the foliage as being above it, and stood the whole plant on
+    # its head -- root points at 1.21-1.48 with the leaves at 0.44.
+    up = up_from_holder(hull_points, hull_orbit[:, 2], cameras)
+    if up is None:
+        up = solve_up_direction(hull_orbit, sparse_orbit)
 
     # Flip the frame so +Z is up, keeping a right-handed basis.
     flip = np.diag([1.0, float(up), float(up)])

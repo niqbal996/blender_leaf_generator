@@ -13,6 +13,29 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 
 
+def _camera_mode(cameras: str, single_camera: bool):
+    """COLMAP's camera grouping, defaulting to one shared camera.
+
+    One camera for the whole capture is right for this rig and wrong the
+    moment the lens is touched. Measured on sugarbeet_3, whose three passes
+    were shot at 48mm, 32mm and 22mm: forcing a single focal across a 2.2x
+    zoom range gives a compromise that fits none of them, and the passes come
+    back interleaved rather than as three orbits.
+
+    EXIF cannot rescue it here -- `ingest_photos` re-encodes when it resizes,
+    which drops the tags -- and the passes share one frames directory, so
+    per-folder grouping does not apply either. `per-image` is the escape
+    hatch: it costs free parameters but makes no assumption about the lens.
+    """
+    import pycolmap
+
+    if cameras == "per-image":
+        return pycolmap.CameraMode.PER_IMAGE
+    if cameras == "auto":
+        return pycolmap.CameraMode.AUTO
+    return pycolmap.CameraMode.SINGLE if single_camera else pycolmap.CameraMode.AUTO
+
+
 def build_sparse_reconstruction(
     image_dir: Union[str, Path],
     output_dir: Union[str, Path],
@@ -22,6 +45,8 @@ def build_sparse_reconstruction(
     max_image_size: int = 2000,
     use_gpu: bool = False,
     single_camera: bool = True,
+    low_texture: bool = False,
+    cameras: str = "single",
 ):
     """Run SIFT extraction + exhaustive matching + incremental mapping.
 
@@ -85,15 +110,41 @@ def build_sparse_reconstruction(
     extraction_options.max_image_size = max_image_size
     extraction_options.use_gpu = use_gpu
 
+    matching_options = pycolmap.FeatureMatchingOptions()
+    if low_texture:
+        # COLMAP's own settings for hard material, left at their defaults
+        # until now. A plant is a small, smooth, self-similar subject and the
+        # captures here are soft, so features are found in quantity and then
+        # fail to *match*: measured on weed_1, a median of 1,984 keypoints per
+        # image but only 29 matches per pair, and 13 of 27 images registered.
+        #
+        #   peak_threshold   keeps weaker maxima, which is most of what a
+        #                    slightly soft image has left
+        #   estimate_affine_shape / domain_size_pooling
+        #                    descriptors that survive a viewpoint or scale
+        #                    change, which is exactly what fails between two
+        #                    photographs taken 13 degrees apart
+        #   guided_matching  a second matching pass using the geometry the
+        #                    first one found
+        #
+        # All deterministic and applied identically to every image, so unlike
+        # a generative "enhancement" they cannot invent detail that differs
+        # between views. The cost is roughly 3-5x in extraction time.
+        extraction_options.sift.peak_threshold = 0.004
+        extraction_options.sift.max_num_features = 16384
+        extraction_options.sift.estimate_affine_shape = True
+        extraction_options.sift.domain_size_pooling = True
+        matching_options.guided_matching = True
+
     pycolmap.extract_features(
         db_path,
         image_dir,
-        camera_mode=pycolmap.CameraMode.SINGLE if single_camera else pycolmap.CameraMode.AUTO,
+        camera_mode=_camera_mode(cameras, single_camera),
         reader_options=reader_options,
         extraction_options=extraction_options,
         device=pycolmap.Device.cuda if use_gpu else pycolmap.Device.cpu,
     )
-    pycolmap.match_exhaustive(db_path)
+    pycolmap.match_exhaustive(db_path, matching_options=matching_options)
 
     sparse_dir = output_dir / "sparse"
     sparse_dir.mkdir(exist_ok=True)
