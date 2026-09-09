@@ -238,8 +238,67 @@ def fit_circle_3d(points: np.ndarray) -> dict:
     }
 
 
+def _connectivity_checks(solve: Optional[dict]) -> dict:
+    """Did every capture pass end up in the one scene everything is built from?
+
+    This is the only check here with no tuned number in it, and it is the one
+    that generalises without qualification: COLMAP either tied a pass into the
+    winning scene or it did not, and that answer does not depend on the plant,
+    the lens, the leaf count or the point density.
+
+    It exists because the failure it names used to be invisible. When a group
+    of images cannot be connected, COLMAP starts a second scene rather than
+    failing; keeping the larger one then discards a complete pass, and the
+    only outward sign is a registered count that looks like a few soft frames.
+    That is precisely the shape a handheld top-down pass fails in.
+
+    `solve` is `p3/solve.json`, written by `build_sparse_reconstruction`. With
+    no such file (an older workdir) the check is simply absent rather than
+    guessed at.
+    """
+    if not solve or not solve.get("final"):
+        return {}
+
+    final = solve["final"]
+    absent = final.get("passes_absent_from_winner", [])
+    discarded = final.get("discarded_models", [])
+    totals = final.get("passes_total", {})
+
+    detail = (f"{final.get('num_models', 1)} scene(s) built; winning scene holds "
+              f"{_fmt_pass_counts(final.get('winner', {}).get('passes', {}))}")
+    if discarded:
+        detail += ("; ALSO BUILT but disconnected and therefore dropped: " + "; ".join(
+            f"scene {d['model']} ({d['num_images']} images: "
+            f"{_fmt_pass_counts(d['passes'])})" for d in discarded))
+    if absent:
+        shot = ", ".join(f"pass {p} ({totals.get(str(p), totals.get(p, 0))} frames)"
+                         for p in absent)
+        detail += (f". {shot} contributed NOTHING to the solve -- those views are "
+                   f"absent from every phase below")
+    if solve.get("recovered_images"):
+        detail += f". Retry against the finished scene recovered {solve['recovered_images']} image(s)"
+
+    # Only a pass that joined *nothing* fails. A stray disconnected scene on a
+    # single-pass capture is worth seeing but is not a disaster -- the main
+    # scene can be complete without it -- and gating on it would stop good
+    # unattended runs, which is the trap the QC gate exists to avoid.
+    return {
+        "all_passes_joined_one_scene": {
+            "pass": not absent,
+            "detail": detail,
+        }
+    }
+
+
+def _fmt_pass_counts(counts: dict) -> str:
+    if not counts:
+        return "none"
+    return ", ".join(f"pass {k}: {v}" for k, v in sorted(counts.items(), key=lambda kv: str(kv[0])))
+
+
 def evaluate_poses(reconstruction, num_input_frames: int,
-                   sources: Optional[dict] = None) -> dict:
+                   sources: Optional[dict] = None,
+                   solve: Optional[dict] = None) -> dict:
     """Score a finished reconstruction against turntable-specific expectations.
 
     With more than one capture pass the single-circle test is wrong by
@@ -276,6 +335,7 @@ def evaluate_poses(reconstruction, num_input_frames: int,
             "detail": f"mean reprojection error {reprojection_error:.3f} px (limit 1.5)",
         },
     }
+    checks.update(_connectivity_checks(solve))
     if len(per_pass) > 1:
         worst_rms = max(c["circle_rms_relative"] for c in per_pass.values())
         worst_gap = max(c["largest_angular_gap_deg"] for c in per_pass.values())

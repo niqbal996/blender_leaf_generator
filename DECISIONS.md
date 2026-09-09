@@ -1171,6 +1171,9 @@ Not done because the gain is one 2-voxel bow on one leaf, against a second
 constant to re-check per species. Revisit if a specimen turns up with large
 upright leaves that visibly need their curvature.
 
+**Resolved 2026-09-02** -- sugarbeet_4 is that specimen. See "Midribs follow
+the points unless the points are not there" below.
+
 ### Open question 2: tissue with no tip of its own is claimed by a neighbour
 
 `own_by_subtree` hands a dead-end branch to whichever leaf its parent
@@ -1194,3 +1197,401 @@ before the pipeline meets a much denser or sparser cloud.
 `CameraView` in `reconstruction.py`, which served the Gaussian-splat trainer
 deleted earlier. `read_tips` is kept: nothing in-repo calls it, but it is
 the reader for `p4c/tips3d.json`, which `pose-tips` still writes.
+
+## 2026-09-02 — P1 records the lens; P3 gives each focal its own camera
+
+sugarbeet_3's three passes were shot at 48/32/22mm. P1 re-encodes when it
+resizes, which drops EXIF, so COLMAP had no prior and fell back to guessing
+1.2x the long edge -- 2304px -- for all 46 frames alike, against true focals
+of 3840/2560/1760px. `--cameras single` then forced one shared focal across a
+2.2x zoom range.
+
+P1 now reads `FocalLengthIn35mmFilm` into `p1/intrinsics.json`, scaled to the
+size it actually wrote, and P3's new default `--cameras exif` groups frames by
+focal and seeds one COLMAP camera per group. With no EXIF the behaviour is
+byte-for-byte the old `single`, so video is unaffected.
+
+### The measurement that matters is not the IoU
+
+All three modes on the same 46 frames, `--low-texture`, all 46/46 registered:
+
+| mode | reproj px | pass axes differ | per-pass circle RMS | hull IoU | recall |
+|---|---|---|---|---|---|
+| single | 1.20 | 5.52 deg | 1.36 / 0.95 / 0.53% | 0.630 | 67.5% |
+| per-image | 1.05 | 4.74 deg | **4.05** / 1.55 / 1.40% | 0.740 | 78.4% |
+| exif | 1.07 | 5.17 deg | **0.39 / 0.46 / 0.26%** | 0.733 | 77.9% |
+
+`per-image` and `exif` score the same IoU, and that number alone would not
+choose between them -- run-to-run variance is about 0.10 (the archived
+`single` run scored 0.528 where this one scores 0.630, after P2 was re-run).
+The per-pass circle fit does choose: `exif` is 3-10x tighter than either
+alternative, while `per-image` *fails* the check it was supposed to help.
+Given 46 free focals the solver absorbs real geometry into intrinsics, which
+is the failure `single_camera`'s docstring already warned about.
+
+The decisive evidence that `exif` recovers true geometry is that the orbit
+radii come back in the ratio of the focal lengths, as they must when the
+camera zooms rather than moves:
+
+| ratio | focal | exif radii | single radii |
+|---|---|---|---|
+| pass 0 : 1 | 1.50 | 1.49 | 1.01 |
+| pass 1 : 2 | 1.45 | 1.60 | 1.07 |
+| pass 0 : 2 | 2.18 | 2.38 | 1.09 |
+
+`single` put all three orbits at nearly the same radius, which is impossible
+across a 2.2x zoom: the focal error had been absorbed into camera placement.
+
+### It is not the whole story
+
+`passes_share_a_rotation_axis` still fails at 5.17 deg (limit 2), in every
+mode. Each pass is now an excellent circle in isolation, so the passes are
+internally consistent and mutually mis-oriented -- the plant or the rig moved
+between passes, which no camera model can undo. Intrinsics were worth about
++0.10 IoU here and are not the remaining gap.
+
+### Regression: the case that already worked
+
+thistle3 is one pass at 36mm x14 and 38mm x13, so `exif` builds two cameras
+where `single` built one. It does not regress, and it flips
+`cameras_lie_on_a_circle` from fail to pass (2.38% -> 1.93% RMS):
+
+| mode | registered | hull IoU | recall | P4a |
+|---|---|---|---|---|
+| single | 16/27 | 0.814 | 93.5% | all pass |
+| exif | 16/27 | 0.822 | 93.8% | all pass |
+
+### Also fixed here: stale frames were being solved as pass 0
+
+`ingest_photos` never cleared `p1/frames`, so an ingest smaller than the last
+one left orphans behind. They get no `sources.json` entry and P3 defaulted
+them to pass 0. On sugarbeet_3, 39 orphans from an aborted run turned a
+46-frame solve into an 85-frame one spanning two different captures, put 43
+views in pass 0, and collapsed the hull to 0.234 IoU -- while every phase
+reported success. P1 now clears first and P3 refuses to run when a frame is
+not listed rather than guessing.
+
+## 2026-09-02 — COLMAP was never the problem; P1 was letting a second plant in
+
+sugarbeet_4 came back with a sparse cloud, a hull that disagreed with its own
+masks, and camera centres visibly off the circle -- with P2 and P4c masking
+confirmed good and both passes shot at the same 30mm, so neither the previous
+entry's focal fix nor a masking fault could explain it.
+
+### What actually happened
+
+`--photos` had been pointed at `sugarbeet_4/pass1` and `sugarbeet_3/pass2`.
+Both basenames print as "pass2" in the log, both plants are sugarbeets on the
+same turntable with the same pliers, so nothing in the output looked wrong.
+53 frames went in: 40 of one plant and 13 of another shot an hour earlier.
+
+COLMAP behaved *correctly* -- it registered the 40 and refused the 13. It was
+the matching that did the damage: the two shoots share a turntable, a pair of
+pliers and a backdrop, so the cross-shoot matches are on real repeated
+structure and survive geometric verification.
+
+Same 40 frames, same masks, with and without the 13 present:
+
+| input | registered | reproj px | circle RMS | angular gap | hull IoU |
+|---|---|---|---|---|---|
+| 40 own frames | 40/40 | 0.49 | **0.05%** | 84 deg | -- |
+| + 13 foreign frames | 40/53 | 0.99 | **7.01%** | 218 deg | 0.471 |
+
+**On clean input this capture solves essentially perfectly** -- 0.05% of
+radius off the fitted circle, 0.34% out of plane. COLMAP is not fragile here
+and needed no tuning; it was fed two scenes and asked for one.
+
+### Rejected: the masking hypothesis
+
+P3's COLMAP mask is one temporal-variance region per pass, unioned with the
+per-frame P2 masks. That region necessarily includes every backdrop pixel the
+plant ever swept across, because a pixel changes both when the plant arrives
+and when it leaves. Measured on sugarbeet_4: **46% of the mask is static
+backdrop wall**, against 10% plant and holder.
+
+That looked like the culprit and is not. Three maskings over the 40 clean
+frames:
+
+| mask | coverage | registered | reproj px | circle RMS |
+|---|---|---|---|---|
+| current (rotating ∪ plant ∪ holder) | 40.9% | 40/40 | 0.49 | 0.05% |
+| per-frame plant ∪ holder only | 9.9% | 40/40 | 0.45 | 0.06% |
+| plant ∪ holder ∪ derived disc | 15.3% | 40/40 | 0.46 | 0.06% |
+
+Indistinguishable. RANSAC discards the static-backdrop matches without help,
+so the 46% is wasted extraction time, not a fault. Left alone: tightening the
+mask would have been a plausible-sounding change that fixed nothing, and the
+current mask is the one every downstream default was fitted against.
+
+### Rejected for now: fiducial markers
+
+The turntable carries small tag markers, which would give a per-frame
+turntable pose directly and remove SfM from the critical path -- the only
+genuinely *guaranteed* method. They are unusable as shot: over six frames,
+the best-performing dictionary (APRILTAG_16H5, also the most false-positive
+prone) found 7 markers total, roughly one per frame, because the tags are
+~2% of frame width and near edge-on at this camera elevation. Viable only
+after a rig change: larger tags, and enough camera elevation to see them
+face-on. Worth doing if turntable capture continues.
+
+### What was added instead
+
+`p1/manifest.json`, one provenance record per frame -- source directory and
+file, EXIF shutter time, camera body, focal -- and `check_capture_consistency`
+over it, run when more than one pass is given. It rejects, in descending order
+of certainty: a pass shot before its predecessor ended (no threshold needed);
+consecutive passes more than `max_pass_gap_minutes` apart (measured: 1.0-1.3
+min within a real capture, 57 min for the foreign pass, default limit 30);
+two camera bodies; and filenames whose order is not capture order, which the
+README has always required and nothing checked. Passes with no EXIF time --
+video -- are skipped rather than guessed at. `--allow-mixed-capture` overrides.
+
+Verified against the real datasets: it names the sugarbeet_4 failure exactly,
+and stays silent on sugarbeet_4 pass1+pass2, sugarbeet_3 pass0+1+2, and
+thistle3.
+
+### Still open on sugarbeet_4
+
+The 84 deg angular gap is in the clean solve too: the 40 photos cover about
+276 deg, not 360. That is a capture hole, not a solver fault, and no amount
+of pose work will fill it -- a visual hull cannot carve what it never saw.
+
+## 2026-09-02 — The rosette crown: nearest foliage above the root, and no column
+
+sugarbeet_4 put its crown at z=0.973 on a plant whose foliage starts at
+z=0.068 and whose root ends at z=-0.072 -- 72% of the way up, in the middle
+of the canopy. thistle3, same code, put its crown at z=0.368 against a root
+top of 0.284, which is right. The interesting question is not why sugarbeet_4
+failed but why thistle3 did not, because the two answers are the same bug.
+
+### Two length scales, both attached to the wrong thing
+
+`crown_from_root` searched for the lowest foliage inside a column of
+`voxel * 6` about the root's top centroid, over tissue P5 had attached to a
+leaf instance.
+
+- **The column was scaled to the voxel.** Voxel size describes how finely the
+  cloud was sampled. Nothing about it says how far a crown may sit from the
+  middle of its own taproot. thistle3's crown sits on that axis and sugarbeet_4's
+  does not -- its crown tissue is 0.045-0.15 off it, against a column of
+  0.045 -- so on sugarbeet_4 the column contained no crown at all and the
+  search walked up it until it found something, in the canopy.
+- **The foliage set was scaled to the instancing.** `own_by_subtree` leaves
+  crown tissue unowned *on purpose*: it has two or more leaves beyond it and
+  belongs to none of them. Filtering on ownership therefore discards exactly
+  what this function looks for, and does so worse the better the crown is. On
+  sugarbeet_4, 35% of blade points unassigned, the lowest attached tissue in
+  the column was z=0.973; including everything moved it only to z=0.821,
+  which is why the ownership filter alone was not the whole story either.
+
+thistle3 escaped both because its crown happens to sit above the middle of
+its root, so a narrow column found it, and because at 15% unassigned enough
+attached tissue remained inside that column.
+
+### The fix removes the column rather than widening it
+
+Widening was tried and is not the answer: the column was doing double duty as
+the drooping-leaf guard, and a wide one admits a blade passing through the
+crown's height out at the rim. Measured against plant extent the two
+specimens do share a plateau -- from 10% of extent upward sugarbeet_4 holds
+z=0.105 and thistle3 z=0.284 -- but that is a knob tuned to two plants.
+
+Asking for the *nearest* foliage above the root's top carries no radius at
+all, assumes nothing about where the shoot emerges, and is the question
+`root_anchor` already answers for the shoot path. The height guard is then
+the whole drooping-leaf exception: a blade hanging below the root is a leaf
+tip, and without the guard thistle3's crown falls onto one at z=0.150.
+
+| specimen | root top | foliage starts | crown before | crown after |
+|---|---|---|---|---|
+| thistle3 | +0.284 | +0.011 | +0.3682 | +0.3070 |
+| sugarbeet_4 | -0.072 | +0.068 | **+0.9731** | **+0.0784** |
+
+Both remaining knobs are inert. Across `top_fraction` from 0.02 to 0.35 -- a
+factor of 17 -- neither specimen's crown moves at all: thistle3 holds 0.3070
+and sugarbeet_4 holds 0.0784 throughout.
+
+### What it cost, and what it recovered
+
+Instancing is untouched on both: identical tips after merge, instances kept,
+and unassigned counts. On sugarbeet_4 the reported leaf count went 4 -> 5,
+because `num_leaves` is `len(axes)` and axes are fitted after the crown is
+known -- a crown 0.9 above the plant's base left one instance without a
+usable axis. The wrong crown was costing a leaf, not just mislabelling a
+point.
+
+### Note for anyone re-running P5 on a scratch copy
+
+P5 reads `p2/masks/holder` to decide which way is up, and falls back to the
+table plane without it. A scratch workdir holding only p3/p4/p4b/p4c
+reconstructs the plant frame *upside down* -- shoot z -1.347..-0.068 instead
+of +0.068..+1.347 -- and every height in this entry becomes meaningless. Copy
+p2 as well.
+
+## 2026-09-02 — Midribs follow the points unless the points are not there
+
+sugarbeet_4's blades came back as straight sticks. They are upright, large and
+fully reconstructed, and `HEART_LEAF_ELEVATION` was drawing every one of them
+as the straight crown-to-tip chord with its points never consulted. This
+closes open question 1 of the 2026-08-28 entry, which predicted exactly this
+specimen: "revisit if a specimen turns up with large upright leaves that
+visibly need their curvature".
+
+### Steepness was standing in for a question it cannot answer
+
+The chord exists for the small upright leaves at the centre of a rosette. Seen
+from above the cloud closes over the middle of the plant slightly higher than
+those leaves attach, so about half their length is never reconstructed and
+what survives is a one-sided sliver. A station centred on lopsided tissue sits
+off the vein, so a fitted curve waves between stations; the straight line is
+better than a curve bent toward whichever side happened to be reconstructed.
+
+That is a statement about **reconstruction**, and elevation measures **pose**.
+On a rosette the two coincide, which is why the shortcut held. On sugarbeet_4
+they come apart completely: its steep blades carry 8k-62k points and cover
+their whole chord.
+
+`chord_station_support` asks the question directly -- of the 14 stations
+between base and tip, how many hold at least 3 of this leaf's own points --
+and the two specimens separate cleanly:
+
+| specimen | steep leaves, by chord coverage |
+|---|---|
+| thistle3 | 0.79, 0.57, 0.50 |
+| sugarbeet_4 | 0.93, 1.00 |
+
+`HEART_LEAF_SUPPORT = 0.85` sits in the middle of that gap. 0.90 was tried
+first and is too close to the edge: sugarbeet_4's largest blade, 62,098 points
+carrying a 1.20 arc-over-chord, measures 0.93 and would be re-flattened by a
+three-point drift.
+
+### What it changes
+
+sugarbeet_4, default rule, before and after:
+
+| leaf | points | elevation | coverage | before | after | arc/chord after |
+|---|---|---|---|---|---|---|
+| 0 | 62,098 | 68.0 deg | 0.93 | chord | **points** | **1.196** |
+| 1 | 18,038 | 59.8 deg | 1.00 | chord | **points** | 1.014 |
+| 2 | 16,757 | 23.3 deg | 0.93 | points | points | 1.010 |
+| 3 | 2,493 | 38.8 deg | 0.93 | points | points | 1.178 |
+| 4 | 1,341 | 39.1 deg | 0.86 | points | points | 1.013 |
+
+thistle3 is untouched: the same three leaves keep the chord and the same five
+follow their points.
+
+### `--strict-midribs`, and why it is not the default
+
+The flag refuses the chord outright. It is the right tool for a specimen whose
+leaves are genuinely upright and well reconstructed, and it is *not* safe in
+general -- thistle3 shows what it costs:
+
+| leaf | points | coverage | default arc/chord | strict arc/chord |
+|---|---|---|---|---|
+| 1 | 12,761 | 0.79 | 1.000 | 1.013 |
+| 4 | 2,123 | 0.57 | 1.000 | 1.261 |
+| 7 | 470 | 0.50 | 1.000 | **3.575** |
+
+A 470-point sliver fitted from its own points produces a midrib three and a
+half times longer than the distance it spans. That is the failure the chord
+was introduced for, still there, and still worth defaulting away from.
+
+On sugarbeet_4 strict changes nothing at all -- no leaf qualifies for the
+chord once coverage is consulted -- which is the sign the default is doing the
+work rather than the flag.
+
+`p5.json` now carries `midrib_support`: elevation, coverage and which
+construction each leaf got, so a leaf reading "chord" with high coverage is
+visible without re-deriving anything.
+
+## 2026-09-09 — P3 reports every scene COLMAP built, and retries the leftovers
+
+`build_sparse_reconstruction` ran `incremental_mapping`, took
+`max(reconstructions.values(), key=num_reg_images)` and returned it. Every
+other scene COLMAP built was discarded without a word.
+
+**Why that is a silent disaster and not a tidy-up.** COLMAP does not fail when
+a group of images cannot be tied to the rest -- it starts a *second* scene and
+carries on, returning both. So a capture pass whose views do not overlap the
+others is not rejected, it is *relocated*, into a scene that was then dropped
+on the floor. The only outward sign was a registered count, which reads exactly
+like a few soft frames. `most_frames_registered` would report "96/126" for a
+run in which 30 perfectly good frames built a complete, internally consistent
+scene of their own.
+
+This is the precise shape a handheld top-down pass fails in, which is what
+prompted it: the motorised rig cannot be raised high enough to look into the
+rosette crown, so the top-down views have to be shot by hand, and whether they
+join the orbit is exactly the question that was going unanswered.
+
+### Three layers, and only one of them is new machinery
+
+**Layer 1 -- say what happened.** `describe_connectivity` reports which capture
+pass landed in which scene, which scenes were built and dropped, and which
+images reached no scene at all. `log_connectivity` prints it during the run.
+
+The acceptance check `all_passes_joined_one_scene` fails when a pass
+contributed **zero** images to the winning scene, and is fatal in
+`qc_gate.py` -- those views are absent from every phase below, so continuing
+spends an hour of carving on evidence that was thrown away.
+
+Deliberately *not* fatal: a stray disconnected clump on a single-pass capture.
+The main scene can be complete without it, and gating there would stop good
+unattended runs -- the trap this project's QC gate exists to avoid. It is
+reported in the check detail instead.
+
+**No threshold anywhere in this check.** "Did pass 1 reach the winning scene"
+is a fact about the capture, not a measurement of the plant, so it reads the
+same on a thistle seedling and a sugarbeet. It is currently the only check in
+P3 of which that is true.
+
+**Layer 2 -- give the leftovers a fairer second attempt.** COLMAP allows each
+image three tries to join (`mapper.max_reg_trials = 3`), spent whenever the
+mapper happens to reach it. An image is therefore judged against whatever the
+scene contained at that moment -- so frames of a viewpoint the scene has barely
+covered yet can exhaust their attempts against a half-built scene and never be
+reconsidered once it has grown enough to accept them. That is an ordering
+accident, not a wrong setting.
+
+`incremental_mapping` accepts an `input_path` (verified against the installed
+pycolmap 4.1.1 signature), which loads a finished scene and continues from it
+with a fresh mapper and therefore fresh attempt counters. So the finished scene
+is handed back and the leftovers try again against the complete thing, with
+`multiple_models=False` so it extends rather than wandering off to start
+another scene.
+
+**Nothing is loosened.** No threshold moves; the images get their attempt under
+the best available conditions instead of the accidental ones. Whether the
+mechanism pays is *measured and printed* ("recovered N image(s): 96 -> 126"),
+not asserted -- a run where it recovers nothing is worth seeing, and says the
+frames genuinely do not overlap.
+
+**Layer 3 -- when the solver is out of moves, name the fix.** Matching here is
+exhaustive: every image pair has already been compared, so there is no "try
+harder" left in the code. `capture_guidance` prints what actually remains --
+`--low-texture` for viewpoint-robust descriptors (offered only when it is off),
+and shooting the joining pass as a continuous climb in elevation from the
+height of the pass it must join rather than as a separate cluster at the top.
+It also names the best bridging surface: the holder (rigid, three-dimensional,
+non-repeating), over the disc (foreshortens sharply between a low and a high
+camera, and the checkerboard aliases -- the thistle2 failure) and the plant
+(smooth, self-occluding, slightly mobile).
+
+Advice rather than another fitted parameter, because both remaining levers are
+specimen-independent.
+
+### State
+
+`p3/solve.json` carries the whole report, so `--reuse-sparse` re-reads it
+without re-solving and a finished run keeps the evidence. An older workdir has
+no such file and the check is *absent* rather than guessed at.
+
+Covered by `tests/pose_estimator/test_scene_connectivity.py` (9 tests),
+including the JSON round-trip, which matters because `json` turns the integer
+pass keys into strings and the check must still name the right pass afterwards.
+
+**Not yet validated on real frames.** The split-scene path is exercised against
+constructed models; layer 2's premise -- that reloading via `input_path` resets
+the per-image attempt counters -- follows from COLMAP building a fresh mapper,
+but has not been measured here. The first handheld top-down capture is the test,
+and the printed before/after count is what settles it.

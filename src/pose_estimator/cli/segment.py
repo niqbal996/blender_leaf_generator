@@ -36,7 +36,11 @@ import cv2
 from pathlib import Path
 from typing import Optional, Tuple
 
-from pose_estimator.frames import extract_sharpest_frames, ingest_photos
+from pose_estimator.frames import (
+    check_capture_consistency,
+    extract_sharpest_frames,
+    ingest_photos,
+)
 from pose_estimator.segmentation import Prompts, segment_sequence
 from pose_estimator.segmentation_qc import run_qc, write_area_plot, write_overlays
 
@@ -67,6 +71,7 @@ def run(
     dino_model: str = "facebook/dinov3-vitb16-pretrain-lvd1689m",
     dino_size: int = 896,
     prompt_points: int = 3,
+    allow_mixed_capture: bool = False,
 ) -> dict:
     workdir.mkdir(parents=True, exist_ok=True)
     frames_dir = workdir / "p1" / "frames"
@@ -78,6 +83,15 @@ def run(
     # has the backdrop in a different place, so they cannot share one
     # rotating-region mask, and two elevations trace two orbits not one.
     sources: dict = {}
+    intrinsics_file = workdir / "p1" / "intrinsics.json"
+    # frame stem -> EXIF focal length in pixels, for frames that carried one.
+    # P3 groups by this so passes shot at different zooms get one camera each
+    # instead of one averaged camera that fits none of them.
+    intrinsics: dict = {}
+    manifest_file = workdir / "p1" / "manifest.json"
+    # One provenance record per ingested frame: where it came from, when it was
+    # shot, on what. P1 is the last phase that can still tell two shoots apart.
+    records_per_pass: list = []
 
     if reuse_frames and existing:
         print(f"Reusing {len(existing)} frames already in {frames_dir}")
@@ -89,13 +103,29 @@ def run(
         # one shot per angle and is taken as it stands. Everything after this
         # point sees only frame_XXXX.jpg + sources.json and cannot tell which
         # was which.
+        # A previous ingest into this workdir may have written more frames
+        # than this one will, and the surplus is a *different* capture: it
+        # survives in p1/frames, gets no sources.json entry, and P3 then files
+        # it under pass 0. Measured on sugarbeet_3, 39 orphans left by an
+        # aborted run turned a 46-frame solve into an 85-frame one, broke the
+        # pass-0 circle fit and collapsed the P4a hull to 0.23 IoU. Clearing
+        # first keeps p1/frames describing this run and nothing else.
+        stale = sorted(frames_dir.glob("frame_*.jpg")) if frames_dir.is_dir() else []
+        if stale:
+            print(f"  clearing {len(stale)} frame(s) left by an earlier ingest")
+            for path in stale:
+                path.unlink()
+
         groups = []
         for index, source in enumerate(list(video_paths or []) + list(photo_dirs or [])):
             start = sum(len(g) for g in groups)
             if source.is_dir():
                 print(f"Pass {index}: still photos from {source.name}/...")
-                written = ingest_photos(source, frames_dir, start_index=start,
-                                        max_edge=photo_max_edge)
+                ingested = ingest_photos(source, frames_dir, start_index=start,
+                                         max_edge=photo_max_edge)
+                written = ingested.frames
+                intrinsics.update(ingested.focals)
+                records_per_pass.append(ingested.records)
             else:
                 print(f"Pass {index}: sharpest of {num_frames} angular bins from {source.name}...")
                 written = extract_sharpest_frames(source, frames_dir, target_frame_count=num_frames,
@@ -106,6 +136,15 @@ def run(
                 sources[path.stem] = index
         sources_file.parent.mkdir(parents=True, exist_ok=True)
         sources_file.write_text(json.dumps(sources, indent=2))
+        # Rewritten even when empty, so a stale file from an earlier ingest
+        # into the same workdir cannot outlive the frames it described.
+        intrinsics_file.write_text(json.dumps(intrinsics, indent=2))
+        manifest_file.write_text(json.dumps(
+            [r for pass_records in records_per_pass for r in pass_records], indent=2))
+
+        # Written first, so the manifest is on disk to inspect when this raises.
+        if len(records_per_pass) > 1 and not allow_mixed_capture:
+            check_capture_consistency(records_per_pass)
     elif existing:
         print(f"No --video/--photos given; using the {len(existing)} frames already in {frames_dir}")
         if sources_file.exists():
@@ -446,6 +485,13 @@ def main(argv: Optional[list] = None) -> None:
                              "enough only when the plant fills the frame; on a small or "
                              "distant plant a single prompt seeds one leaf and SAM2 "
                              "tracks just that leaf.")
+    parser.add_argument(
+        "--allow-mixed-capture", action="store_true",
+        help="Skip the check that the --photos/--video passes are one shoot of one "
+             "plant (same camera body, consecutive in time, filenames in capture "
+             "order). Only for a capture you know is right but whose EXIF says "
+             "otherwise -- the check exists because a foreign pass is invisible "
+             "after P1 and wrecks P3 without failing any phase.")
     parser.add_argument("--dino-size", type=int, default=896)
     parser.add_argument("--device", default="cuda", help="torch device (cuda or cpu)")
     parser.add_argument(
@@ -475,6 +521,7 @@ def main(argv: Optional[list] = None) -> None:
         dino_model=args.dino_model,
         dino_size=args.dino_size,
         prompt_points=args.prompt_points,
+        allow_mixed_capture=args.allow_mixed_capture,
     )
 
 

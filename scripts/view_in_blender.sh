@@ -19,9 +19,21 @@ set -euo pipefail
 # - /home/... -> \\wsl.localhost\<distro>\...
 # The UNC path is right for WSL-owned files but a mounted Windows drive can be
 # denied when Blender reads it via the WSL localhost share.
+#
+# `wslpath -w` is asked first because the mount point letter is not the drive
+# letter: an external disk mounted by hand lands wherever there was a free
+# slot, so /mnt/e can be F:. wslpath reads the actual mount table and gets
+# this right; the letter-for-letter guess below silently produced E:\... for
+# an F: drive and Blender reported the P5 output as missing.
 to_windows_path() {
     local path="${1:-}"
     [[ -n "$path" ]] || return 1
+
+    local win
+    if win="$(wslpath -w "$path" 2>/dev/null)" && [[ -n "$win" ]]; then
+        printf '%s' "$win"
+        return 0
+    fi
 
     if [[ "$path" == /mnt/* ]]; then
         local drive="${path#/mnt/}"

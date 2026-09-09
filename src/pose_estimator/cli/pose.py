@@ -39,7 +39,7 @@ def run(
     max_image_size: int = 1920,
     use_gpu: bool = False,
     low_texture: bool = False,
-    cameras: str = "single",
+    cameras: str = "exif",
     reuse_sparse: bool = False,
     single_camera: bool = True,
 ) -> dict:
@@ -54,8 +54,31 @@ def run(
 
     sources_file = workdir / "p1" / "sources.json"
     source_of = json.loads(sources_file.read_text()) if sources_file.exists() else {}
+    # Defaulting an unlisted frame to pass 0 is how a leftover capture gets
+    # solved as part of this one -- silently, because the orbit checks are
+    # per pass and a contaminated pass 0 just looks like a bad circle fit.
+    unlisted = [p.name for p in frame_paths if p.stem not in source_of]
+    if source_of and unlisted:
+        raise ValueError(
+            f"{len(unlisted)} frame(s) in {frames_dir} are missing from "
+            f"{sources_file.name}, starting with {unlisted[0]} -- they are left over "
+            f"from an earlier ingest into this workdir and belong to a different "
+            f"capture.\n"
+            f"  Re-run P1 (pose-segment with --video/--photos, or run_pipeline.sh "
+            f"without --skip-to) to rebuild p1/frames, which now clears itself first.\n"
+            f"  Deleting the {len(unlisted)} listed frame(s) by hand also works if P2 "
+            f"masks for the rest are still good.")
     sources = [int(source_of.get(p.stem, 0)) for p in frame_paths]
     num_passes = len(set(sources))
+
+    # Written by P1 from photo EXIF; absent for video frames and for workdirs
+    # ingested before P1 recorded it, both of which fall back to one camera.
+    intrinsics_file = workdir / "p1" / "intrinsics.json"
+    focal_priors = json.loads(intrinsics_file.read_text()) if intrinsics_file.exists() else {}
+    if cameras == "exif" and not focal_priors and frames_dir.is_dir():
+        print("  no p1/intrinsics.json -- frames predate EXIF capture, or came from "
+              "video. Re-run P1 to record it, or pass --cameras per-image if the "
+              "passes were shot at different zooms.")
 
     print(f"Separating the rotating rig from the static backdrop "
           f"({len(frame_paths)} frames, {num_passes} capture pass(es))...")
@@ -110,10 +133,20 @@ def run(
             low_texture=low_texture,
             cameras=cameras,
             single_camera=single_camera,
+            focal_priors=focal_priors,
+            sources=source_of,
         )
 
+    solve_file = p3_dir / "solve.json"
+    solve = json.loads(solve_file.read_text()) if solve_file.exists() else None
+    if solve is None:
+        print("  no p3/solve.json -- this model predates scene-connectivity reporting, "
+              "so 'all_passes_joined_one_scene' cannot be judged. Re-run without "
+              "--reuse-sparse to record it.")
+
     report = evaluate_poses(reconstruction, num_input_frames=len(frame_paths),
-                            sources=source_of if num_passes > 1 else None)
+                            sources=source_of if num_passes > 1 else None,
+                            solve=solve)
 
     centers, _, _ = get_registered_camera_poses(reconstruction)
     if report["orbit"] is not None:
@@ -145,11 +178,14 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--workdir", required=True, type=Path, help="Specimen run directory (must already have p1/ and p2/)")
     parser.add_argument("--num-threads", type=int, default=8, help="Threads for SIFT extraction")
     parser.add_argument(
-        "--cameras", choices=["single", "per-image", "auto"], default="single",
-        help="How COLMAP groups intrinsics. 'single' (default) is right when every "
-             "frame came from one camera at one zoom -- the normal rig. Use "
-             "'per-image' if the lens was zoomed or swapped between passes: one "
-             "shared focal cannot fit two, and the passes come back interleaved.")
+        "--cameras", choices=["exif", "single", "per-image", "auto"], default="exif",
+        help="How COLMAP groups intrinsics. 'exif' (default) reads the focal P1 "
+             "recorded from each photo and gives every distinct lens setting its own "
+             "camera, seeded with that focal; with no EXIF it is exactly 'single'. "
+             "'single' forces one shared camera, which is right for one locked-off "
+             "lens and wrong across a zoom change. 'per-image' gives every frame a "
+             "free focal -- the fallback for EXIF-stripped photos shot at mixed "
+             "zooms, at the cost of enough freedom to absorb drift into intrinsics.")
     parser.add_argument(
         "--low-texture",
         action="store_true",

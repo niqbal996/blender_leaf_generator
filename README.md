@@ -236,6 +236,77 @@ disk, so any one can be re-run or swapped without touching the others.
 you stop for the two things that need a human, which are picking the P2
 plant/holder prompts and picking the P4c organ seeds.
 
+### Midribs: fitted from the points, or the straight chord
+
+A leaf's midrib is fitted from that leaf's own points, except where they
+cannot describe it. The exception is the small upright leaves at the centre of
+a rosette: the cloud closes over the middle of the plant slightly higher than
+they attach, so half their length is missing and what survives is a one-sided
+sliver. A curve fitted to that waves off the vein, and the straight
+crown-to-tip chord is the better midrib.
+
+A leaf takes the chord only when it is **both** steep (above 45 degrees) and
+**poorly covered** -- fewer than 85% of the stations along its own chord hold
+its own tissue. Steepness alone is not the test: it describes how a leaf is
+posed, not how well it was reconstructed, and on sugarbeet_4 those come apart
+completely. Its upright blades carry 8k-62k points and cover their whole
+chord, and selecting on angle drew every one as a straight stick -- discarding
+a real 1.20 arc-over-chord on the largest.
+
+`p5.json` reports `midrib_support` per leaf: elevation, coverage, and which
+construction it got. `--strict-midribs` refuses the chord entirely and fits
+every midrib from its own points. Use it when the leaves are genuinely upright
+and well reconstructed; it is not the default because a sparse leaf fitted
+from its own points can wander badly -- thistle3's 470-point leaf produces a
+midrib 3.6x longer than the distance it spans.
+
+### Naming a dataset, and pipeline.conf
+
+The shortest correct invocation names the dataset directory and nothing else:
+
+```bash
+./run_pipeline.sh /data/2026-09-01/sugarbeet_4
+```
+
+Its `pass*/` subdirectories become the capture passes in natural order
+(`pass2` before `pass10`), and the workdir is `<dataset>/plant`. A flat
+directory of JPEGs is a single pass, which is how `thistle3` is laid out.
+`--photos`, `--video` and `--workdir` still override and are still the way to
+drive a layout that is not this one.
+
+This is worth doing for correctness, not just brevity. In the long form every
+path repeats the same dataset prefix, so one stale component is easy to type
+and invisible on review -- which is how sugarbeet_4 came to be reconstructed
+from two different plants (see DECISIONS.md, 2026-09-02).
+
+Settings that hold across runs go in a `pipeline.conf` of `key = value` lines
+-- keys are the long options with dashes as underscores, and an unknown key is
+an error rather than a silent no-op:
+
+```
+prompt_bank  = /data/2026-09-01/sugarbeet_3/plant/p2/prompt_bank.npz
+seed_bank    = /data/thistle3/plant/p4c/seed_bank.npz
+architecture = rosette
+low_texture  = 1
+```
+
+Read from `~/.config/blender_leaf_generator/pipeline.conf`, `./pipeline.conf`,
+`<dataset>/../pipeline.conf` and `<dataset>/pipeline.conf` in that order, each
+overriding the last, and any command-line flag overriding all of them.
+`--config <file>` uses just that file. `pipeline.conf.example` in the repo
+root lists every key.
+
+Keep the HF token out of the command line -- put it in the user-level config
+or in `$HF_TOKEN`. A command-line argument is visible in `ps` to every user on
+the machine and is written to your shell history.
+
+`--dry-run` prints every resolved path and stops. Run it whenever a path
+changed: the paths a config file or the dataset directory supplied are the
+ones you did not type on this run, so they are the ones you will not notice
+are wrong. It also flags a bank that lives outside the current dataset, which
+is legitimate -- that is what banks are for -- and is also what a stale path
+looks like.
+
 ### Install the pose pipeline
 
 The env this needs is heavier than the leaf-generator one above:
@@ -950,16 +1021,19 @@ pose-segment --photos /data/plant_9_shots --workdir runs/plant_9     # or the ph
 
 Give several directories for several passes, and mix them with `--video`
 freely. After P1 there is no difference at all: every later phase reads
-`p1/frames/frame_XXXX.jpg` plus `p1/sources.json` and cannot tell which kind
-of capture produced them.
+`p1/frames/frame_XXXX.jpg` plus `p1/sources.json` (and `p1/intrinsics.json` /
+`p1/manifest.json`, where EXIF supplied a focal and a shutter time) and cannot
+tell which kind of capture produced them.
 
-Three things to know, all consequences of stills having no redundancy:
+Four things to know, the first three all consequences of stills having no
+redundancy:
 
 - **Filename order must be capture order** around the turntable. SAM2
   propagates from one frame to the next and P3 checks the camera traces a
   circle; both assume consecutive frames are neighbouring angles. Cameras
   number shots sequentially, so this is usually free -- but a folder mixing
-  two shoots, or renamed files, will break it silently.
+  two shoots, or renamed files, would break it silently. P1 now checks it
+  against the EXIF shutter times rather than trusting it.
 - **Every photo is used as it is.** A video gets sampled down to the sharpest
   frame of each angular bin; a photo directory has one shot per angle and no
   alternative to fall back on. Each photo's sharpness is printed on ingest
@@ -977,6 +1051,33 @@ Three things to know, all consequences of stills having no redundancy:
   resolution reaches nothing. Intrinsics are safe either way: COLMAP records
   the camera at the image's real dimensions even when it extracts features
   on a smaller internal copy.
+- **Zooming between passes is allowed, because P1 records the lens.** The
+  focal length is read from each photo's EXIF into `p1/intrinsics.json`,
+  scaled to the size P1 actually wrote, and P3 gives every distinct focal its
+  own COLMAP camera seeded with it (`--cameras exif`, the default). This
+  matters more than it sounds: P1 re-encodes when it resizes, which drops the
+  EXIF from the frame itself, so without that record COLMAP falls back to
+  guessing 1.2x the long edge for every frame alike. On sugarbeet_3, whose
+  three passes were shot at 48/32/22mm and solved as one shared camera at
+  that 2304px guess, the three orbits came back with rotation axes 7.7
+  degrees apart and P4a over-carved the hull to 0.53 IoU against masks that
+  were themselves clean. Photos with no EXIF, and video, are unaffected:
+  with nothing recorded the behaviour is exactly one shared camera as before.
+
+**Several passes must be one shoot of one plant.** P1 writes a provenance
+record per frame to `p1/manifest.json` -- source directory and file, EXIF
+shutter time, camera body, focal -- and refuses passes that cannot be one
+capture: one shot before the previous ended, more than 30 minutes apart, on a
+different camera body, or with filenames out of capture order. This is the
+last phase that can tell: afterwards every pass is `frame_XXXX.jpg` in one
+directory, and a pass of a *different specimen* looks exactly like a second
+elevation of this one. Measured on sugarbeet_4, where a mistyped `--photos`
+added 13 frames of another plant shot an hour earlier: COLMAP refused to
+register them and they still took the camera circle from 0.05% to 7.01% RMS,
+because both shoots share a turntable and pliers for the matcher to latch
+onto, and the hull fell to 0.471 IoU with no phase reporting a failure.
+`--allow-mixed-capture` overrides. Video frames carry no EXIF and are skipped
+rather than guessed at.
 
 The blur trade-off is worth stating plainly, because it is the usual reason
 to shoot stills in the first place: handheld photos can be *sharper* than

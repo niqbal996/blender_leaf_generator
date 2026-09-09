@@ -53,6 +53,7 @@ def run(
     source: str = "auto",
     contact_voxels: float = 3.0,
     min_leaf_points: int = 150,
+    strict_midribs: bool = False,
     min_tip_depth_voxels: float = 8.0,
     min_persistence_ratio: Optional[float] = None,
     architecture: str = "caulescent",
@@ -123,7 +124,8 @@ def run(
                                   min_leaf_points=min_leaf_points,
                                   min_tip_depth_voxels=min_tip_depth_voxels,
                                   min_persistence_ratio=min_persistence_ratio,
-                                  architecture=architecture)
+                                  architecture=architecture,
+                                  strict_midribs=strict_midribs)
 
     base = structure.instancing.base if structure.instancing is not None else None
     if base is not None:
@@ -435,6 +437,11 @@ def _evaluate(structure, clamp, frame, voxel: float) -> dict:
         "num_leaves": structure.num_leaves,
         "points_per_leaf": per_leaf,
         "axis_lengths": lengths,
+        # Per leaf: how steeply it rises, how much of its own chord its points
+        # cover, and which midrib construction that earned it. A leaf reading
+        # "chord" with high coverage is one --strict-midribs would draw from
+        # its points instead.
+        "midrib_support": structure.midrib_support,
         "tip_shortfall_voxels": [round(v / voxel, 2) for v in shortfall],
         "plant_frame": frame.to_dict(),
         "checks": checks,
@@ -459,6 +466,16 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--min-tip-depth-voxels", type=float, default=8.0,
                         help="Ignore maxima shallower than this. Low on purpose -- persistence "
                              "does the rejecting, so this only screens out surface noise.")
+    parser.add_argument(
+        "--strict-midribs", action="store_true",
+        help="Fit every midrib from its own leaf's points, however steep or sparsely "
+             "reconstructed the leaf is. By default a leaf that is both steep and "
+             "poorly covered by its own tissue is drawn as the straight crown-to-tip "
+             "chord instead, because a curve fitted to a one-sided sliver waves off "
+             "the vein. Use this when the leaves are genuinely upright and well "
+             "reconstructed and you would rather have their real curvature -- and "
+             "check p5.json's midrib_support, which reports the coverage each leaf "
+             "was judged on.")
     parser.add_argument("--architecture", choices=["upright", "rosette", "caulescent"],
                         default="caulescent",
                         help="What kind of plant this is. caulescent (default): an upright "
@@ -482,7 +499,8 @@ def main(argv: Optional[list] = None) -> None:
         min_persistence_ratio=args.min_persistence_ratio,
         # "caulescent" is the old name for "upright", kept as an alias so
         # existing commands and scripts keep working.
-        architecture=args.architecture)
+        architecture=args.architecture,
+        strict_midribs=args.strict_midribs)
 
 
 if __name__ == "__main__":

@@ -29,8 +29,10 @@ def fatal_conditions(phase: str, report: dict) -> list:
                          "P2 tracked the tool, not the plant (re-click: pose-pick-prompts)")
     elif phase == "p3":
         # README: if the circle fit fails, nothing downstream can be right.
+        # A pass that joined no scene is absent from every phase below, and
+        # nothing further down can tell that those views were ever shot.
         for name in ("cameras_lie_on_a_circle", "each_pass_lies_on_a_circle",
-                     "full_rotation_covered"):
+                     "full_rotation_covered", "all_passes_joined_one_scene"):
             if failed(name):
                 fatal.append(f"{name}: {checks[name].get('detail', '')}")
     elif phase == "p4a":

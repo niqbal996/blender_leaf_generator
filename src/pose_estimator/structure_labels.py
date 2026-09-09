@@ -56,6 +56,16 @@ from scipy.spatial import cKDTree
 # degrees: the split falls in a 46-degree empty band, so the exact value is
 # not delicate. Halfway between flat and vertical is the natural place for it.
 HEART_LEAF_ELEVATION = 45.0
+# ... and only when its own tissue fails to describe that rise. Steep is not
+# the same as poorly reconstructed, and conflating the two is what drew
+# sugarbeet_4's blades as straight sticks. See `chord_station_support`.
+#
+# Placed in the middle of the gap the two specimens leave, not at the edge of
+# it: the leaves that need the chord measure 0.50, 0.57 and 0.79 (thistle3)
+# and the ones that must not have it measure 0.93 and 1.00 (sugarbeet_4).
+# 0.85 keeps roughly equal margin either side; 0.90 sat 0.03 from
+# re-flattening sugarbeet_4's largest blade, which carries a 1.20 arc.
+HEART_LEAF_SUPPORT = 0.85
 
 # Persistence above which a maximum is a leaf beyond argument, so the
 # leaf/noise cut is never made among them. This was the whole rule once, as a
@@ -106,6 +116,9 @@ class LabelledStructure:
     attachments: List[np.ndarray] = field(default_factory=list)   # per instance
     tips: List[np.ndarray] = field(default_factory=list)
     axes: List[np.ndarray] = field(default_factory=list)          # per instance, base -> tip
+    # per instance: how steep it is, how much of its own chord its points
+    # cover, and which of the two midrib constructions that earned it
+    midrib_support: List[dict] = field(default_factory=list)
     root_points: Optional[np.ndarray] = None
     instancing: Optional[Instancing] = None
     crown: Optional[np.ndarray] = None   # foot of the stem, just above the root
@@ -751,78 +764,72 @@ def _largest_cluster(points: np.ndarray, radius: float) -> Optional[np.ndarray]:
 
 
 def crown_from_root(root_points, foliage_points, voxel: float,
-                    top_fraction: float = 0.05, bin_voxels: float = 6.0):
-    """The crown: the lowest foliage sitting directly above the root.
+                    top_fraction: float = 0.05):
+    """The crown: the foliage nearest the root, ignoring anything below it.
 
     A rosette has no stem to trace, but it does have a root, and the jaws grip
     exactly where the root ends and the shoot begins. That band is *occluded*
     -- the tool is in front of it from every angle -- so the junction itself is
     never reconstructed and cannot be measured directly. What can be measured
-    is the tissue on either side of the hole, and the first foliage above it is
-    the closest thing to the crown the data contains.
+    is the tissue on either side of the hole, and the foliage closest to the
+    root is the closest thing to the crown the data contains.
 
-    Measured on thistle3, in a 6-voxel column about the root's own axis:
+    Two guards, and between them they are the whole method:
 
-        z 0.150-0.330   root                <- root body
-        z 0.330-0.360   nothing at all      <- the pliers
-        z 0.360-0.420   stem, then leaf     <- foliage bottom
-
-    Three details, each of which the data forced:
-
-    * **The column matters.** A rosette's outer leaves droop well below the
-      crown -- thistle3 has leaf tissue down at z=0.087, far under the root's
-      top -- so "the lowest foliage" without a horizontal restriction returns a
-      blade tip off to one side. Confining the search to a column about the
-      root's axis is what makes "above the root" mean above *the root*.
-
-    * **Unassigned tissue is excluded** by the caller passing only foliage that
-      P5 actually attached to a leaf, plus stem. The tissue P4c labels leaf but
-      P5 attaches to nothing sits *inside* the root band on thistle3 (z
-      0.150-0.330, interleaved with root), so leaving it in lets it spoof a
-      foliage bottom 0.2 units too low.
+    * **Only foliage above the root's top.** This is the drooping-leaf
+      exception: a rosette's outer leaves hang well below the crown -- thistle3
+      has leaf tissue at z=0.087 against a root ending at z=0.284 -- and a
+      blade hanging below the root is a leaf tip, which is the one thing that
+      is certainly not the crown. Without this guard thistle3's crown lands at
+      z=0.150, on the drooping blade; with it, z=0.307.
 
     * **The root's top is a quantile**, not its highest point: thistle3 has a
       stray root point at z=0.494, inside the band the jaws occlude, and a max
-      would put the floor above the foliage it is meant to sit under.
+      would put the floor above the foliage it is meant to sit under. Also the
+      root's *main mass* rather than every point wearing the root label --
+      dirt on the turntable classifies as root, and on thistle1 that put 189
+      stray root points up at z 0.85-0.94 among the leaves.
 
-    Neither knob is delicate. Across bin radii of 4-12 voxels and
-    `top_fraction` of 0.05-0.10 the crown moved from z=0.386 to z=0.368 and
-    settled on the same point, against a plant 1.2 units tall.
+    What there is deliberately *no* knob for is how far the crown may sit from
+    the root sideways. An earlier version confined the search to a column of
+    6 voxels about the root's top centroid, which assumes the shoot comes up
+    directly above the middle of the root. thistle3 obliges and sugarbeet_4
+    does not -- its crown tissue sits 0.045-0.15 off that axis, so the column
+    contained no crown at all and the search walked up it into the canopy,
+    reporting z=0.973 on a plant whose foliage starts at z=0.068. Widening the
+    column is not the fix either: it weakens the drooping-leaf guard, which is
+    what the column was doing double duty for. Asking for the *nearest*
+    foliage instead carries no radius, makes no assumption about where the
+    shoot emerges, and is the same question `root_anchor` already answers for
+    the shoot path.
 
-    Returns None when there is no root to stand on, or nothing above it in the
-    column, leaving the caller's own fallback in charge.
+    Neither remaining knob is delicate. Across `top_fraction` from 0.02 to
+    0.35 -- a factor of 17 -- the crown does not move at all on either
+    specimen: thistle3 holds z=0.3070 and sugarbeet_4 holds z=0.0784.
+
+    `foliage_points` should be every leaf point plus stem, assigned to a leaf
+    instance or not. Filtering on ownership was tried and is exactly backwards:
+    `own_by_subtree` leaves crown tissue unowned on purpose, because it has two
+    or more leaves beyond it and belongs to none of them, so requiring
+    ownership discards the one thing being searched for. On sugarbeet_4, with
+    35% of blade points unassigned, the lowest *attached* tissue near the root
+    was z=0.973.
+
+    Returns None when there is no root to stand on, or nothing above it,
+    leaving the caller's own fallback in charge.
     """
     if root_points is None or len(root_points) == 0 or len(foliage_points) == 0:
         return None
 
-    # The root's *main mass*, not every point wearing the root label. Dirt on
-    # the turntable classifies as root, and on thistle1 that put 189 stray
-    # root points up at z 0.85-0.94 among the leaves, against a real root
-    # body of 0.00-0.43. This function walks to the top of the root by
-    # design, so those strays became the top and the crown followed them into
-    # the foliage. A quantile cannot save it -- they were 2% of the label but
-    # a third of everything above the cut.
-    #
-    # Keeping the largest cluster is enough, and needs no threshold beyond
-    # the sampling the cloud already has: real root tissue is contiguous, a
-    # cloud of misread dirt in the canopy is not connected to it.
-    root_points = _largest_cluster(root_points, voxel * 4.0)
-    if root_points is None or len(root_points) == 0:
+    body = _largest_cluster(root_points, voxel * 4.0)
+    if body is None or len(body) == 0:
         return None
 
-    heights = root_points[:, 2]
-    root_top = float(np.quantile(heights, 1.0 - top_fraction))
-    upper = root_points[heights >= root_top]
-    if not len(upper):
+    root_top = float(np.quantile(body[:, 2], 1.0 - top_fraction))
+    above = foliage_points[foliage_points[:, 2] > root_top]
+    if not len(above):
         return None
-    centre_x, centre_y = upper[:, 0].mean(), upper[:, 1].mean()
-
-    across = np.hypot(foliage_points[:, 0] - centre_x, foliage_points[:, 1] - centre_y)
-    above = (across <= voxel * bin_voxels) & (foliage_points[:, 2] > root_top)
-    if not above.any():
-        return None
-    candidates = foliage_points[above]
-    return candidates[int(np.argmin(candidates[:, 2]))]
+    return root_anchor(body, above)
 
 
 def root_anchor(root_points: np.ndarray, shoot_points: np.ndarray):
@@ -1132,6 +1139,69 @@ def _crown_base(leaf_points, stem_points, graph, k_neighbors):
                       extremities=base.extremities, evidence=base.evidence)
 
 
+def use_straight_chord(elevation_deg: float, support: float,
+                       strict: bool = False) -> bool:
+    """Whether this leaf should be drawn as the straight crown-to-tip line.
+
+    Both conditions have to hold, and the second is the one that was missing.
+
+    * **Steep**, above `HEART_LEAF_ELEVATION`. A rosette's central leaves rise
+      almost vertically, and it is those the cloud fails to reconstruct near
+      the crown -- seen from above it closes over the middle of the plant
+      slightly higher than they attach.
+    * **Poorly reconstructed**, below `HEART_LEAF_SUPPORT` of its own chord
+      covered by its own tissue. What survives of such a leaf is a one-sided
+      sliver rather than a blade seen from both edges, and a station centred
+      on lopsided tissue sits off the vein, so the fitted curve waves between
+      stations. The straight line is better than a curve bent toward whichever
+      side happened to be reconstructed.
+
+    Testing steepness alone conflates the pose with the reconstruction, and
+    that is what drew sugarbeet_4's blades as six straight sticks: 8k-36k
+    points each, up to 1.33 long, every one covering 100% of its own chord.
+    thistle3's steep leaves cover 79%, 57% and 50% -- a clean gap, and only
+    that group needs the chord.
+
+    `strict` refuses the shortcut outright, for a specimen whose leaves are
+    genuinely upright and well reconstructed.
+    """
+    return (not strict
+            and elevation_deg >= HEART_LEAF_ELEVATION
+            and support < HEART_LEAF_SUPPORT)
+
+
+def chord_station_support(points: np.ndarray, base: np.ndarray, tip: np.ndarray,
+                          num_stations: int = 14, min_bin: int = 3) -> float:
+    """Fraction of the base-to-tip chord this leaf's own tissue actually covers.
+
+    The same binning `chord_midrib` does internally, asked as a question
+    instead: of the stations between base and tip, how many hold at least
+    `min_bin` of this instance's own points? 1.0 means the leaf describes its
+    own shape everywhere along its length and nothing needs to be assumed;
+    a low value means most of the curve would be drawn from shared tissue,
+    or from nothing.
+
+    This is the measurement that separates the two situations the straight
+    chord exists for. Steepness alone does not: measured across both
+    specimens, every steep leaf on sugarbeet_4 scores 1.00 while thistle3's
+    steep leaves score 0.79, 0.57 and 0.50, and it is only the latter group
+    the chord belongs to.
+    """
+    base = np.asarray(base, float).reshape(3)
+    tip = np.asarray(tip, float).reshape(3)
+    axis = tip - base
+    length = float(np.linalg.norm(axis))
+    if length < 1e-12 or len(points) == 0:
+        return 0.0
+    t = ((np.asarray(points, float) - base) @ (axis / length)) / length
+    t = t[(t >= 0.0) & (t <= 1.0)]
+    edges = np.linspace(0.0, 1.0, num_stations + 1)
+    filled = sum(
+        1 for a, b in zip(edges[:-1], edges[1:])
+        if (((t >= a) & (t < b)) if b < 1.0 else ((t >= a) & (t <= b))).sum() >= min_bin)
+    return filled / num_stations
+
+
 def chord_midrib(points: np.ndarray, base: np.ndarray, tip: np.ndarray,
                  spare: Optional[np.ndarray] = None, heart: bool = False,
                  num_stations: int = 14, degree: int = 3,
@@ -1362,8 +1432,14 @@ def build_from_labels(
     min_persistence_ratio: Optional[float] = None,
     k_neighbors: int = 10,
     architecture: str = "caulescent",
+    strict_midribs: bool = False,
 ) -> LabelledStructure:
     """Full structure from a labelled cloud, in the plant frame.
+
+    `strict_midribs` refuses the straight-chord shortcut entirely, so every
+    midrib is fitted from its leaf's own points however steep or sparse the
+    leaf is. The default keeps the chord for leaves that are both steep and
+    poorly reconstructed, which is the only case it was ever right for.
 
     `architecture` is passed through to the instancing: see `instance_by_tips`.
     A rosette reaches this function with no stem tissue and no root tissue --
@@ -1443,11 +1519,10 @@ def build_from_labels(
         # depth field's zero but is a poorer answer for "where does this plant
         # come out of the ground" -- and it is all there is when the specimen
         # was clamped above its root, or the root was never labelled.
-        # Foliage means tissue P5 actually attached to a leaf, plus stem --
-        # not every leaf-labelled point. The unattached remainder lies in the
-        # root band and would masquerade as the foliage bottom.
-        attached = leaf_points[instancing.owner >= 0] if len(leaf_points) else leaf_points
-        foliage = np.vstack([attached, stem_points]) if len(stem_points) else attached
+        # Every leaf point, assigned or not, plus stem. See `crown_from_root`:
+        # filtering on ownership discards the crown, because `own_by_subtree`
+        # leaves crown tissue unowned by design.
+        foliage = np.vstack([leaf_points, stem_points]) if len(stem_points) else leaf_points
         crown = crown_from_root(root_points, foliage, voxel)
         if crown is None:
             crown = instancing.base.center
@@ -1489,6 +1564,7 @@ def build_from_labels(
             stem_path = np.vstack([anchor, stem_path])
 
     axes, tips, attachments = [], [], []
+    midrib_support: List[dict] = []
     num = int(instancing.owner.max()) + 1 if (instancing.owner >= 0).any() else 0
     for instance in range(num):
         member = np.nonzero(instancing.owner == instance)[0]
@@ -1553,9 +1629,23 @@ def build_from_labels(
             rise = np.asarray(tip, float) - np.asarray(base_point, float)
             reach = float(np.linalg.norm(rise))
             elevation = np.degrees(np.arcsin(np.clip(rise[2] / max(reach, 1e-9), -1.0, 1.0)))
+            # Steep *and* poorly reconstructed. Elevation alone was the rule
+            # and it is the wrong test: it asks how the leaf is posed, when
+            # the question the chord answers is whether the leaf's own points
+            # can describe it. On sugarbeet_4 every steep blade covers its
+            # whole chord -- 100% support across six leaves of 8k-36k points,
+            # up to 1.33 long -- and each was drawn as a straight stick with
+            # its curvature discarded. thistle3's steep leaves score 79%, 57%
+            # and 50%, and those are the ones the chord is for.
+            support = chord_station_support(leaf_points[member], base_point, tip)
+            heart = use_straight_chord(elevation, support, strict=strict_midribs)
+            midrib_support.append(
+                {"elevation_deg": round(float(elevation), 1),
+                 "chord_support": round(float(support), 3),
+                 "source": "chord" if heart else "points"})
             chorded = chord_midrib(leaf_points[member], base_point, tip,
                                    spare=leaf_points[instancing.owner < 0],
-                                   heart=elevation >= HEART_LEAF_ELEVATION)
+                                   heart=heart)
             # Always the chord construction now. Selecting between it and
             # the geodesic station chain was tried and is subtly wrong: the
             # chain is built from real points, so "which curve sits closer to
@@ -1593,7 +1683,7 @@ def build_from_labels(
 
     return LabelledStructure(
         stem_path=stem_path, leaf_ids=instancing.owner, leaf_points=leaf_points,
-        attachments=attachments, tips=tips, axes=axes,
+        attachments=attachments, tips=tips, axes=axes, midrib_support=midrib_support,
         root_points=root_points, instancing=instancing,
         crown=crown, heart=heart,
     )

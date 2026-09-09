@@ -1,8 +1,38 @@
 #!/usr/bin/env bash
 # Plant pose pipeline, P1 -> P6: video in, per-leaf measurements out.
 #
+# Name the dataset directory and the paths follow from it:
+#
+#   ./run_pipeline.sh /data/2026-09-01/sugarbeet_4
+#
+# which takes its pass*/ subdirectories as the capture passes, in natural
+# order, and works in <dataset>/plant. A flat directory of JPEGs is one pass.
+# --photos/--video/--workdir still override, and are still how you point at a
+# layout that is not this one.
+#
+# Settings that hold across runs -- bank paths, architecture, the HF token --
+# go in a pipeline.conf of key=value lines rather than in every command:
+#
+#   prompt_bank  = /data/2026-09-01/sugarbeet_3/plant/p2/prompt_bank.npz
+#   seed_bank    = /data/thistle3/plant/p4c/seed_bank.npz
+#   architecture = rosette
+#   low_texture  = 1
+#
+# Read from ~/.config/blender_leaf_generator/pipeline.conf, ./pipeline.conf,
+# <dataset>/../pipeline.conf and <dataset>/pipeline.conf, in that order --
+# each overriding the last, and any flag overriding all of them. --config
+# <file> uses just that file. See pipeline.conf.example.
+#
+# Put the HF token in the user-level file or in $HF_TOKEN, not on the command
+# line: an argument is visible in `ps` to every user on the machine and lands
+# in your shell history.
+#
+#   --dry-run   print the resolved inputs and stop. Worth doing whenever a
+#               path changed: it prints every path the run will use, including
+#               the ones a config file or the dataset directory supplied.
+#
 #   # 1. frames + masks
-#   ./run_pipeline.sh --video <file> --workdir runs/plant_9 --stop-after p1p2
+#   ./run_pipeline.sh /data/2026-09-01/sugarbeet_4 --stop-after p1p2
 #
 #   # 2. click a few leaf/stem/root points (writes p4c/seeds.json)
 #   pose-pick-seeds --workdir runs/plant_9
@@ -25,6 +55,28 @@
 #               guided matching. For a small, smooth or softly-focused subject.
 #               Measured: 13/27 -> 26/27 frames on one capture, 11/54 -> 47/54 on
 #               another. Costs roughly 3-5x the feature-extraction time.
+#
+#   --allow-mixed-capture
+#               skip P1's check that the passes are one shoot of one plant --
+#               same camera body, consecutive in time, filenames in capture
+#               order. The check reads EXIF, so it is only wrong when the EXIF
+#               is. Measured on sugarbeet_4: 13 frames of a different plant,
+#               shot an hour earlier, reached P3 through a mistyped --photos;
+#               COLMAP would not register them and they still took the camera
+#               circle from 0.05% to 7.01% RMS, because both shoots share a
+#               turntable and pliers for the matcher to latch onto.
+#
+#   --cameras   how P3 groups camera intrinsics: exif (default), single,
+#               per-image or auto. exif reads the focal P1 recorded from each
+#               photo into p1/intrinsics.json and gives every distinct lens
+#               setting its own camera seeded with that focal; with no EXIF it
+#               behaves exactly like single, so video captures are unaffected.
+#               single forces one shared camera -- right for one locked-off
+#               lens, wrong across a zoom change: measured on sugarbeet_3
+#               (passes at 48/32/22mm, solved as one camera at COLMAP's 2304px
+#               guess) it gave 1.15px reprojection error and orbit axes 7.7 deg
+#               apart, over-carving the P4a hull to 0.53 IoU. per-image is the
+#               fallback for photos whose EXIF was stripped.
 #
 #   --use-gpu   run P3's SIFT on the GPU. Needs a CUDA pycolmap build
 #               (pip install pycolmap-cuda) with its bundled CUDA runtime on
@@ -143,6 +195,13 @@ DINO_MODEL="facebook/dinov3-vitb16-pretrain-lvd1689m"
 SEEDS=(); SKIP_TO=""; SEED_BANK=""; SEEDS_FILE=""; SKIP_P4B=0
 BACKEND="dino"; SAM_CHECKPOINT=""; STOP_AFTER=""
 PROMPT_BANK=""; PROMPT_ROOT=""; NO_PROMPT_BANK=0; USE_GPU=0; LOW_TEXTURE=0; ARCHITECTURE=""; PERSISTENCE=""; PROMPT_POINTS=""; KEEP_GOING=0
+CAMERAS=""; ALLOW_MIXED=0; STRICT_MIDRIBS=0
+DATASET=""; DRY_RUN=0; CONF_FILES=()
+
+# Which settings the command line set explicitly. A config file fills in only
+# what is missing, so a flag always beats a file and there is no precedence
+# question to remember.
+declare -A SET=()
 
 # Print the comment block at the top of this file, however long it is, so the
 # help text cannot drift out of sync with a hard-coded line range.
@@ -153,41 +212,191 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --video)        shift; while [[ $# -gt 0 && "$1" != --* ]]; do VIDEOS+=("$1"); shift; done ;;
-        --photos)       shift; while [[ $# -gt 0 && "$1" != --* ]]; do PHOTOS+=("$1"); shift; done ;;
-        --workdir)      WORKDIR="$2"; shift 2 ;;
+        --video)        SET[video]=1; shift; while [[ $# -gt 0 && "$1" != --* ]]; do VIDEOS+=("$1"); shift; done ;;
+        --photos)       SET[photos]=1; shift; while [[ $# -gt 0 && "$1" != --* ]]; do PHOTOS+=("$1"); shift; done ;;
+        --workdir)      SET[workdir]=1; WORKDIR="$2"; shift 2 ;;
+        --config)       CONF_FILES+=("$2"); shift 2 ;;
+        --dry-run)      DRY_RUN=1; shift ;;
         --seed-frame)   SEED_FRAME="$2"; shift 2 ;;
-        --hf-token)     HF_TOKEN_ARG="$2"; shift 2 ;;
-        --dino-model)   DINO_MODEL="$2"; shift 2 ;;
+        --hf-token) SET[hf_token]=1;     HF_TOKEN_ARG="$2"; shift 2 ;;
+        --dino-model) SET[dino_model]=1;   DINO_MODEL="$2"; shift 2 ;;
         --skip-to)      [[ -n "$SKIP_TO" ]] && echo "  note: --skip-to given twice ($SKIP_TO then $2); the last one wins" >&2
                         SKIP_TO="$2"; shift 2 ;;
         --stop-after)   [[ -n "$STOP_AFTER" ]] && echo "  note: --stop-after given twice ($STOP_AFTER then $2); the last one wins" >&2
                         STOP_AFTER="$2"; shift 2 ;;
-        --seed-bank)    SEED_BANK="$2"; shift 2 ;;
-        --prompt-bank)  PROMPT_BANK="$2"; shift 2 ;;
-        --prompt-points) PROMPT_POINTS="$2"; shift 2 ;;
-        --prompt-root)  PROMPT_ROOT="$2"; shift 2 ;;
+        --seed-bank) SET[seed_bank]=1;    SEED_BANK="$2"; shift 2 ;;
+        --prompt-bank) SET[prompt_bank]=1;  PROMPT_BANK="$2"; shift 2 ;;
+        --prompt-points) SET[prompt_points]=1; PROMPT_POINTS="$2"; shift 2 ;;
+        --prompt-root) SET[prompt_root]=1;  PROMPT_ROOT="$2"; shift 2 ;;
         --no-prompt-bank) NO_PROMPT_BANK=1; shift ;;
-        --use-gpu)      USE_GPU=1; shift ;;
-        --low-texture)  LOW_TEXTURE=1; shift ;;
-        --architecture) ARCHITECTURE="$2"; shift 2 ;;
-        --min-persistence-ratio) PERSISTENCE="$2"; shift 2 ;;
+        --use-gpu) SET[use_gpu]=1;      USE_GPU=1; shift ;;
+        --low-texture) SET[low_texture]=1;  LOW_TEXTURE=1; shift ;;
+        --cameras) SET[cameras]=1;      CAMERAS="$2"; shift 2 ;;
+        --allow-mixed-capture) SET[allow_mixed_capture]=1; ALLOW_MIXED=1; shift ;;
+        --strict-midribs) SET[strict_midribs]=1; STRICT_MIDRIBS=1; shift ;;
+        --architecture) SET[architecture]=1; ARCHITECTURE="$2"; shift 2 ;;
+        --min-persistence-ratio) SET[min_persistence_ratio]=1; PERSISTENCE="$2"; shift 2 ;;
         --seeds-file)   SEEDS_FILE="$2"; shift 2 ;;
-        --backend)      BACKEND="$2"; shift 2 ;;
-        --sam-checkpoint) SAM_CHECKPOINT="$2"; shift 2 ;;
-        --skip-p4b)     SKIP_P4B=1; shift ;;
-        --keep-going)   KEEP_GOING=1; shift ;;
+        --backend) SET[backend]=1;      BACKEND="$2"; shift 2 ;;
+        --sam-checkpoint) SET[sam_checkpoint]=1; SAM_CHECKPOINT="$2"; shift 2 ;;
+        --skip-p4b) SET[skip_p4b]=1;     SKIP_P4B=1; shift ;;
+        --keep-going) SET[keep_going]=1;   KEEP_GOING=1; shift ;;
         --use-gpu)      USE_GPU=1; shift ;;
         --seeds)        shift; while [[ $# -gt 0 && "$1" != --* ]]; do SEEDS+=("$1"); shift; done ;;
         -h|--help)      usage 0 ;;
-        *) echo "unknown option: $1" >&2; usage 1 ;;
+        --*) echo "unknown option: $1" >&2; usage 1 ;;
+        *)  [[ -z "$DATASET" ]] || { echo "give at most one dataset directory (got $DATASET and $1)" >&2; usage 1; }
+            DATASET="$1"; shift ;;
     esac
 done
 
-[[ -n "$WORKDIR" ]] || { echo "--workdir is required" >&2; usage 1; }
+# --------------------------------------------------------------------------
+# A dataset directory answers most of the command line by itself
+# --------------------------------------------------------------------------
+# The long form is the one that goes wrong: every path repeats the same
+# dataset prefix, so a single stale component is easy to type and impossible
+# to see. Measured cost of exactly that, on sugarbeet_4: one --photos entry
+# left pointing at sugarbeet_3 and the solve was of two different plants.
+# Naming the dataset once removes the chance to disagree with yourself.
+resolve_dataset() {
+    local root="$1"
+    [[ -d "$root" ]] || { echo "no such dataset directory: $root" >&2; exit 1; }
+    root="${root%/}"
+
+    local passes=()
+    while IFS= read -r dir; do passes+=("$dir"); done < <(
+        find "$root" -mindepth 1 -maxdepth 1 -type d -name 'pass*' | sort -V)
+
+    if [[ ${#passes[@]} -eq 0 ]] && compgen -G "$root"/*.[jJ][pP][gG] > /dev/null; then
+        # A flat directory of photos is one pass, which is how thistle3 is laid out.
+        passes=("$root")
+    fi
+
+    if [[ ${#passes[@]} -gt 0 && -z "${SET[photos]:-}" && -z "${SET[video]:-}" ]]; then
+        PHOTOS=("${passes[@]}")
+    fi
+    [[ -n "${SET[workdir]:-}" ]] || WORKDIR="$root/plant"
+
+    if [[ ${#passes[@]} -eq 0 && ! -d "$WORKDIR/p1/frames" ]]; then
+        echo "$root has no pass*/ subdirectories, no *.JPG of its own, and no" >&2
+        echo "  frames already at $WORKDIR/p1/frames -- is it a dataset directory?" >&2
+        exit 1
+    fi
+}
+
+# Settings that hold across runs -- bank paths, architecture, the HF token --
+# belong in a file rather than in every command. Least specific first, so a
+# per-dataset file overrides a per-session one, and a flag overrides both.
+load_config() {
+    local file key value
+    for file in "$@"; do
+        [[ -f "$file" ]] || continue
+        LOADED_CONF+=("$file")
+        local line_no=0
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line_no=$((line_no + 1))
+            line="${line%%#*}"
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -n "$line" ]] || continue
+            [[ "$line" == *=* ]] || {
+                echo "$file:$line_no: expected key=value, got: $line" >&2; exit 1; }
+            key="${line%%=*}"; value="${line#*=}"
+            key="${key%"${key##*[![:space:]]}"}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%\"}"; value="${value#\"}"
+            # A flag already given wins; the file only fills in what is missing.
+            [[ -z "${SET[$key]:-}" ]] || continue
+            case "$key" in
+                prompt_bank)   PROMPT_BANK="$value" ;;
+                prompt_root)   PROMPT_ROOT="$value" ;;
+                prompt_points) PROMPT_POINTS="$value" ;;
+                seed_bank)     SEED_BANK="$value" ;;
+                architecture)  ARCHITECTURE="$value" ;;
+                hf_token)      HF_TOKEN_ARG="$value" ;;
+                dino_model)    DINO_MODEL="$value" ;;
+                backend)       BACKEND="$value" ;;
+                sam_checkpoint) SAM_CHECKPOINT="$value" ;;
+                cameras)       CAMERAS="$value" ;;
+                min_persistence_ratio) PERSISTENCE="$value" ;;
+                low_texture)   LOW_TEXTURE=$([[ "$value" == 1 || "$value" == true ]] && echo 1 || echo 0) ;;
+                use_gpu)       USE_GPU=$([[ "$value" == 1 || "$value" == true ]] && echo 1 || echo 0) ;;
+                skip_p4b)      SKIP_P4B=$([[ "$value" == 1 || "$value" == true ]] && echo 1 || echo 0) ;;
+                keep_going)    KEEP_GOING=$([[ "$value" == 1 || "$value" == true ]] && echo 1 || echo 0) ;;
+                strict_midribs) STRICT_MIDRIBS=$([[ "$value" == 1 || "$value" == true ]] && echo 1 || echo 0) ;;
+                allow_mixed_capture) ALLOW_MIXED=$([[ "$value" == 1 || "$value" == true ]] && echo 1 || echo 0) ;;
+                *) echo "$file:$line_no: unknown setting '$key'. Valid keys are the long" >&2
+                   echo "  options with dashes as underscores: prompt_bank, seed_bank," >&2
+                   echo "  architecture, hf_token, dino_model, backend, sam_checkpoint," >&2
+                   echo "  cameras, prompt_points, prompt_root, min_persistence_ratio," >&2
+                   echo "  low_texture, use_gpu, skip_p4b, keep_going, allow_mixed_capture,
+                   strict_midribs." >&2
+                   exit 1 ;;
+            esac
+        done < "$file"
+    done
+}
+
+LOADED_CONF=()
+[[ -z "$DATASET" ]] || resolve_dataset "$DATASET"
+
+if [[ ${#CONF_FILES[@]} -gt 0 ]]; then
+    load_config "${CONF_FILES[@]}"
+else
+    CANDIDATES=("$HOME/.config/blender_leaf_generator/pipeline.conf" "$PWD/pipeline.conf")
+    [[ -z "$DATASET" ]] || CANDIDATES+=("$(dirname "${DATASET%/}")/pipeline.conf" "${DATASET%/}/pipeline.conf")
+    load_config "${CANDIDATES[@]}"
+fi
+
+[[ -n "$WORKDIR" ]] || { echo "--workdir (or a dataset directory) is required" >&2; usage 1; }
 [[ ${#VIDEOS[@]} -gt 0 || ${#PHOTOS[@]} -gt 0 || -d "$WORKDIR/p1/frames" ]] || {
     echo "--video or --photos is required unless $WORKDIR/p1/frames already exists" >&2
     usage 1; }
+
+# Everything resolved, printed before anything runs. A path that came from a
+# config file or a dataset directory is one you did not type on this run, so
+# it is exactly the kind that goes unnoticed when it is wrong.
+print_plan() {
+    echo "resolved inputs"
+    [[ -z "$DATASET" ]] || echo "  dataset       ${DATASET%/}"
+    for f in "${LOADED_CONF[@]+"${LOADED_CONF[@]}"}"; do echo "  config        $f"; done
+    if [[ ${#PHOTOS[@]} -gt 0 ]]; then
+        for d in "${PHOTOS[@]}"; do
+            local n; n=$(find "$d" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' \) 2>/dev/null | wc -l)
+            echo "  photos        ${d%/}  ($n)"
+        done
+    fi
+    for v in "${VIDEOS[@]+"${VIDEOS[@]}"}"; do echo "  video         $v"; done
+    echo "  workdir       $WORKDIR"
+    [[ -z "$PROMPT_BANK" ]]  || echo "  prompt bank   $PROMPT_BANK"
+    [[ -z "$SEED_BANK" ]]    || echo "  seed bank     $SEED_BANK"
+    [[ -z "$ARCHITECTURE" ]] || echo "  architecture  $ARCHITECTURE"
+    [[ -z "$CAMERAS" ]]      || echo "  cameras       $CAMERAS"
+    [[ "$LOW_TEXTURE" == 1 ]] && echo "  low-texture   on"
+    [[ "$USE_GPU" == 1 ]]     && echo "  gpu           on"
+    [[ -z "$HF_TOKEN_ARG" ]] || echo "  hf token      set (${#HF_TOKEN_ARG} chars)"
+    echo "  phases        ${SKIP_TO:-p1p2} -> ${STOP_AFTER:-p6}"
+
+    # A bank belonging to another dataset is legitimate -- that is what banks
+    # are for -- but it is also what a stale path looks like, so say so.
+    local ds; ds="$(cd "${DATASET:-$WORKDIR}" 2>/dev/null && pwd || echo "")"
+    for pair in "prompt bank:$PROMPT_BANK" "seed bank:$SEED_BANK"; do
+        local label="${pair%%:*}" path="${pair#*:}"
+        [[ -n "$path" ]] || continue
+        if [[ ! -e "$path" ]]; then
+            echo "  note: $label does not exist: $path" >&2
+        elif [[ -n "$ds" && "$(cd "$(dirname "$path")" && pwd)" != "$ds"* ]]; then
+            echo "  note: $label comes from another dataset (fine if deliberate)" >&2
+        fi
+    done
+}
+print_plan
+if [[ "$DRY_RUN" == 1 ]]; then
+    echo
+    echo "--dry-run: nothing was run."
+    exit 0
+fi
+echo
 
 # Seeds clicked with pose-pick-seeds land here by default, so finding them is
 # not something you should have to tell the script about.
@@ -405,7 +614,8 @@ if should_run p1p2; then
         --checkpoint "$SAM_CKPT" \
         ${PROMPT_BANK:+--prompt-bank "$PROMPT_BANK"} \
         ${PROMPT_BANK:+--dino-model "$DINO_MODEL"} \
-        ${PROMPT_POINTS:+--prompt-points "$PROMPT_POINTS"}
+        ${PROMPT_POINTS:+--prompt-points "$PROMPT_POINTS"} \
+        $([[ "$ALLOW_MIXED" == 1 ]] && echo --allow-mixed-capture)
     gate p1p2 "$WORKDIR/p2/qc.json"
 fi
 
@@ -413,6 +623,7 @@ if should_run p3; then
     phase "P3     camera poses, masked COLMAP                 -> $WORKDIR/p3"
     $PY -m pose_estimator.cli.pose --workdir "$WORKDIR" \
         $([[ "$USE_GPU" == 1 ]] && echo --use-gpu) \
+        $([[ -n "$CAMERAS" ]] && echo --cameras "$CAMERAS") \
         $([[ "$LOW_TEXTURE" == 1 ]] && echo --low-texture)
     gate p3 "$WORKDIR/p3/poses.json"
 fi
@@ -471,6 +682,7 @@ if should_run p5; then
         phase "P5     stem centreline + leaf instances           -> $WORKDIR/p5"
         $PY -m pose_estimator.cli.structure --workdir "$WORKDIR" \
             ${ARCHITECTURE:+--architecture "$ARCHITECTURE"} \
+            $([[ "$STRICT_MIDRIBS" == 1 ]] && echo --strict-midribs) \
             ${PERSISTENCE:+--min-persistence-ratio "$PERSISTENCE"}
     else
         phase "P5     SKIPPED -- no $WORKDIR/p4c/labels.npy"
