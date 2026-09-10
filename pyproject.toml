@@ -102,21 +102,27 @@ semantic = [
 # needed, then this extra will retain it when its version satisfies >=2.3.
 # The exporter imports LightGlue even when --bundle-adjust is off.
 #
-# Two requirements cannot be expressed here, and `pose-geometry` checks both
-# before it stages anything:
+# Two requirements this extra cannot enforce on its own, both verified by
+# `pose-geometry` before it stages anything:
 #   * Python >= 3.10. The exporter and its vendored files annotate with PEP 604
 #     unions (`np.ndarray | None`) in positions Python evaluates on import, so
 #     3.9 raises "unsupported operand type(s) for |" from inside
 #     vggt/dependency/projection.py. Only the model environment needs 3.10+:
 #     keep this project where it is and pass --model-python.
-#   * pycolmap, from whichever build you already use for pose-solve -- plain
-#     `pycolmap` or `pycolmap-cuda`. Naming either one here would clobber the
-#     other, since both install the same `pycolmap` module, so this extra
-#     names neither and the exporter's import of it is checked at runtime.
+#   * an environment of its own. `pycolmap` below is pinned to the version the
+#     exporter is written against, and both it and `pycolmap-cuda` provide the
+#     same `pycolmap` module -- so installing this extra beside "skeleton-gpu"
+#     replaces the build pose-solve uses. Keep them in separate environments
+#     and pass --model-python; pose-geometry verifies the API before running.
 vggt = [
     "torch>=2.3",
     "torchvision>=0.18",
     "numpy<2",
+    # Matches VGGT's own requirements_demo.txt pin. pycolmap 4.x renamed
+    # `Image.id` and made `cam_from_world` read-only, so the exporter dies
+    # in np_to_pycolmap.py with AttributeError on anything newer. The
+    # exporter only *writes* a model, so the CUDA build gains it nothing.
+    "pycolmap==3.10.0",
     "Pillow",
     "huggingface_hub",
     "einops",

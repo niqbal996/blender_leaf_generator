@@ -146,7 +146,7 @@ def run_learned_backend(
     environment = None
     if not skip_env_check:
         print(f"  {backend}: checking the exporter environment ({model_python or sys.executable})...")
-        environment = require_model_environment(backend, model_python)
+        environment = require_model_environment(backend, model_python, repo_root)
         cuda = environment.get("torch_cuda") or {}
         print(f"    Python {'.'.join(str(part) for part in environment['python'])}, torch CUDA "
               f"{cuda.get('build') or 'n/a'}, devices: {', '.join(cuda.get('devices') or ['none'])}")
@@ -351,6 +351,12 @@ _ENVIRONMENT_MARKERS = (
      "a vendored file uses PEP 604 `X | None` annotations, which need Python 3.10 or newer -- "
      "point --model-python at a newer interpreter"),
     ("ModuleNotFoundError: No module named 'pycolmap'", _PYCOLMAP_HELP),
+    ("object has no attribute 'id'",
+     "the installed pycolmap is newer than the API this exporter is written against "
+     "(pycolmap 4.x renamed Image.id); install the version its requirements_demo.txt pins"),
+    ("Cannot import the C++ backend",
+     "the installed pycolmap wheel cannot load its compiled core; the exporter only writes a "
+     "model, so plain pycolmap at the pinned version is the simplest fix"),
     ("libcudart", "an installed CUDA extension cannot find its CUDA runtime; put it on LD_LIBRARY_PATH"),
     ("ModuleNotFoundError", "a dependency of the official exporter is missing from that environment"),
     ("ImportError", "a dependency of the official exporter is present but unusable"),
@@ -368,6 +374,18 @@ for name in sys.argv[1:]:
     except BaseException as exc:            # a bad wheel can raise anything
         report["modules"][name] = f"MISSING: {{type(exc).__name__}}: {{exc}}"
 try:
+    import pycolmap
+    report["pycolmap_version"] = getattr(pycolmap, "__version__", "unknown")
+    try:
+        # The exporter's own call. pycolmap 4.x renamed `id` and made
+        # cam_from_world read-only, so importability proves nothing.
+        pycolmap.Image(id=1, name="probe", camera_id=1, cam_from_world=pycolmap.Rigid3d())
+        report["pycolmap_exporter_api"] = "ok"
+    except BaseException as exc:
+        report["pycolmap_exporter_api"] = f"INCOMPATIBLE: {{type(exc).__name__}}: {{exc}}"
+except BaseException:
+    pass
+try:
     import torch
     count = torch.cuda.device_count() if torch.cuda.is_available() else 0
     report["torch_cuda"] = {{
@@ -378,6 +396,25 @@ except BaseException:
     pass
 print({_PROBE_MARKER!r} + json.dumps(report))
 '''
+
+
+def exporter_pinned_pycolmap(repo_root: Optional[Path], default: str = "3.10.0") -> str:
+    """The pycolmap version the checked-out exporter pins for itself.
+
+    Reading it from the checkout means this stays correct when upstream bumps
+    the pin, rather than encoding today's answer in this file.
+    """
+    if repo_root is None:
+        return default
+    for name in ("requirements_demo.txt", "requirements.txt"):
+        try:
+            content = (Path(repo_root) / name).read_text()
+        except OSError:
+            continue
+        match = re.search(r"^pycolmap\s*==\s*([\w.]+)", content, re.MULTILINE)
+        if match:
+            return match.group(1)
+    return default
 
 
 def probe_model_environment(backend: str, model_python: Optional[str] = None) -> Dict:
@@ -406,7 +443,11 @@ def probe_model_environment(backend: str, model_python: Optional[str] = None) ->
     )
 
 
-def require_model_environment(backend: str, model_python: Optional[str] = None) -> Dict:
+def require_model_environment(
+    backend: str,
+    model_python: Optional[str] = None,
+    repo_root: Optional[Path] = None,
+) -> Dict:
     """Fail with instructions when the exporter's interpreter cannot run it.
 
     Both failures this catches are environment mistakes, not model problems,
@@ -426,16 +467,30 @@ def require_model_environment(backend: str, model_python: Optional[str] = None) 
             f"      Create a newer environment and point --model-python at its python; the rest "
             f"of this pipeline can stay where it is."
         )
+    pinned = exporter_pinned_pycolmap(repo_root)
     missing = {name: detail for name, detail in report["modules"].items() if detail.startswith("MISSING:")}
     for name, detail in missing.items():
         hint = _MODULE_HELP.get(name)
-        # A pycolmap wheel that imports but cannot find CUDA is a third case,
-        # distinct from an absent package, and needs a different fix.
-        if name == "pycolmap" and "libcudart" in detail:
-            hint = ("pycolmap-cuda is installed but its CUDA runtime is not on LD_LIBRARY_PATH; "
-                    "see the skeleton-gpu notes in pyproject.toml")
+        # A pycolmap wheel that is installed but broken is a separate case from
+        # an absent one, and the CUDA build is the usual reason: this exporter
+        # only writes a model, so it gains nothing from GPU SIFT.
+        if name == "pycolmap" and ("libcudart" in detail or "_core" in detail):
+            hint = (f'pip install "pycolmap=={pinned}" -- the exporter only writes a COLMAP '
+                    f"model and never extracts features, so the pycolmap-cuda build buys it "
+                    f"nothing and only has to load")
+        elif name == "pycolmap":
+            hint = f'pip install "pycolmap=={pinned}"  ({_PYCOLMAP_HELP})'
         problems.append(f"{name} cannot be imported in {report['executable']}: "
                         f"{detail[len('MISSING: '):]}" + (f"\n      Fix: {hint}" if hint else ""))
+    api = report.get("pycolmap_exporter_api", "")
+    if api.startswith("INCOMPATIBLE:"):
+        problems.append(
+            f"pycolmap {report.get('pycolmap_version', '?')} in {report['executable']} cannot build "
+            f"the model this exporter writes: {api[len('INCOMPATIBLE: '):]}\n"
+            f"      The exporter is written against the version it pins for itself, and pycolmap 4.x "
+            f"renamed `Image.id` and made `cam_from_world` read-only.\n"
+            f'      Fix: pip install "pycolmap=={pinned}" in the exporter environment.'
+        )
     if problems:
         raise RuntimeError(
             f"the {backend} exporter cannot run in this environment:\n    - "

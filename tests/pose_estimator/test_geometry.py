@@ -258,7 +258,7 @@ def test_missing_pycolmap_explains_why_the_extra_cannot_pin_it(monkeypatch):
     assert "clobber" in message  # the reason it is not simply added to [vggt]
 
 
-def test_pycolmap_present_but_missing_its_cuda_runtime_gets_a_different_fix(monkeypatch):
+def test_a_pycolmap_missing_its_cuda_runtime_is_explained_differently_from_an_absent_one(monkeypatch):
     import subprocess as sp
 
     import pytest
@@ -266,15 +266,19 @@ def test_pycolmap_present_but_missing_its_cuda_runtime_gets_a_different_fix(monk
     from pose_estimator import geometry
 
     modules = {name: "2.0" for name in geometry._REQUIRED_MODULES["vggt"]}
-    modules["pycolmap"] = ("MISSING: ImportError: libcudart.so.12: cannot open shared object file")
+    modules["pycolmap"] = "MISSING: ImportError: libcudart.so.12: cannot open shared object file"
     monkeypatch.setattr(geometry.subprocess, "run",
                         lambda command, **kw: sp.CompletedProcess(
                             command, 0, stdout=_probe_output((3, 11, 0), modules), stderr=""))
 
     with pytest.raises(RuntimeError) as failure:
         geometry.require_model_environment("vggt")
-    assert "LD_LIBRARY_PATH" in str(failure.value)
-    assert "pip install pycolmap" not in str(failure.value)
+    message = str(failure.value)
+    # Same install command as an absent package, but the reason differs: a CUDA
+    # build is pointless for an exporter that only writes a model.
+    assert 'pip install "pycolmap==3.10.0"' in message
+    assert "never extracts features" in message
+    assert "clobber" not in message
 
 
 def test_a_complete_environment_passes_and_reports_its_gpus(monkeypatch):
@@ -341,3 +345,76 @@ def test_an_import_time_crash_is_diagnosed_as_environment_not_memory(tmp_path):
     no_pycolmap = diagnose_exporter_failure(
         "vggt", 1, "ModuleNotFoundError: No module named 'pycolmap'", 27, usage, tmp_path / "log")
     assert "pip install pycolmap" in no_pycolmap
+
+
+def test_pinned_pycolmap_is_read_from_the_checkout_not_hardcoded(tmp_path):
+    from pose_estimator.geometry import exporter_pinned_pycolmap
+
+    repo = tmp_path / "vggt"
+    repo.mkdir()
+    assert exporter_pinned_pycolmap(None) == "3.10.0"          # no checkout yet
+    assert exporter_pinned_pycolmap(repo) == "3.10.0"          # no requirements file
+    (repo / "requirements_demo.txt").write_text("trimesh\npycolmap==3.11.1\nlightglue\n")
+    assert exporter_pinned_pycolmap(repo) == "3.11.1"          # follows an upstream bump
+
+
+def test_importable_but_incompatible_pycolmap_is_rejected_before_any_work(monkeypatch, tmp_path):
+    import subprocess as sp
+
+    import pytest
+
+    from pose_estimator import geometry
+
+    ready = {name: "2.0" for name in geometry._REQUIRED_MODULES["vggt"]}
+    stdout = _probe_output((3, 12, 0), ready).replace(
+        '"modules"', '"pycolmap_version": "4.1.1", "pycolmap_exporter_api": '
+        '"INCOMPATIBLE: AttributeError: \'pycolmap._core.Image\' object has no attribute \'id\'", '
+        '"modules"')
+    monkeypatch.setattr(geometry.subprocess, "run",
+                        lambda command, **kw: sp.CompletedProcess(command, 0, stdout=stdout, stderr=""))
+    repo = tmp_path / "vggt"
+    repo.mkdir()
+    (repo / "requirements_demo.txt").write_text("pycolmap==3.10.0\n")
+
+    with pytest.raises(RuntimeError) as failure:
+        geometry.require_model_environment("vggt", None, repo)
+    message = str(failure.value)
+    assert "pycolmap 4.1.1" in message
+    assert "no attribute 'id'" in message
+    assert 'pip install "pycolmap==3.10.0"' in message
+    assert "Nothing was staged or downloaded" in message
+
+
+def test_a_pycolmap_wheel_that_cannot_load_its_core_gets_the_plain_build_advice(monkeypatch):
+    import subprocess as sp
+
+    import pytest
+
+    from pose_estimator import geometry
+
+    modules = {name: "2.0" for name in geometry._REQUIRED_MODULES["vggt"]}
+    modules["pycolmap"] = ("MISSING: RuntimeError: Cannot import the C++ backend pycolmap._core")
+    monkeypatch.setattr(geometry.subprocess, "run",
+                        lambda command, **kw: sp.CompletedProcess(
+                            command, 0, stdout=_probe_output((3, 12, 0), modules), stderr=""))
+
+    with pytest.raises(RuntimeError) as failure:
+        geometry.require_model_environment("vggt")
+    message = str(failure.value)
+    assert 'pip install "pycolmap==3.10.0"' in message
+    assert "never extracts features" in message  # why the CUDA build is pointless here
+
+
+def test_a_post_launch_pycolmap_api_break_is_named_rather_than_reported_as_exit_1(tmp_path):
+    from pose_estimator.geometry import diagnose_exporter_failure
+
+    usage = {"stage": "building the COLMAP sparse model (CPU)",
+             "last_line": "AttributeError: 'pycolmap._core.Image' object has no attribute 'id'",
+             "peak_gpu_used_gb": 10.1, "gpu_total_gb": 45.0, "peak_process_rss_gb": 10.2,
+             "min_host_available_gb": 775.6, "elapsed_seconds": 216}
+    message = diagnose_exporter_failure(
+        "vggt", 1, "AttributeError: 'pycolmap._core.Image' object has no attribute 'id'",
+        27, usage, tmp_path / "log")
+    assert "environment problem" in message
+    assert "requirements_demo.txt" in message
+    assert "out-of-memory" not in message  # 10 of 45 GB is not a memory failure

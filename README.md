@@ -283,19 +283,30 @@ once into the same environment that launches `pose-geometry`:
 pip install -e ".[vggt]"
 ```
 
-Two things that extra cannot install for you, both checked before a run
-stages anything:
+Install it into an **environment of its own**, for two reasons the extra
+cannot enforce by itself:
 
-* **Python 3.10 or newer, for the model environment only.** VGGT's exporter
-  and its vendored files annotate with `np.ndarray | None` in positions
-  Python evaluates on import, so 3.9 fails with `TypeError: unsupported
-  operand type(s) for |` from inside `vggt/dependency/projection.py`. This
-  project itself does not need 3.10: keep it where it is and pass
-  `--model-python /path/to/py310/bin/python`.
-* **`pycolmap`**, from whichever build you already use for `pose-solve` --
-  plain `pycolmap` or `pycolmap-cuda`. The extra names neither on purpose:
-  both install the same `pycolmap` module, so pinning one would clobber the
-  other and break P3.
+* **Python 3.10 or newer.** VGGT's exporter and its vendored files annotate
+  with `np.ndarray | None` in positions Python evaluates on import, so 3.9
+  fails with `TypeError: unsupported operand type(s) for |` from inside
+  `vggt/dependency/projection.py`. This project itself does not need 3.10.
+* **`pycolmap==3.10.0`**, which the extra pins to match VGGT's own
+  `requirements_demo.txt`. pycolmap 4.x renamed `Image.id` and made
+  `cam_from_world` read-only, so a newer build dies in `np_to_pycolmap.py`
+  with `AttributeError: 'pycolmap._core.Image' object has no attribute 'id'`
+  *after* the weights have downloaded and inference has run. Since
+  `pycolmap` and `pycolmap-cuda` provide the same module, installing this
+  extra next to `skeleton-gpu` would replace the build `pose-solve` uses --
+  hence a separate environment. The exporter only *writes* a COLMAP model
+  and never extracts features, so it gains nothing from the CUDA build.
+
+```bash
+conda create -n vggt python=3.11 && conda activate vggt
+pip install -e ".[vggt]"
+# then, from wherever the rest of the pipeline lives:
+pose-geometry --workdir runs/plant_9 --backends vggt \
+  --model-python ~/miniconda3/envs/vggt/bin/python
+```
 
 `pose-geometry` asks the exporter's own interpreter what it has before it
 clears or stages anything, so a missing dependency costs seconds instead of
@@ -307,15 +318,20 @@ RuntimeError: the vggt exporter cannot run in this environment:
       3.10 or newer: it annotates with `X | None` in positions Python
       evaluates at import time ...
       Create a newer environment and point --model-python at its python ...
-    - pycolmap cannot be imported in /env/bin/python: ModuleNotFoundError ...
-      Fix: pip install pycolmap  (or pycolmap-cuda for GPU SIFT). ...
+    - pycolmap 4.1.1 in /env/bin/python cannot build the model this exporter
+      writes: AttributeError: 'pycolmap._core.Image' object has no attribute 'id'
+      The exporter is written against the version it pins for itself ...
+      Fix: pip install "pycolmap==3.10.0" in the exporter environment.
   Nothing was staged or downloaded. Re-run with --skip-env-check to try anyway.
 ```
 
-`--dry-run` runs exactly this check and stages the inputs without loading a
-model, which makes it the quickest way to validate a new machine.  A
-`pycolmap-cuda` wheel that imports but cannot find `libcudart` is reported as
-its own case, since the fix there is `LD_LIBRARY_PATH`, not an install.
+The pycolmap check calls the exporter's own `pycolmap.Image(...)` rather than
+comparing version strings, and the version it recommends is read from the
+checkout's `requirements_demo.txt`, so it stays right when upstream moves.
+A wheel that imports but cannot load its compiled core (`Cannot import the
+C++ backend pycolmap._core`, or a missing `libcudart`) is reported as its own
+case.  `--dry-run` runs exactly this check and stages the inputs without
+loading a model, which makes it the quickest way to validate a new machine.
 
 This includes `trimesh`, LightGlue, the tracker configuration libraries, and
 the Hugging Face loader used by the upstream exporter. Install your
