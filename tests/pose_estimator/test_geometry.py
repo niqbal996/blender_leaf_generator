@@ -481,7 +481,8 @@ def test_each_backend_can_use_its_own_interpreter(monkeypatch, tmp_path):
 
     calls = []
     monkeypatch.setattr(cli, "require_sparse_model", lambda workdir, backend="colmap": tmp_path)
-    monkeypatch.setattr(cli, "compare_backends", lambda workdir, backends: {"comparisons": {}})
+    monkeypatch.setattr(cli, "compare_backends",
+                        lambda workdir, backends: {"comparisons": {}, "models": {}})
 
     def record(workdir, backend, root, **kwargs):
         calls.append((backend, kwargs["model_python"]))
@@ -495,3 +496,114 @@ def test_each_backend_can_use_its_own_interpreter(monkeypatch, tmp_path):
     calls.clear()
     cli.run(tmp_path, ["vggt", "mapanything"], model_python="/envs/shared/python")
     assert calls == [("vggt", "/envs/shared/python"), ("mapanything", "/envs/shared/python")]
+
+
+def _quaternion(rotation):
+    """Rotation matrix -> COLMAP's (qw, qx, qy, qz), without a scipy dependency."""
+    trace = rotation.trace()
+    if trace > 0:
+        scale = 2.0 * np.sqrt(1.0 + trace)
+        return np.array([0.25 * scale,
+                         (rotation[2, 1] - rotation[1, 2]) / scale,
+                         (rotation[0, 2] - rotation[2, 0]) / scale,
+                         (rotation[1, 0] - rotation[0, 1]) / scale])
+    axis = int(np.argmax(np.diag(rotation)))
+    other = [(axis + 1) % 3, (axis + 2) % 3]
+    scale = 2.0 * np.sqrt(1.0 + rotation[axis, axis] - sum(rotation[i, i] for i in other))
+    quaternion = np.zeros(4)
+    quaternion[0] = (rotation[other[1], other[0]] - rotation[other[0], other[1]]) / scale
+    quaternion[axis + 1] = 0.25 * scale
+    quaternion[other[0] + 1] = (rotation[other[0], axis] + rotation[axis, other[0]]) / scale
+    quaternion[other[1] + 1] = (rotation[other[1], axis] + rotation[axis, other[1]]) / scale
+    return quaternion
+
+
+def _synthetic_turntable(tmp_path, backend, jitter=0.0):
+    """A point cloud seen from 8 turntable poses, with masks drawn from the truth.
+
+    Written as COLMAP text files rather than through pycolmap's Python API,
+    which changed incompatibly at 4.0 -- the text format is what every
+    backend actually exchanges, so this also exercises the real read path.
+    Perturbing the *cameras* while leaving the masks alone is what makes this
+    a test of the metric: the score must fall when the geometry is wrong.
+    """
+    rng = np.random.default_rng(0)
+    points = rng.uniform(-0.1, 0.1, size=(400, 3))
+    width = height = 200
+    focal = 300.0
+    model = (tmp_path / "p3" / "sparse" / "best" if backend == "colmap"
+             else tmp_path / "p3" / "experiments" / backend / "sparse" / "best")
+    model.mkdir(parents=True)
+    masks = tmp_path / "p2" / "masks" / "plant"
+    frames = tmp_path / "p1" / "frames"
+    masks.mkdir(parents=True); frames.mkdir(parents=True)
+
+    (model / "cameras.txt").write_text(
+        f"1 SIMPLE_PINHOLE {width} {height} {focal} {width / 2} {height / 2}\n")
+    (model / "points3D.txt").write_text("".join(
+        f"{index + 1} {x} {y} {z} 128 128 128 0\n"
+        for index, (x, y, z) in enumerate(points)))
+
+    image_lines = []
+    for index in range(8):
+        angle = 2 * np.pi * index / 8
+        eye = np.array([np.cos(angle), np.sin(angle), 0.0])
+        forward = -eye
+        right = np.cross(np.array([0.0, 0.0, 1.0]), forward)
+        right /= np.linalg.norm(right)
+        rotation = np.stack([right, np.cross(forward, right), forward])
+
+        # Masks come from the true pose, always.
+        camera_points = points @ rotation.T + (-rotation @ eye)
+        pixels = camera_points[:, :2] / camera_points[:, 2:3] * focal + np.array([width / 2, height / 2])
+        mask = np.zeros((height, width), np.uint8)
+        for column, row in np.round(pixels).astype(int):
+            cv2.circle(mask, (int(column), int(row)), 4, 255, -1)
+        cv2.imwrite(str(masks / f"frame_{index:04d}.png"), mask)
+        cv2.imwrite(str(frames / f"frame_{index:04d}.jpg"), np.zeros((height, width, 3), np.uint8))
+
+        if jitter:  # the recorded pose, optionally wrong
+            spin = cv2.Rodrigues(np.array([0.0, 0.0, jitter]))[0]
+            rotation = rotation @ spin
+        translation = -rotation @ eye
+        qw, qx, qy, qz = _quaternion(rotation)
+        image_lines.append(
+            f"{index + 1} {qw} {qx} {qy} {qz} {translation[0]} {translation[1]} {translation[2]} "
+            f"1 frame_{index:04d}.jpg\n\n")
+    (model / "images.txt").write_text("".join(image_lines))
+    return tmp_path
+
+
+def test_silhouette_agreement_is_near_perfect_for_correct_geometry(tmp_path):
+    import pytest
+
+    pytest.importorskip("pycolmap")
+    from pose_estimator.geometry import silhouette_agreement
+
+    score = silhouette_agreement(_synthetic_turntable(tmp_path, "vggt"), "vggt")
+    assert score["views_scored"] == 8
+    assert score["points_in_silhouette"] > 0.99   # the masks were drawn from these points
+    assert score["silhouette_coverage"] > 0.9
+
+
+def test_silhouette_agreement_falls_when_the_poses_are_wrong(tmp_path):
+    import pytest
+
+    pytest.importorskip("pycolmap")
+    from pose_estimator.geometry import silhouette_agreement
+
+    good = silhouette_agreement(_synthetic_turntable(tmp_path / "good", "vggt"), "vggt")
+    bad = silhouette_agreement(_synthetic_turntable(tmp_path / "bad", "vggt", jitter=0.2), "vggt")
+    assert bad["points_in_silhouette"] < good["points_in_silhouette"] - 0.2
+    assert bad["silhouette_coverage"] < good["silhouette_coverage"]
+
+
+def test_multi_pass_captures_are_scored_with_their_pass_map(tmp_path):
+    from pose_estimator.geometry import read_capture_passes
+
+    (tmp_path / "p1").mkdir()
+    assert read_capture_passes(tmp_path) is None            # no file
+    (tmp_path / "p1" / "sources.json").write_text('{"frame_0000": 0, "frame_0001": 0}')
+    assert read_capture_passes(tmp_path) is None            # single pass: one circle is right
+    (tmp_path / "p1" / "sources.json").write_text('{"frame_0000": 0, "frame_0001": 1}')
+    assert read_capture_passes(tmp_path) == {"frame_0000": 0, "frame_0001": 1}

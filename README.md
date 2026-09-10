@@ -441,10 +441,40 @@ p3/experiments/compare.json  registration and aligned camera-centre agreement
 p3/experiments/diag/camera_compare.png
 ```
 
-`compare.json` aligns matching camera centres by a best-fit similarity before
-reporting errors, because learned models and COLMAP use unrelated world axes
-and scales.  A low error means the candidate agrees with the baseline; it is
-not ground-truth accuracy.  Read that alongside registration fraction, cloud
+#### Which backend is actually better
+
+`compare.json` carries two independent families of number, and the
+distinction decides what you can conclude.
+
+*Agreement with COLMAP.* Camera centres of matching frames are aligned by a
+best-fit similarity (learned models and COLMAP use unrelated world axes and
+scales, so raw coordinates say nothing) and the residuals reported. A low
+error means the candidate agrees with the baseline -- it is not accuracy, and
+if COLMAP is the one that drifted, the better reconstruction looks worse.
+
+*Agreement with the silhouettes.* The P2 masks are the one piece of geometry
+this pipeline independently trusts, and P4 already carves against them as
+truth, so scoring against them needs no reference reconstruction:
+
+* `points_in_silhouette` -- of every (point, view) pair a camera can see, the
+  fraction landing inside the plant mask. Wrong poses or wrong depths scatter
+  points outside the silhouette, so this is comparable across backends and
+  higher is better. On `thistle3` the COLMAP baseline scores 0.83.
+* `silhouette_coverage` -- the fraction of mask area with a projected point
+  within a few pixels. This rewards dense pointmaps *by construction*
+  (COLMAP's 1372 sparse points cover 39% of the mask; a feed-forward
+  pointmap of 100k points will beat that regardless of quality), so read it
+  next to `num_points` and never on its own. It is the number that speaks to
+  thin structures: leaf tips and petioles are where a sparse cloud has
+  nothing to say.
+
+Read both next to `most_frames_registered` from each backend's `poses.json`.
+Registration completeness is often the real differentiator on plants: masked
+COLMAP registers 16 of 27 frames on `thistle3`, while a feed-forward model
+returns a pose for every view it is given, whether or not that pose is good.
+All backends are now scored with the same per-pass turntable checks, so a
+multi-elevation capture is compared circle-by-circle rather than against one
+circle it cannot lie on.  Read that alongside registration fraction, cloud
 coverage in `sparse_points.ply`, and the rendered P4 hull.  The official
 projects currently expose COLMAP export in their repositories:
 [VGGT](https://github.com/facebookresearch/vggt) and

@@ -68,6 +68,12 @@ def run(
         available.insert(0, "colmap")
     comparison = compare_backends(workdir, available)
     print(f"Comparison: {workdir / 'p3' / 'experiments' / 'compare.json'}")
+    for name, model in comparison["models"].items():
+        silhouette = model.get("silhouette") or {}
+        if "points_in_silhouette" in silhouette:
+            print(f"  {name}: {silhouette['points_in_silhouette']:.1%} of projected points inside the P2 "
+                  f"masks, {silhouette['silhouette_coverage']:.1%} mask coverage "
+                  f"({silhouette['num_points']} points)")
     for name, entry in comparison["comparisons"].items():
         alignment = entry["camera_center_alignment"]
         detail = "not alignable" if alignment is None else f"aligned camera RMSE {alignment['rmse']:.4f}"

@@ -883,17 +883,118 @@ def _copy_images(paths: Iterable[Path], destination: Path) -> None:
         shutil.copyfile(path, destination / path.name)
 
 
+def read_capture_passes(workdir: Path) -> Optional[Dict[str, int]]:
+    """P1's frame -> capture-pass map, when the capture had more than one.
+
+    ``evaluate_poses`` fits one circle per pass and then checks that the
+    passes share a rotation axis.  Without this, a two-elevation capture is
+    scored against a single circle it cannot lie on, which reports a large
+    residual for a perfectly good solve -- and it loses the strongest check
+    there is.  pose-solve already passes this, so a learned backend scored
+    without it is not comparable to the baseline.
+    """
+    try:
+        sources = json.loads((workdir / "p1" / "sources.json").read_text())
+    except (OSError, ValueError):
+        return None
+    passes = {str(name): int(index) for name, index in sources.items()}
+    return passes if len(set(passes.values())) > 1 else None
+
+
 def score_sparse_model(workdir: Path, backend: str, num_input_frames: int) -> Dict:
     """Create the same basic report/PLY artifacts for every backend."""
     import pycolmap
 
     destination = geometry_dir(workdir, backend)
     reconstruction = pycolmap.Reconstruction(str(require_sparse_model(workdir, backend)))
-    report = evaluate_poses(reconstruction, num_input_frames=num_input_frames)
+    report = evaluate_poses(reconstruction, num_input_frames=num_input_frames,
+                            sources=read_capture_passes(workdir))
     centers, _, _ = get_registered_camera_poses(reconstruction)
     xyz, rgb = _points_and_colors(reconstruction)
     export_scene_ply(destination / "sparse_points.ply", destination / "camera_centers.ply", xyz, rgb, centers)
     return report
+
+
+def silhouette_agreement(
+    workdir: Path,
+    backend: str,
+    dilate_px: int = 2,
+    coverage_radius_px: int = 6,
+    max_points: int = 200_000,
+) -> Dict:
+    """Score a backend's cloud against the P2 silhouettes it should explain.
+
+    Camera-centre agreement says whether two backends *agree*; it cannot say
+    which is right.  The masks can: they are the one piece of geometry in this
+    pipeline that is independently trusted, and P4 carving already treats them
+    as truth.  Two numbers, deliberately kept apart:
+
+    ``points_in_silhouette``  of every (point, view) pair the camera can see,
+        the fraction landing inside the plant mask.  Wrong poses or wrong
+        depths scatter points outside the silhouette, so this is the honest
+        precision measure and it is comparable across backends.
+    ``silhouette_coverage``  the fraction of mask area with a projected point
+        within ``coverage_radius_px``.  This rewards dense pointmaps by
+        construction, so it is only comparable between clouds of similar
+        size -- read it as "does the cloud explain the whole plant, including
+        the thin structures", never on its own.
+    """
+    import pycolmap
+
+    from pose_estimator.hull import load_carve_cameras
+
+    reconstruction = pycolmap.Reconstruction(str(require_sparse_model(workdir, backend)))
+    cameras = load_carve_cameras(reconstruction, workdir / "p2" / "masks" / "plant",
+                                 dilate_px=dilate_px)
+    xyz, _ = _points_and_colors(reconstruction)
+    if not cameras or not len(xyz):
+        return {"views_scored": len(cameras), "num_points": int(len(xyz)),
+                "note": "need both a cloud and P2 masks to score silhouette agreement"}
+    points = xyz if len(xyz) <= max_points else xyz[
+        np.linspace(0, len(xyz) - 1, max_points).astype(int)]
+
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * coverage_radius_px + 1, 2 * coverage_radius_px + 1))
+    observed = inside = 0
+    coverages, per_view = [], {}
+    for camera in cameras:
+        height, width = camera.mask.shape
+        pixels, in_front = camera.project(points)
+        columns = np.round(pixels[:, 0]).astype(np.int64)
+        rows = np.round(pixels[:, 1]).astype(np.int64)
+        # Bounds come from the mask, not the model's stored width/height: the
+        # exporters rescale intrinsics to the original frames but do not
+        # always update that metadata.
+        visible = in_front & (columns >= 0) & (columns < width) & (rows >= 0) & (rows < height)
+        columns, rows = columns[visible], rows[visible]
+        hit = camera.mask[rows, columns]
+        observed += int(visible.sum())
+        inside += int(hit.sum())
+
+        raster = np.zeros(camera.mask.shape, np.uint8)
+        raster[rows, columns] = 1
+        explained = cv2.dilate(raster, kernel).astype(bool) & camera.mask
+        mask_area = int(camera.mask.sum())
+        coverage = explained.sum() / mask_area if mask_area else 0.0
+        coverages.append(coverage)
+        per_view[camera.name] = {
+            "points_visible": int(visible.sum()),
+            "points_in_silhouette": float(hit.mean()) if visible.any() else 0.0,
+            "silhouette_coverage": float(coverage),
+        }
+
+    return {
+        "views_scored": len(cameras),
+        "num_points": int(len(xyz)),
+        "points_scored": int(len(points)),
+        "point_view_pairs_visible": observed,
+        "points_in_silhouette": inside / observed if observed else 0.0,
+        "silhouette_coverage": float(np.mean(coverages)),
+        "worst_view_coverage": float(np.min(coverages)),
+        "coverage_radius_px": coverage_radius_px,
+        "mask_dilate_px": dilate_px,
+        "per_view": per_view,
+    }
 
 
 def compare_backends(workdir: Path, backends: Sequence[str]) -> Dict:
@@ -907,6 +1008,9 @@ def compare_backends(workdir: Path, backends: Sequence[str]) -> Dict:
     if "colmap" not in backends:
         backends = ["colmap", *backends]
     models = {name: _load_model_summary(workdir, name) for name in backends}
+    # Scored against the masks, so every backend gets a number that does not
+    # depend on agreeing with COLMAP.
+    silhouettes = {name: silhouette_agreement(workdir, name) for name in backends}
     baseline = models["colmap"]
     comparisons = {}
     for name, model in models.items():
@@ -934,10 +1038,27 @@ def compare_backends(workdir: Path, backends: Sequence[str]) -> Dict:
             entry["camera_center_alignment"] = None
             entry["note"] = "fewer than three shared registered frames; trajectory cannot be aligned"
         comparisons[name] = entry
-    report = {"reference": "colmap", "models": {name: _serializable_summary(m) for name, m in models.items()},
+    for name, entry in silhouettes.items():
+        summary = {key: value for key, value in entry.items() if key != "per_view"}
+        report_target = comparisons.get(name)
+        if report_target is not None:
+            report_target["silhouette"] = summary
+    report = {"reference": "colmap",
+              "models": {name: dict(_serializable_summary(models[name]),
+                                    silhouette={key: value for key, value in silhouettes[name].items()
+                                                if key != "per_view"})
+                         for name in models},
               "comparisons": comparisons,
-              "interpretation": "Camera-centre errors are after best-fit similarity alignment; lower is better. "
-                                "They assess agreement with COLMAP, not ground-truth accuracy."}
+              "interpretation": {
+                  "camera_center_alignment": "Errors after best-fit similarity alignment; lower is better. "
+                                             "Measures agreement with COLMAP, not ground-truth accuracy.",
+                  "points_in_silhouette": "Fraction of visible (point, view) pairs landing inside the P2 plant "
+                                          "mask. Independent of COLMAP and comparable across backends: higher "
+                                          "is better geometry.",
+                  "silhouette_coverage": "Fraction of mask area explained by a nearby projected point. Rewards "
+                                         "dense pointmaps by construction, so compare it only between clouds of "
+                                         "similar size, alongside num_points.",
+              }}
     out = workdir / "p3" / "experiments"
     out.mkdir(parents=True, exist_ok=True)
     (out / "compare.json").write_text(json.dumps(report, indent=2))
