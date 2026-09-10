@@ -96,6 +96,28 @@ semantic = [
     "transformers",
     "matplotlib",
 ]
+# pose-geometry --backends vggt -- the dependencies imported by VGGT's
+# official demo_colmap.py exporter.  Torch is deliberately not pinned to a
+# CUDA wheel URL: install a CUDA-matching torch/torchvision build first if
+# needed, then this extra will retain it when its version satisfies >=2.3.
+# The exporter imports LightGlue even when --bundle-adjust is off.
+vggt = [
+    "torch>=2.3",
+    "torchvision>=0.18",
+    "numpy<2",
+    "Pillow",
+    "huggingface_hub",
+    "einops",
+    "safetensors",
+    "trimesh",
+    "hydra-core",
+    "omegaconf",
+    "scipy",
+    "requests",
+    "pydantic==2.10.6",
+    "pyceres==2.3",
+    "lightglue @ git+https://github.com/jytime/LightGlue.git",
+]
 # Everything the P1-P6 pipeline needs, in one name, for a machine that will
 # run the whole thing. Uses the GPU pycolmap build; swap to "skeleton" for
 # the CPU one (they are mutually exclusive -- same `pycolmap` module).
@@ -116,6 +138,8 @@ pose-all = [
 pose-segment = "pose_estimator.cli.segment:main"      # P1 + P2
 pose-pick-prompts = "pose_estimator.cli.pick_prompts:main"  # P2 SAM2 seed picker (GUI)
 pose-solve = "pose_estimator.cli.pose:main"           # P3
+pose-geometry = "pose_estimator.cli.geometry:main"    # P3 learned backends + comparison
+pose-compare-geometry = "pose_estimator.cli.compare_geometry:main" # re-score P3 experiments
 pose-hull = "pose_estimator.cli.hull:main"            # P4a
 pose-surface = "pose_estimator.cli.surface:main"      # P4b
 pose-pick-seeds = "pose_estimator.cli.pick_seeds:main" # P4c seed picker (GUI)

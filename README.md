@@ -19,7 +19,7 @@ laid out in a row, each with an estimated stem-attachment keypoint.
   Turntable video in, per-leaf midribs out, as the phased P1-P6 pipeline
   described under "Plant pose pipeline" below.
   - `frames.py`, `segmentation.py`, `reconstruction.py`, `pose.py`,
-    `hull.py`, `surfels.py`, `classify2d.py`, `dino.py`, `semantic.py`,
+    `geometry.py`, `hull.py`, `surfels.py`, `classify2d.py`, `dino.py`, `semantic.py`,
     `structure.py`, `structure_labels.py`, `leaf.py`, `ply_io.py` -- the
     library modules, one cluster per phase.
   - `cli/` -- the phase CLIs, installed as the `pose-*` console scripts.
@@ -225,6 +225,7 @@ disk, so any one can be re-run or swapped without touching the others.
 |---|---|---|---|
 | P1+P2 | `pose-segment` | sharpest frame per angular bin, then SAM2 plant/holder masks | `p1/`, `p2/` |
 | P3 | `pose-solve` | camera poses, masked COLMAP, one shared camera | `p3/` |
+| P3x | `pose-geometry` | VGGT / MapAnything on the same masked frames; aligned comparison to COLMAP | `p3/experiments/` |
 | P4a | `pose-hull` | visual hull by silhouette carving | `p4/` |
 | P4b | `pose-surface` | 2DGS surfels, then a carved thin surface | `p4b/` |
 | P4c | `pose-classify` | per-frame organ class maps (DINOv3 or SAM2) | `p4c/class_maps/` |
@@ -235,6 +236,94 @@ disk, so any one can be re-run or swapped without touching the others.
 `run_pipeline.sh` drives the phases; `--stop-after` and `--skip-to` are how
 you stop for the two things that need a human, which are picking the P2
 plant/holder prompts and picking the P4c organ seeds.
+
+### Learned P3 geometry experiment (VGGT and MapAnything)
+
+P3's masked COLMAP solve remains the baseline.  `pose-geometry` is a separate
+experiment, not a replacement: it prepares the exact P2 plant-masked RGB
+frames for each learned model, invokes that project's official COLMAP export,
+and leaves every result in its own directory.  This keeps a failed learned
+pose from quietly contaminating P4--P6.
+
+No checkpoint needs to be downloaded manually.  On first use the adapter
+fetches the public exporter code into the Linux-side cache
+`~/.cache/blender_leaf_generator/model_code/`, while each official
+model's `from_pretrained` call downloads its weights from Hugging Face into
+the normal Hugging Face cache.  Accept the gated VGGT model's terms first.
+Use an environment variable for the token so it never lands in shell history
+or command-line process arguments, then run:
+
+```bash
+export HF_TOKEN='hf_...'
+pose-solve --workdir runs/plant_9
+pose-geometry --workdir runs/plant_9 --backends vggt mapanything \
+  --max-images 80 --bundle-adjust \
+  --model-python /opt/conda/envs/geometry/bin/python
+```
+
+`--max-images` uniformly samples around the capture orbit; use it for the
+first VRAM-limited comparison, then re-run the promising backend with `0`
+(all frames).  `--bundle-adjust` is forwarded to VGGT's official exporter;
+MapAnything ignores it.  Start with `--dry-run` to stage the masked images and
+record the exact command without loading a model.  `--model-python` is useful
+when the models live in a separate Torch/CUDA environment; otherwise the
+adapter uses the Python that launched `pose-geometry`.
+`--hf-token` is available when an environment variable is impractical, but
+the environment variable is safer. `--vggt-root` and `--mapanything-root`
+remain optional overrides for an existing code checkout; they are no longer
+required. The exporter cache deliberately does not live in the work directory:
+on WSL a dataset under `/mnt/c`, `/mnt/d`, or `/mnt/e` cannot host Git's POSIX
+metadata. Use `--code-cache /some/linux/path` to choose another Linux-native
+location.
+
+For VGGT's official COLMAP exporter, install its exporter-only dependencies
+once into the same environment that launches `pose-geometry`:
+
+```bash
+pip install -e ".[vggt]"
+```
+
+This includes `trimesh`, LightGlue, the tracker configuration libraries, and
+the Hugging Face loader used by the upstream exporter. Install your
+CUDA-matched `torch`/`torchvision` build before this command if the existing
+environment does not already have one; the extra intentionally does not force
+a particular CUDA build. It follows the imports and demo requirements of the
+[official VGGT exporter](https://github.com/facebookresearch/vggt).
+
+The outputs are deliberately comparable:
+
+```text
+p3/experiments/vggt/
+  input/images/             P2 plant-masked RGB, original frame names retained
+  sparse/best/              official prediction exported as a COLMAP model
+  poses.json                registration/orbit report in P3's usual format
+  sparse_points.ply         inspectable cloud
+p3/experiments/mapanything/  (same layout)
+p3/experiments/compare.json  registration and aligned camera-centre agreement
+p3/experiments/diag/camera_compare.png
+```
+
+`compare.json` aligns matching camera centres by a best-fit similarity before
+reporting errors, because learned models and COLMAP use unrelated world axes
+and scales.  A low error means the candidate agrees with the baseline; it is
+not ground-truth accuracy.  Read that alongside registration fraction, cloud
+coverage in `sparse_points.ply`, and the rendered P4 hull.  The official
+projects currently expose COLMAP export in their repositories:
+[VGGT](https://github.com/facebookresearch/vggt) and
+[MapAnything](https://github.com/facebookresearch/map-anything).
+
+To compare silhouette-constrained geometry without overwriting the baseline
+P4 artifacts, carve an experimental hull separately:
+
+```bash
+pose-hull --workdir runs/plant_9 --geometry-backend vggt
+# writes p4/experiments/vggt/{hull.ply,hull.json,diag/}
+```
+
+Only promote an experimental reconstruction into the normal `p3/` / `p4/`
+path after inspecting it; the semantic-fusion and skeleton stages require one
+specific cloud and point order, so mixing artifacts from two backends is not
+valid.
 
 ### Midribs: fitted from the points, or the straight chord
 

@@ -17,6 +17,7 @@ CLIS = [
     ("pose_estimator.cli.segment", "run", {"no_roi", "plant_point", "holder_point", "video"}),
     ("pose_estimator.cli.pick_prompts", "run", {"no_auto", "no_bank"}),
     ("pose_estimator.cli.pick_seeds", "run", set()),
+    ("pose_estimator.cli.geometry", "run", set()),
 ]
 
 

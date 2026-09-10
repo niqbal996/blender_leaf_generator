@@ -2,8 +2,10 @@
 
     pose-hull --workdir runs/plant_9/ --resolution 256
 
-Reads <workdir>/p2/masks/plant and <workdir>/p3/sparse/best, writes into
-<workdir>/p4:
+Reads <workdir>/p2/masks/plant and a P3 sparse model (COLMAP by default),
+writes into <workdir>/p4. With ``--geometry-backend vggt`` or
+``mapanything``, it writes instead to <workdir>/p4/experiments/<backend> so
+the baseline cloud and its downstream labels stay intact:
     hull.ply            watertight-ish hull mesh
     hull_points.ply     occupied voxel centres
     hull.json           carve settings + acceptance checks
@@ -31,6 +33,7 @@ from pose_estimator.hull import (
     write_hull_3d_plot,
     write_ply_mesh,
 )
+from pose_estimator.geometry import geometry_dir, require_sparse_model
 
 
 def run(
@@ -40,15 +43,19 @@ def run(
     dilate_px: int = 2,
     min_judged_views: int = 8,
     min_judged_fraction: float = 0.5,
+    geometry_backend: str = "colmap",
+    out_dir: Optional[Path] = None,
 ) -> dict:
     import pycolmap
 
-    p3_sparse = workdir / "p3" / "sparse" / "best"
-    if not p3_sparse.is_dir():
-        raise FileNotFoundError(f"{p3_sparse} not found -- run pose-solve on this workdir first")
+    p3_sparse = require_sparse_model(workdir, geometry_backend)
 
     plant_masks = workdir / "p2" / "masks" / "plant"
-    p4_dir = workdir / "p4"
+    # Experimental hulls cannot share p4/: P4c labels and P5 point indices
+    # refer to one exact cloud.  Put them beside the baseline until the user
+    # has inspected the comparison and deliberately promotes one.
+    p4_dir = out_dir or (workdir / "p4" if geometry_backend == "colmap"
+                         else workdir / "p4" / "experiments" / geometry_backend)
     p4_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading poses from {p3_sparse}...")
@@ -92,7 +99,7 @@ def run(
     _write_points_ply(p4_dir / "hull_points.ply", points)
 
     orbit = None
-    poses_path = workdir / "p3" / "poses.json"
+    poses_path = geometry_dir(workdir, geometry_backend) / "poses.json"
     if poses_path.exists():
         with open(poses_path) as f:
             orbit = json.load(f).get("orbit")
@@ -115,6 +122,8 @@ def run(
             "min_judged_fraction": min_judged_fraction,
             "occlusion_aware": occluder_dir is not None,
             "extent": extent.tolist(),
+            "geometry_backend": geometry_backend,
+            "geometry_model": str(p3_sparse),
         }
     )
     with open(p4_dir / "hull.json", "w") as f:
@@ -232,6 +241,10 @@ def main(argv: Optional[list] = None) -> None:
         "hidden behind the pliers for part of the turn. The default was fit by sweeping both "
         "specimens; reprojection IoU peaks there for each.",
     )
+    parser.add_argument("--geometry-backend", choices=["colmap", "vggt", "mapanything"], default="colmap",
+                        help="P3 model to carve. Learned-model hulls are written below p4/experiments/ by default.")
+    parser.add_argument("--out-dir", type=Path,
+                        help="Override the P4 output directory. Use only for an intentional promotion.")
     parser.add_argument(
         "--dilate-px",
         type=int,
@@ -246,6 +259,8 @@ def main(argv: Optional[list] = None) -> None:
         resolution=args.resolution,
         min_inside_fraction=args.min_inside_fraction,
         dilate_px=args.dilate_px,
+        geometry_backend=args.geometry_backend,
+        out_dir=args.out_dir,
     )
 
 

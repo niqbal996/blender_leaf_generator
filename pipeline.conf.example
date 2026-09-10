@@ -1,0 +1,28 @@
+# Settings that hold across runs, so they need not be retyped per command.
+# key = value, # comments, blank lines ignored. Any command-line flag wins.
+#
+# Copy to one of, most general first (each overrides the last):
+#   ~/.config/blender_leaf_generator/pipeline.conf   per user -- put the token here
+#   ./pipeline.conf                                  per checkout
+#   <dataset>/../pipeline.conf                       per capture session
+#   <dataset>/pipeline.conf                          per specimen
+#
+# Keys are the long options with dashes as underscores. An unknown key is an
+# error rather than a silent no-op, so a typo here cannot cost you a run.
+
+# --- reused from an already-solved specimen ------------------------------
+# prompt_bank  = /data/2026-09-01/sugarbeet_3/plant/p2/prompt_bank.npz
+# seed_bank    = /data/thistle3/plant/p4c/seed_bank.npz
+
+# --- per specimen, but usually constant within a session -----------------
+# architecture = rosette
+
+# --- solver ---------------------------------------------------------------
+# low_texture  = 1        # more features, ~3-5x extraction time
+# cameras      = exif     # exif (default) | single | per-image | auto
+# use_gpu      = 0
+
+# --- credentials ----------------------------------------------------------
+# Prefer the user-level file or the HF_TOKEN environment variable: a token
+# passed as a command-line argument is visible in `ps` and saved to history.
+# hf_token = hf_...
