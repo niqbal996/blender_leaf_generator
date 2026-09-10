@@ -18,6 +18,8 @@ from typing import List, Optional, Sequence, Union
 import cv2
 import numpy as np
 
+from pose_estimator.reconstruction import cam_from_world_matrix
+
 LEAF_PALETTE = np.array(
     [
         [80, 80, 230], [120, 200, 80], [240, 140, 90], [70, 190, 240],
@@ -322,7 +324,7 @@ def write_reprojected_skeleton(
             continue
 
         world_to_camera = np.eye(4)
-        world_to_camera[:3, :] = image.cam_from_world().matrix()
+        world_to_camera[:3, :] = cam_from_world_matrix(image)
         K = np.asarray(camera.calibration_matrix())
 
         def project(points_plant: np.ndarray) -> np.ndarray:

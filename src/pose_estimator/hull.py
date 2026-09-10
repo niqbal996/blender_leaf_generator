@@ -28,6 +28,8 @@ from typing import List, Optional, Sequence, Tuple, Union
 import cv2
 import numpy as np
 
+from pose_estimator.reconstruction import cam_from_world_matrix
+
 
 @dataclass
 class CarveCamera:
@@ -96,7 +98,7 @@ def load_carve_cameras(
                 occluder &= ~binary      # plant in front of the tool is still plant
 
         world_to_camera = np.eye(4)
-        world_to_camera[:3, :] = image.cam_from_world().matrix()
+        world_to_camera[:3, :] = cam_from_world_matrix(image)
 
         cameras.append(
             CarveCamera(
@@ -164,6 +166,58 @@ def _vote(
         inside[start : start + chunk] = block_inside
 
     return observed, judged, inside
+
+
+def _empty_hull_diagnosis(
+    points: np.ndarray,
+    cameras: Sequence[CarveCamera],
+    min_observed: int,
+    min_judged_views: int,
+    min_judged_fraction: float,
+    min_inside_fraction: float,
+) -> str:
+    """Explain an empty intersection in terms of how close it came.
+
+    "The masks and the poses disagree" was true but useless: it gave no way
+    to tell a small pose error from masks belonging to another capture, and
+    those need opposite responses.  The distance to the threshold does tell
+    them apart, so report it -- carving is an intersection, so a hull is lost
+    to the *worst* views, and a near miss is the common case when P3 came
+    from a model whose per-view poses are only approximately consistent.
+    """
+    observed, judged, inside = _vote(points, cameras)
+    enough = ((observed >= min_observed)
+              & (judged >= min_judged_views)
+              & (judged >= min_judged_fraction * np.maximum(observed, 1)))
+    lines = ["Silhouette carving produced an empty hull."]
+    if not enough.any():
+        lines.append(
+            f"No voxel had enough evidence to judge: the best was observed by "
+            f"{int(observed.max())} views (needs {min_observed}) and unoccluded in "
+            f"{int(judged.max())} of {len(cameras)} (needs {min_judged_views}).")
+        lines.append(
+            "That is a coverage or occlusion problem rather than a disagreement one -- "
+            "look at how much of the orbit registered, and at the holder masks.")
+    else:
+        agreement = inside[enough] / np.maximum(judged[enough], 1)
+        best = float(agreement.max())
+        lines.append(
+            f"{int(enough.sum())} voxels had enough views to judge, but the best of them was "
+            f"in-silhouette in only {best:.0%} of those views, against a "
+            f"{min_inside_fraction:.0%} threshold.")
+        if best >= 0.5:
+            lines.append(
+                f"The poses and the masks describe nearly the same object, but not precisely "
+                f"enough to intersect: --min-inside-fraction {max(best - 0.01, 0.5):.2f} would "
+                f"carve a hull, at the cost of a looser upper bound. A shortfall this size is "
+                f"normally camera-pose error, not wrong masks -- the worst-placed views are the "
+                f"ones that empty an intersection.")
+        else:
+            lines.append(
+                "Fewer than half the judging views agreeing means the masks and the poses "
+                "describe different objects -- check that the P2 masks belong to these frames.")
+    lines.append("p3/diag/camera_orbit.png and the P2 overlays are where to look next.")
+    return "\n  ".join(lines)
 
 
 def carve(
@@ -234,10 +288,8 @@ def carve(
     grid = _grid_points(bounds_min, bounds_max, coarse_resolution)
     keep = survives(grid)
     if not keep.any():
-        raise RuntimeError(
-            "Silhouette carving produced an empty hull. The masks and the poses probably "
-            "disagree -- check p3/diag/camera_orbit.png and that the P2 masks belong to these frames."
-        )
+        raise RuntimeError(_empty_hull_diagnosis(
+            grid, cameras, min_observed, min_judged_views, min_judged_fraction, min_inside_fraction))
 
     occupied = grid[keep]
     span = (bounds_max - bounds_min) / coarse_resolution

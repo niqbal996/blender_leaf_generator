@@ -40,6 +40,8 @@ from typing import List, Optional, Sequence, Tuple, Union
 import cv2
 import numpy as np
 
+from pose_estimator.reconstruction import cam_from_world_matrix
+
 
 @dataclass
 class TrainView:
@@ -98,7 +100,7 @@ def load_views(
         K[:2] /= downsample
 
         world_to_camera = np.eye(4)
-        world_to_camera[:3, :] = image.cam_from_world().matrix()
+        world_to_camera[:3, :] = cam_from_world_matrix(image)
 
         soft_mask = (mask.astype(np.float32) / 255.0)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0

@@ -198,6 +198,12 @@
 # moves -- matching and mapping are CPU either way, and on 192 frames matching
 # is the larger share, so this is a smaller win than it sounds.
 #
+# Dependencies are checked for the phases this run will actually execute, so a
+# carve-only run needs no torch: `pip install -e ".[skeleton]"` covers P3/P4a,
+# while P1/P2, P4b and P4c need the segment, splat and semantic extras, and
+# ./setup_env.sh installs the lot. A missing package is named together with the
+# command that installs it, before any frame is touched.
+#
 # Runtime on an RTX 2070, 96 frames: about 40 minutes, dominated by COLMAP
 # (P3) and surfel training (P4b).
 
@@ -222,6 +228,50 @@ declare -A SET=()
 usage() {
     awk 'NR>1 { if (/^#/) { sub(/^# ?/, ""); print } else { exit } }' "${BASH_SOURCE[0]}"
     exit "${1:-1}"
+}
+
+# Flags people reasonably expect this script to have, and what it calls them.
+declare -A FLAG_MEANT=(
+    [--force]="--keep-going    (only QC stops need overriding; every phase already overwrites its own outputs)"
+    [--overwrite]="--keep-going    (phases overwrite their own outputs; nothing needs forcing)"
+    [--method]="--geometry-backend vggt|mapanything"
+    [--model]="--geometry-backend vggt|mapanything"
+    [--geometry]="--geometry-backend vggt|mapanything"
+    [--resume]="--skip-to <phase>"
+    [--start]="--skip-to <phase>"
+    [--start-at]="--skip-to <phase>"
+    [--from]="--skip-to <phase>"
+    [--stop]="--stop-after <phase>"
+    [--until]="--stop-after <phase>"
+    [--gpu]="--use-gpu"
+    [--conf]="--config <file>"
+    [--verbose]="nothing -- every phase already logs to <workdir>/pipeline.log"
+)
+
+# An unknown flag used to print one line and then the whole guide, which
+# scrolled the one useful line off the screen. The guide stays behind --help.
+unknown_option() {
+    local given="$1" flag suggestion="" known=()
+    # The accepted flags, read out of this script's own parser below, so this
+    # message cannot drift from what the parser actually handles.
+    mapfile -t known < <(grep -oE '^ +-{1,2}[a-z0-9|-]+\)' "${BASH_SOURCE[0]}" \
+        | tr -d ' )' | tr '|' '\n' | grep -E '^--' | sort -u)
+    suggestion="${FLAG_MEANT[$given]:-}"
+    if [[ -z "$suggestion" ]]; then
+        for flag in "${known[@]}"; do
+            [[ "$flag" == "$given"* || "$given" == "$flag"* ]] && { suggestion="$flag"; break; }
+        done
+    fi
+    {
+        echo "unknown option: $given"
+        [[ -z "$suggestion" ]] || echo "  did you mean:  $suggestion"
+        echo ""
+        echo "  accepted flags:"
+        printf '%s\n' "${known[@]}" | column -c 76 | sed 's/^/    /'
+        echo ""
+        echo "  what each one does:  ${BASH_SOURCE[0]} --help"
+    } >&2
+    exit 1
 }
 
 while [[ $# -gt 0 ]]; do
@@ -260,7 +310,7 @@ while [[ $# -gt 0 ]]; do
         --use-gpu)      USE_GPU=1; shift ;;
         --seeds)        shift; while [[ $# -gt 0 && "$1" != --* ]]; do SEEDS+=("$1"); shift; done ;;
         -h|--help)      usage 0 ;;
-        --*) echo "unknown option: $1" >&2; usage 1 ;;
+        --*) unknown_option "$1" ;;
         *)  [[ -z "$DATASET" ]] || { echo "give at most one dataset directory (got $DATASET and $1)" >&2; usage 1; }
             DATASET="$1"; shift ;;
     esac
@@ -360,7 +410,13 @@ if [[ ${#CONF_FILES[@]} -gt 0 ]]; then
     load_config "${CONF_FILES[@]}"
 else
     CANDIDATES=("$HOME/.config/blender_leaf_generator/pipeline.conf" "$PWD/pipeline.conf")
-    [[ -z "$DATASET" ]] || CANDIDATES+=("$(dirname "${DATASET%/}")/pipeline.conf" "${DATASET%/}/pipeline.conf")
+    # With --workdir there is no $DATASET to hang the per-session and
+    # per-specimen files off -- but the workdir is <dataset>/plant by
+    # convention, so the same two files are findable from it. Without this a
+    # pipeline.conf beside the dataset was silently ignored on exactly the
+    # runs that resume with --skip-to, which is most of them.
+    CONF_BASE="${DATASET:-$([[ -n "$WORKDIR" ]] && dirname "${WORKDIR%/}")}"
+    [[ -z "$CONF_BASE" ]] || CANDIDATES+=("$(dirname "${CONF_BASE%/}")/pipeline.conf" "${CONF_BASE%/}/pipeline.conf")
     load_config "${CANDIDATES[@]}"
 fi
 
@@ -408,9 +464,54 @@ print_plan() {
         fi
     done
 }
+# Phases run in this order; --skip-to jumps in partway and --stop-after ends
+# early. Declared here because the phase range decides which dependencies,
+# config keys and QC gates this run needs, all of which are settled below.
+ORDER=(p1p2 p3 p4a p4b p4c p5 p6)
+
+for name in "$SKIP_TO" "$STOP_AFTER"; do
+    [[ -z "$name" ]] && continue
+    [[ " ${ORDER[*]} " == *" $name "* ]] || {
+        echo "unknown phase '$name' -- expected one of: ${ORDER[*]}" >&2; exit 1; }
+done
+
+# Whether this run includes <phase>. A pure predicate over the range, kept
+# apart from should_run's one-shot state machine, and honouring the two
+# phases that skip themselves for reasons unrelated to the range.
+will_run_phase() {
+    local phase="$1" first="${SKIP_TO:-${ORDER[0]}}" last="${STOP_AFTER:-${ORDER[-1]}}"
+    local i target=-1 from=-1 to=-1
+    for i in "${!ORDER[@]}"; do
+        [[ "${ORDER[$i]}" == "$phase" ]] && target=$i
+        [[ "${ORDER[$i]}" == "$first" ]] && from=$i
+        [[ "${ORDER[$i]}" == "$last" ]]  && to=$i
+    done
+    (( target >= 0 && from >= 0 && to >= 0 && target >= from && target <= to )) || return 1
+    [[ "$phase" == "p4b" && "$SKIP_P4B" == 1 ]] && return 1
+    # P4c skips itself when it has no labelled examples to classify against.
+    if [[ "$phase" == "p4c" && "$BACKEND" != "sam" && -z "$SEEDS_FILE" \
+          && ${#SEEDS[@]} -eq 0 && -z "$SEED_BANK" ]]; then
+        return 1
+    fi
+    return 0
+}
+
 case "$GEOMETRY_BACKEND" in
     colmap|vggt|mapanything) ;;
     *) echo "unknown --geometry-backend '$GEOMETRY_BACKEND' -- colmap, vggt or mapanything" >&2
+       exit 1 ;;
+esac
+
+# Two flags with "backend" in the name land in different phases, and the
+# names are close enough that a geometry model passed to the classifier
+# would otherwise be accepted here and fail deep inside P4c.
+case "$BACKEND" in
+    dino|sam) ;;
+    colmap|vggt|mapanything)
+        echo "--backend $BACKEND: --backend chooses P4c's organ classifier (dino or sam)." >&2
+        echo "  For the P3 geometry model you want:  --geometry-backend $BACKEND" >&2
+        exit 1 ;;
+    *) echo "unknown --backend '$BACKEND' -- dino or sam (P4c's organ classifier)" >&2
        exit 1 ;;
 esac
 
@@ -479,16 +580,96 @@ PY="${POSE_PYTHON:-$(command -v python3 || command -v python)}"
 # interpreter -- including one with none of its dependencies installed. The
 # run then dies several minutes in, after extracting frames, on a bare
 # ModuleNotFoundError from inside a phase.
-MISSING="$("$PY" - <<'PYCHECK' 2>/dev/null
+#
+# Only what the phases in *this* run import, though. Demanding the union of
+# every phase's dependencies made a torch-free carve-only run impossible on
+# a base `pip install -e .`, while never checking pycolmap -- which P3, P4a
+# and P5 all need and no base install provides.
+phase_modules() {
+    case "$1" in
+        p1p2) echo "numpy cv2 torch" ;;              # SAM2 masking
+        p3)   echo "numpy cv2 pycolmap" ;;           # COLMAP, or scoring a learned model
+        p4a)  echo "numpy cv2 pycolmap" ;;           # silhouette carving only
+        p4b)  echo "numpy cv2 pycolmap torch gsplat" ;;
+        p4c)  echo "numpy cv2 torch $([[ "$BACKEND" == "sam" ]] && echo sam2 || echo transformers)" ;;
+        p5)   echo "numpy pycolmap" ;;
+        p6)   echo "numpy" ;;
+    esac
+}
+
+# The extra that installs each one, so the fix is a command and not a hunt.
+module_source() {
+    case "$1" in
+        pycolmap)     echo 'pip install -e ".[skeleton]"   (or ".[skeleton-gpu]" for GPU SIFT)' ;;
+        torch)        echo 'a CUDA-matching torch build: https://pytorch.org/get-started/locally/' ;;
+        gsplat)       echo 'pip install -e ".[splat]"      (or run with --skip-p4b)' ;;
+        transformers) echo 'pip install -e ".[semantic]"' ;;
+        sam2)         echo 'see setup_env.sh -- SAM2 installs from its own repository' ;;
+        cv2)          echo 'pip install -e ".[segment]"' ;;
+        *)            echo 'pip install -e .' ;;
+    esac
+}
+
+phase_cli() {
+    case "$1" in
+        p1p2) echo "pose_estimator.cli.segment" ;;
+        p3)   [[ "$GEOMETRY_BACKEND" == "colmap" ]] && echo "pose_estimator.cli.pose" \
+                                                    || echo "pose_estimator.cli.geometry" ;;
+        p4a)  echo "pose_estimator.cli.hull" ;;
+        p4b)  echo "pose_estimator.cli.surface" ;;
+        p4c)  echo "pose_estimator.cli.semantic" ;;
+        p5)   echo "pose_estimator.cli.structure" ;;
+        p6)   echo "pose_estimator.cli.leaf_model" ;;
+    esac
+}
+
+REQUIRED="pose_estimator"
+for name in "${ORDER[@]}"; do
+    will_run_phase "$name" || continue
+    REQUIRED="$REQUIRED $(phase_modules "$name")"
+done
+CLI_MODULES=""
+for name in "${ORDER[@]}"; do
+    will_run_phase "$name" || continue
+    CLI_MODULES="$CLI_MODULES $(phase_cli "$name")"
+done
+# Two passes, because neither alone is enough. find_spec catches the heavy
+# packages a phase imports *inside* a function -- pycolmap is deliberately
+# lazy, so importing the CLI module never reveals it missing. Importing the
+# CLI module catches everything the phase pulls in transitively at import
+# time, which no hand-maintained list stays in step with.
+MISSING="$("$PY" - "$REQUIRED" "--" $CLI_MODULES <<'PYCHECK' 2>/dev/null
+import importlib
 import importlib.util as u
-print(" ".join(m for m in ("numpy", "cv2", "torch", "pose_estimator") if u.find_spec(m) is None))
+import sys
+
+wanted = sys.argv[1].split()
+clis = sys.argv[sys.argv.index("--") + 1:]
+missing = []
+for name in wanted:
+    try:
+        if u.find_spec(name) is None:
+            missing.append(name)
+    except (ImportError, ValueError):      # broken or namespace-shadowed package
+        missing.append(name)
+for name in clis:
+    try:
+        importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        missing.append(exc.name or name)
+    except Exception:
+        pass    # imports, but objects at import time: not this check's business
+print(" ".join(dict.fromkeys(missing)))
 PYCHECK
 )"
 if [[ -n "${MISSING// /}" ]]; then
-    echo "ERROR: $PY is missing: $MISSING" >&2
-    echo "  Activate the right environment first:  conda activate pose" >&2
-    echo "  Or build one:                          ./setup_env.sh" >&2
-    echo "  Override the interpreter with:         POSE_PYTHON=/path/to/python" >&2
+    echo "ERROR: $PY cannot run ${SKIP_TO:-p1p2} -> ${STOP_AFTER:-p6}; missing: $MISSING" >&2
+    for name in $MISSING; do
+        printf '  %-14s %s\n' "$name" "$(module_source "$name")" >&2
+    done
+    echo "" >&2
+    echo "  Or build a complete environment:       ./setup_env.sh" >&2
+    echo "  Or point at another interpreter:       POSE_PYTHON=/path/to/python" >&2
     exit 1
 fi
 
@@ -561,7 +742,6 @@ echo "=== run started $(date '+%Y-%m-%d %H:%M:%S') ==="
 
 # Phases run in order; --skip-to jumps in partway on an existing workdir and
 # --stop-after ends early. Both name a phase from this list.
-ORDER=(p1p2 p3 p4a p4b p4c p5 p6)
 started=0
 stopped=0
 should_run() {
@@ -574,12 +754,6 @@ should_run() {
     [[ "$1" == "$STOP_AFTER" ]] && stopped=1
     return 0
 }
-
-for name in "$SKIP_TO" "$STOP_AFTER"; do
-    [[ -z "$name" ]] && continue
-    [[ " ${ORDER[*]} " == *" $name "* ]] || {
-        echo "unknown phase '$name' -- expected one of: ${ORDER[*]}" >&2; exit 1; }
-done
 
 phase() { printf '\n\033[1m=== %s ===\033[0m\n' "$1"; }
 

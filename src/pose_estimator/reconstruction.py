@@ -139,6 +139,21 @@ def _extract_with_focal_priors(
 # behaves identically on every run.
 
 
+def cam_from_world_matrix(image) -> np.ndarray:
+    """The 3x4 world-to-camera matrix, whichever pycolmap is installed.
+
+    ``Image.cam_from_world`` is a Rigid3d attribute in pycolmap 3.x and a
+    method in 4.x.  Both are in use here by necessity: VGGT and MapAnything
+    pin 3.10 for their exporters, while a fresh install of this project gets
+    4.x -- and reading a model written by either is the whole point of the P3
+    comparison, so every consumer has to tolerate both.
+    """
+    pose = image.cam_from_world
+    if callable(pose):
+        pose = pose()
+    return np.asarray(pose.matrix(), dtype=np.float64)
+
+
 def _pass_of(name: str, sources: Optional[Dict[str, int]]) -> int:
     return int((sources or {}).get(Path(name).stem, 0))
 

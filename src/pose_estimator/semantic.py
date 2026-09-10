@@ -50,6 +50,8 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from pose_estimator.reconstruction import cam_from_world_matrix
+
 UNLABELED = -1
 LABEL_NONE = UNLABELED  # retained name; the tests and P5 both read it
 
@@ -140,7 +142,7 @@ def render_points(
 def camera_from_colmap(image, camera) -> ViewCamera:
     """Wrap a solved COLMAP view so the same renderer can produce its index map."""
     world_to_camera = np.eye(4)
-    world_to_camera[:3, :] = image.cam_from_world().matrix()
+    world_to_camera[:3, :] = cam_from_world_matrix(image)
     return ViewCamera(
         K=np.asarray(camera.calibration_matrix(), dtype=np.float64),
         world_to_camera=world_to_camera,

@@ -22,12 +22,16 @@ FOCAL = 480.0
 
 def _sphere_views(n_views=24, orbit_radius=2.0, height=0.35):
     """Cameras on a circle, each rendering the silhouette of a known sphere."""
-    K = np.array([[FOCAL, 0, IMAGE_SIZE / 2], [0, FOCAL, IMAGE_SIZE / 2], [0, 0, 1]], float)
     rng = np.random.default_rng(0)
     surface = rng.normal(size=(60000, 3))
     surface /= np.linalg.norm(surface, axis=1)[:, None]
     surface *= SPHERE_RADIUS
+    return _object_views(surface, n_views=n_views, orbit_radius=orbit_radius, height=height)
 
+
+def _object_views(surface, n_views=24, orbit_radius=2.0, height=0.35):
+    """Cameras on a circle, each rendering one object's true silhouette."""
+    K = np.array([[FOCAL, 0, IMAGE_SIZE / 2], [0, FOCAL, IMAGE_SIZE / 2], [0, 0, 1]], float)
     cameras = []
     for angle in np.linspace(0, 2 * np.pi, n_views, endpoint=False):
         center = np.array([orbit_radius * np.cos(angle), orbit_radius * np.sin(angle), height])
@@ -93,3 +97,96 @@ def test_carve_rejects_voxels_outside_the_frustums():
 
     # Nothing should survive out near the corners of the initial volume.
     assert np.linalg.norm(points, axis=1).max() < 0.5
+
+
+def _misplace_cameras(cameras, distance):
+    """Displace each camera centre by `distance`, leaving its mask truthful.
+
+    This is what a feed-forward P3 backend produces: every view registered,
+    each pose individually plausible, none of them mutually consistent to
+    the precision an intersection needs. Displacing the centre is also the
+    error `compare.json` reports, so the magnitudes here are comparable to
+    the ones a real run prints.
+
+    Rotating the cameras instead would not do: a rotation about an axis
+    through the object leaves the object's projection near the optical axis
+    put, so the hull shrinks toward that axis rather than emptying.
+    """
+    rng = np.random.default_rng(1)
+    moved = []
+    for camera in cameras:
+        direction = rng.normal(size=3)
+        direction /= np.linalg.norm(direction)
+        world_to_camera = camera.world_to_camera.copy()
+        # X_cam = R(X - C): moving C by s takes t to t - R s.
+        world_to_camera[:3, 3] -= world_to_camera[:3, :3] @ (direction * distance)
+        moved.append(CarveCamera(K=camera.K, world_to_camera=world_to_camera,
+                                 mask=camera.mask, name=camera.name))
+    return moved
+
+
+def _lopsided_surface():
+    """Two unequal lobes off the orbit axis.
+
+    A sphere is the wrong object for testing pose sensitivity: it is
+    rotationally symmetric, so misplacing the cameras about the orbit axis
+    leaves every silhouette perfectly consistent with the same sphere and
+    the hull survives. A plant is not symmetric, and neither is this.
+    """
+    rng = np.random.default_rng(2)
+    big = rng.normal(size=(40000, 3))
+    big /= np.linalg.norm(big, axis=1)[:, None]
+    big = big * 0.20 + np.array([0.22, 0.0, 0.0])
+    small = rng.normal(size=(20000, 3))
+    small /= np.linalg.norm(small, axis=1)[:, None]
+    small = small * 0.10 + np.array([-0.18, 0.10, 0.12])
+    return np.vstack([big, small])
+
+
+def test_an_empty_hull_reports_how_far_the_poses_missed_by():
+    """A near miss must be distinguishable from unrelated masks."""
+    cameras = _misplace_cameras(_object_views(_lopsided_surface()), 0.25)
+    bounds = np.array([-0.6, -0.6, -0.6]), np.array([0.6, 0.6, 0.6])
+
+    with pytest.raises(RuntimeError) as failure:
+        carve(cameras, *bounds, resolution=48, min_inside_fraction=0.86)
+    message = str(failure.value)
+
+    assert "in-silhouette in only" in message
+    assert "86%" in message                       # the threshold it fell short of
+    assert "--min-inside-fraction" in message     # the knob that would carve one
+    assert "camera-pose error" in message         # the likely cause at this distance
+    assert "different objects" not in message     # which this is not
+
+
+def test_the_suggested_threshold_actually_carves_a_hull():
+    """The number in the message has to be usable, not decorative."""
+    import re
+
+    cameras = _misplace_cameras(_object_views(_lopsided_surface()), 0.25)
+    bounds = np.array([-0.6, -0.6, -0.6]), np.array([0.6, 0.6, 0.6])
+    with pytest.raises(RuntimeError) as failure:
+        carve(cameras, *bounds, resolution=48, min_inside_fraction=0.86)
+
+    suggested = float(re.search(r"--min-inside-fraction ([0-9.]+)", str(failure.value)).group(1))
+    points, _, _ = carve(cameras, *bounds, resolution=48, min_inside_fraction=suggested)
+    assert len(points) > 0
+
+
+def test_masks_from_another_capture_are_called_out_as_such():
+    """Total disagreement gets the opposite diagnosis, not a threshold to lower."""
+    cameras = _misplace_cameras(_object_views(_lopsided_surface()), 0.60)
+    bounds = np.array([-0.6, -0.6, -0.6]), np.array([0.6, 0.6, 0.6])
+
+    with pytest.raises(RuntimeError) as failure:
+        carve(cameras, *bounds, resolution=48, min_inside_fraction=0.86)
+    message = str(failure.value)
+    assert "different objects" in message
+    assert "--min-inside-fraction" not in message   # lowering it would not help
+
+
+def test_good_poses_still_carve_the_sphere_after_the_diagnosis_change():
+    points, _, _ = carve(_sphere_views(), np.array([-0.6, -0.6, -0.6]),
+                         np.array([0.6, 0.6, 0.6]), resolution=48, min_inside_fraction=0.86)
+    radius = np.linalg.norm(points - points.mean(axis=0), axis=1).max()
+    assert 0.25 < radius < 0.40      # the known 0.30, within voxel resolution
