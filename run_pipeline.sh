@@ -87,6 +87,19 @@
 # existing workdir; --stop-after <phase> ends early. P4c looks for clicked
 # seeds at <workdir>/p4c/seeds.json and uses them without being told.
 #
+#   --geometry-backend vggt|mapanything   run P3 with a learned model instead
+#               of COLMAP, and carve P4a from it. Everything lands under
+#               p3/experiments/<b>/ and p4/experiments/<b>/, leaving the
+#               baseline untouched, so the two hulls can be compared:
+#
+#                 ./run_pipeline.sh --workdir runs/plant_9 --skip-to p3 \
+#                     --geometry-backend vggt \
+#                     --model-python ~/miniconda3/envs/vggt/bin/python
+#
+#               Needs a COLMAP P3 already on disk (it is the reference), and
+#               stops after p4a: P4b onward read the baseline p3/ and p4/,
+#               so running them would mix backends.
+#
 # The run STOPS at a phase whose QC shows a catastrophic failure (P2 tracking
 # the tool instead of the plant, a failed P3 circle fit, a hull that does not
 # match the masks) -- everything after would silently build on garbage.
@@ -196,6 +209,7 @@ SEEDS=(); SKIP_TO=""; SEED_BANK=""; SEEDS_FILE=""; SKIP_P4B=0
 BACKEND="dino"; SAM_CHECKPOINT=""; STOP_AFTER=""
 PROMPT_BANK=""; PROMPT_ROOT=""; NO_PROMPT_BANK=0; USE_GPU=0; LOW_TEXTURE=0; ARCHITECTURE=""; PERSISTENCE=""; PROMPT_POINTS=""; KEEP_GOING=0
 CAMERAS=""; ALLOW_MIXED=0; STRICT_MIDRIBS=0
+GEOMETRY_BACKEND="colmap"; MODEL_PYTHON=""
 DATASET=""; DRY_RUN=0; CONF_FILES=()
 
 # Which settings the command line set explicitly. A config file fills in only
@@ -224,6 +238,8 @@ while [[ $# -gt 0 ]]; do
                         SKIP_TO="$2"; shift 2 ;;
         --stop-after)   [[ -n "$STOP_AFTER" ]] && echo "  note: --stop-after given twice ($STOP_AFTER then $2); the last one wins" >&2
                         STOP_AFTER="$2"; shift 2 ;;
+        --geometry-backend) GEOMETRY_BACKEND="$2"; shift 2 ;;
+        --model-python) MODEL_PYTHON="$2"; shift 2 ;;
         --seed-bank) SET[seed_bank]=1;    SEED_BANK="$2"; shift 2 ;;
         --prompt-bank) SET[prompt_bank]=1;  PROMPT_BANK="$2"; shift 2 ;;
         --prompt-points) SET[prompt_points]=1; PROMPT_POINTS="$2"; shift 2 ;;
@@ -376,6 +392,8 @@ print_plan() {
     [[ "$USE_GPU" == 1 ]]     && echo "  gpu           on"
     [[ -z "$HF_TOKEN_ARG" ]] || echo "  hf token      set (${#HF_TOKEN_ARG} chars)"
     echo "  phases        ${SKIP_TO:-p1p2} -> ${STOP_AFTER:-p6}"
+    echo "  geometry      $GEOMETRY_BACKEND"
+    [[ -z "$MODEL_PYTHON" ]] || echo "  model python  $MODEL_PYTHON"
 
     # A bank belonging to another dataset is legitimate -- that is what banks
     # are for -- but it is also what a stale path looks like, so say so.
@@ -390,6 +408,30 @@ print_plan() {
         fi
     done
 }
+case "$GEOMETRY_BACKEND" in
+    colmap|vggt|mapanything) ;;
+    *) echo "unknown --geometry-backend '$GEOMETRY_BACKEND' -- colmap, vggt or mapanything" >&2
+       exit 1 ;;
+esac
+
+# An experimental backend writes to p3/experiments/<b> and p4/experiments/<b>.
+# P4b onward read the baseline p3/ and p4/ and have no notion of an
+# experiment, so running them here would silently mix one backend's hull with
+# another's poses. The comparison stops at the carved hull; promoting an
+# experiment into the baseline paths stays a deliberate, separate act.
+if [[ "$GEOMETRY_BACKEND" != "colmap" ]]; then
+    case "$STOP_AFTER" in
+        ""|p4b|p4c|p5|p6)
+            if [[ -n "$STOP_AFTER" ]]; then
+                echo "--geometry-backend $GEOMETRY_BACKEND cannot run $STOP_AFTER: phases after p4a read" >&2
+                echo "  the baseline p3/ and p4/, so they would mix backends. Use --stop-after p4a," >&2
+                echo "  compare p4/experiments/$GEOMETRY_BACKEND against p4/, and promote deliberately." >&2
+                exit 1
+            fi
+            STOP_AFTER="p4a" ;;
+    esac
+fi
+
 print_plan
 if [[ "$DRY_RUN" == 1 ]]; then
     echo
@@ -578,8 +620,16 @@ if [[ -n "$SKIP_TO" ]]; then
         [[ "$name" == "$SKIP_TO" ]] && break
         case "$name" in
             p1p2) gate p1p2 "$WORKDIR/p2/qc.json" ;;
-            p3)   gate p3   "$WORKDIR/p3/poses.json" ;;
-            p4a)  gate p4a  "$WORKDIR/p4/hull.json" ;;
+            p3)   if [[ "$GEOMETRY_BACKEND" == "colmap" ]]; then
+                      gate p3 "$WORKDIR/p3/poses.json"
+                  else
+                      gate p3 "$WORKDIR/p3/experiments/$GEOMETRY_BACKEND/poses.json"
+                  fi ;;
+            p4a)  if [[ "$GEOMETRY_BACKEND" == "colmap" ]]; then
+                      gate p4a "$WORKDIR/p4/hull.json"
+                  else
+                      gate p4a "$WORKDIR/p4/experiments/$GEOMETRY_BACKEND/hull.json"
+                  fi ;;
         esac
     done
 fi
@@ -620,18 +670,38 @@ if should_run p1p2; then
 fi
 
 if should_run p3; then
-    phase "P3     camera poses, masked COLMAP                 -> $WORKDIR/p3"
-    $PY -m pose_estimator.cli.pose --workdir "$WORKDIR" \
-        $([[ "$USE_GPU" == 1 ]] && echo --use-gpu) \
-        $([[ -n "$CAMERAS" ]] && echo --cameras "$CAMERAS") \
-        $([[ "$LOW_TEXTURE" == 1 ]] && echo --low-texture)
-    gate p3 "$WORKDIR/p3/poses.json"
+    if [[ "$GEOMETRY_BACKEND" == "colmap" ]]; then
+        phase "P3     camera poses, masked COLMAP                 -> $WORKDIR/p3"
+        $PY -m pose_estimator.cli.pose --workdir "$WORKDIR" \
+            $([[ "$USE_GPU" == 1 ]] && echo --use-gpu) \
+            $([[ -n "$CAMERAS" ]] && echo --cameras "$CAMERAS") \
+            $([[ "$LOW_TEXTURE" == 1 ]] && echo --low-texture)
+        gate p3 "$WORKDIR/p3/poses.json"
+    else
+        phase "P3x    $GEOMETRY_BACKEND poses + cloud    -> $WORKDIR/p3/experiments/$GEOMETRY_BACKEND"
+        echo "  the COLMAP baseline in $WORKDIR/p3 is read as the comparison reference"
+        echo "  and is not modified."
+        $PY -m pose_estimator.cli.geometry --workdir "$WORKDIR" \
+            --backends "$GEOMETRY_BACKEND" \
+            ${MODEL_PYTHON:+--model-python "$MODEL_PYTHON"}
+        gate p3 "$WORKDIR/p3/experiments/$GEOMETRY_BACKEND/poses.json"
+    fi
 fi
 
 if should_run p4a; then
-    phase "P4a    visual hull by silhouette carving           -> $WORKDIR/p4"
-    $PY -m pose_estimator.cli.hull --workdir "$WORKDIR" --resolution 256
-    gate p4a "$WORKDIR/p4/hull.json"
+    if [[ "$GEOMETRY_BACKEND" == "colmap" ]]; then
+        phase "P4a    visual hull by silhouette carving           -> $WORKDIR/p4"
+        $PY -m pose_estimator.cli.hull --workdir "$WORKDIR" --resolution 256
+        gate p4a "$WORKDIR/p4/hull.json"
+    else
+        phase "P4a    hull carved from $GEOMETRY_BACKEND poses  -> $WORKDIR/p4/experiments/$GEOMETRY_BACKEND"
+        $PY -m pose_estimator.cli.hull --workdir "$WORKDIR" --resolution 256 \
+            --geometry-backend "$GEOMETRY_BACKEND"
+        gate p4a "$WORKDIR/p4/experiments/$GEOMETRY_BACKEND/hull.json"
+        echo ""
+        echo "  compare against the baseline hull:"
+        echo "    $WORKDIR/p4/hull.json  vs  $WORKDIR/p4/experiments/$GEOMETRY_BACKEND/hull.json"
+    fi
 fi
 
 if should_run p4b && [[ "$SKIP_P4B" == 0 ]]; then
