@@ -34,6 +34,7 @@ def run(
     code_cache: Optional[Path] = None,
     auto_fetch_code: bool = True,
     dry_run: bool = False,
+    heartbeat_seconds: float = 30.0,
 ) -> dict:
     require_sparse_model(workdir, "colmap")
     selected = list(dict.fromkeys(backends))
@@ -46,7 +47,8 @@ def run(
                                      bundle_adjust=bundle_adjust, device=device, model_python=model_python,
                                      hf_token=hf_token, hf_home=hf_home,
                                      code_cache=code_cache,
-                                     auto_fetch_code=auto_fetch_code, dry_run=dry_run)
+                                     auto_fetch_code=auto_fetch_code, dry_run=dry_run,
+                                     heartbeat_seconds=heartbeat_seconds)
         if dry_run:
             print("  would run: " + " ".join(report["command"]))
         else:
@@ -90,13 +92,17 @@ def main(argv: Optional[list] = None) -> None:
                         help="Linux-local cache for public exporter code; defaults to $XDG_CACHE_HOME or ~/.cache")
     parser.add_argument("--no-auto-fetch-code", action="store_true",
                         help="Require supplied --vggt-root/--mapanything-root rather than cloning public exporter code")
+    parser.add_argument("--heartbeat-seconds", type=float, default=30.0,
+                        help="While the exporter prints nothing, report its stage and GPU/host memory "
+                             "this often. The peak-VRAM stage is silent for minutes; 0 disables it.")
     parser.add_argument("--dry-run", action="store_true", help="Stage inputs and record, but do not start models")
     args = parser.parse_args(argv)
     run(args.workdir, args.backends, vggt_root=args.vggt_root, mapanything_root=args.mapanything_root,
         max_images=args.max_images, bundle_adjust=args.bundle_adjust, device=args.device,
         model_python=args.model_python, hf_token=args.hf_token, hf_home=args.hf_home,
         code_cache=args.code_cache,
-        auto_fetch_code=not args.no_auto_fetch_code, dry_run=args.dry_run)
+        auto_fetch_code=not args.no_auto_fetch_code, dry_run=args.dry_run,
+        heartbeat_seconds=args.heartbeat_seconds)
 
 
 if __name__ == "__main__":

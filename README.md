@@ -290,6 +290,57 @@ environment does not already have one; the extra intentionally does not force
 a particular CUDA build. It follows the imports and demo requirements of the
 [official VGGT exporter](https://github.com/facebookresearch/vggt).
 
+#### Reading the run: memory, stages, and stalls
+
+VGGT's aggregator attends over the tokens of *every* staged frame at once, so
+its VRAM grows with frame count rather than staying per-image constant, and
+the whole prediction happens inside one CUDA call that prints nothing.  A run
+that works at 8 frames can therefore die silently at 27.  `pose-geometry`
+makes that stage legible instead of leaving a blank terminal:
+
+```text
+  vggt: 27 masked frames; live log .../p3/experiments/vggt/stdout.log
+  host RAM: 12.5 GB available of 15.5 GB
+  GPU 0 (NVIDIA GeForce RTX 2070 with Max-Q Design): 0.3 GB free of 8.0 GB
+  WARNING: 1 other compute process(es) already hold this GPU (pid 63488); ...
+  WARNING: VGGT needs roughly 17.5 GB for 27 frames but 0.3 GB is free. ...
+  WARNING: consider --max-images 8 (an estimate from this card's 8 GB, ...)
+    [vggt 00:12] Loaded 27 images from .../runner/images
+    [vggt 02:42] still running, no output for 150s | aggregator + camera/depth
+      heads over all frames at once -- the peak-VRAM stage | GPU 7.6/8.0 GB
+      used | host 4.1 GB free | RSS 6.2 GB (peak 6.4)
+```
+
+Every exporter line is prefixed with elapsed time, and during silence the
+last stage reached is reported with live GPU, host, and exporter memory every
+`--heartbeat-seconds` (default 30; `0` keeps quiet but still records peaks).
+The pre-run figures come from `nvidia-smi` and `/proc/meminfo`; the VRAM
+estimate is a coarse empirical fit used only to warn and to propose a frame
+count, never to block a run.  Under WSL `nvidia-smi` cannot attribute VRAM
+per process, so the GPU figure is device-wide and other compute processes are
+listed by pid -- a nearly full card with nothing of yours running usually
+means a previous attempt is still holding it.
+
+Output is written to `stdout.log` as it arrives, so an interrupt or a kill
+still leaves a complete log, and `resources.json` records the pre-run
+snapshot beside the observed peaks.  Ctrl-C stops the exporter rather than
+orphaning it on the GPU.  A failure is diagnosed rather than reported as a
+bare exit code:
+
+```text
+RuntimeError: vggt exporter exited -9 after 12:03 while: aggregator + ...
+  Killed by SIGKILL with no traceback, which is normally the host
+  out-of-memory killer (common under WSL, whose RAM is capped) ...
+  Peak GPU memory in use on the device, all processes together: 7.9 of 8.0 GB.
+  Peak exporter host memory: 11.2 GB (host free fell to 0.3 GB).
+  This is an out-of-memory failure. 27 frames were staged; retry with
+  --max-images 8.
+```
+
+A host out-of-memory kill matters under WSL specifically: its VM gets a
+fraction of system RAM by default, which a `.wslconfig` `memory=` setting can
+raise.
+
 The outputs are deliberately comparable:
 
 ```text

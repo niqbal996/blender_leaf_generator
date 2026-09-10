@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -119,6 +122,7 @@ def run_learned_backend(
     code_cache: Optional[Path] = None,
     auto_fetch_code: bool = True,
     dry_run: bool = False,
+    heartbeat_seconds: float = 30.0,
 ) -> Dict:
     """Run an official exporter and standardize its output under P3.
 
@@ -185,6 +189,8 @@ def run_learned_backend(
     if dry_run:
         return {"backend": backend, "command": command, "staged_images": len(staged), "dry_run": True}
 
+    log_path = experiment / "stdout.log"
+    preflight = report_run_environment(backend, len(staged), bundle_adjust, log_path, device=device)
     print(f"  {backend}: starting official exporter (live output below; model download may take time)...")
     # Combine streams so a verbose stderr warning cannot block a quiet stdout
     # reader. -u above makes Python-level progress appear as it is emitted.
@@ -192,21 +198,19 @@ def run_learned_backend(
         command, cwd=str(repo_root), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         bufsize=1, env=env,
     )
-    output_lines = []
-    assert process.stdout is not None
-    for line in process.stdout:
-        output_lines.append(line)
-        print(f"    [{backend}] {line}", end="", flush=True)
+    output, usage = stream_exporter_output(process, backend, log_path, heartbeat_seconds)
     returncode = process.wait()
-    output = "".join(output_lines)
-    (experiment / "stdout.log").write_text(output)
     # Keep the established failure path valid. The combined stream contains
     # Python tracebacks and dependency errors regardless of originating fd.
     (experiment / "stderr.log").write_text(output)
+    (experiment / "resources.json").write_text(json.dumps(
+        {"preflight": preflight, "observed": usage, "exit_code": returncode}, indent=2))
     if returncode:
-        raise RuntimeError(
-            f"{backend} exporter exited {returncode}; see {experiment / 'stderr.log'}"
-        )
+        raise RuntimeError(diagnose_exporter_failure(
+            backend, returncode, output, len(staged), usage, log_path, bundle_adjust))
+    print(f"  {backend}: exporter finished in {format_elapsed(usage['elapsed_seconds'])}"
+          + (f", peak GPU {usage['peak_gpu_used_gb']:.1f}/{usage['gpu_total_gb']:.1f} GB"
+             if usage.get("gpu_total_gb") else ""))
     source = find_colmap_model(runner)
     standardized = sparse_model_dir(workdir, backend)
     if standardized.exists():
@@ -278,6 +282,344 @@ def backend_code_cache(code_cache: Optional[Path] = None) -> Path:
 
 def _exporter_script(repo_root: Path, backend: str) -> Path:
     return repo_root / ("demo_colmap.py" if backend == "vggt" else "scripts/demo_colmap.py")
+
+
+_SAMPLE_SECONDS = 5.0
+# Coarse constants for the VGGT advisory estimate only; see the docstring.
+_VGGT_WEIGHTS_GB = 2.6
+_VGGT_GB_PER_FRAME = 0.55
+# Substrings of the official exporters' own progress prints, mapped to what
+# the model is about to do next.  A stage is what makes a silent stretch
+# interpretable, and the exporters emit nothing during their longest one.
+_STAGE_HINTS = {
+    "vggt": (
+        ("Using dtype", "loading VGGT-1B weights (the first run also downloads them)"),
+        ("Model loaded", "loading and squaring the input images"),
+        ("images from", "aggregator + camera/depth heads over all frames at once -- the peak-VRAM stage"),
+        ("Predicting Tracks", "LightGlue track prediction for bundle adjustment"),
+        ("Converting to COLMAP", "building the COLMAP sparse model (CPU)"),
+    ),
+    "mapanything": (
+        ("Loading", "loading model weights (the first run also downloads them)"),
+        ("images", "inference over the staged frames"),
+        ("COLMAP", "building the COLMAP sparse model (CPU)"),
+    ),
+}
+_OOM_MARKERS = (
+    "CUDA out of memory", "OutOfMemoryError", "CUBLAS_STATUS_ALLOC_FAILED",
+    "CUDA error: out of memory", "MemoryError", "std::bad_alloc",
+    "cannot allocate memory", "DefaultCPUAllocator: not enough memory",
+)
+
+
+def read_host_memory() -> Optional[Dict[str, float]]:
+    """Host RAM totals in GB, or None where /proc/meminfo is unavailable."""
+    try:
+        fields = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, _, rest = line.partition(":")
+            fields[key] = float(rest.split()[0]) / 1024 / 1024
+    except (OSError, IndexError, ValueError):
+        return None
+    if "MemTotal" not in fields:
+        return None
+    return {"total_gb": fields["MemTotal"], "available_gb": fields.get("MemAvailable", fields["MemTotal"])}
+
+
+def read_gpu_memory(device: Optional[str] = None) -> Optional[List[Dict]]:
+    """Per-GPU memory via nvidia-smi, or None when it cannot be queried.
+
+    ``device`` is the same string as ``CUDA_VISIBLE_DEVICES``; when it selects
+    specific indices the report is narrowed to those, so the numbers describe
+    the GPU the subprocess will actually use.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            text=True, capture_output=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode:
+        return None
+    wanted = {part.strip() for part in device.split(",")} if device else None
+    gpus = []
+    for line in result.stdout.strip().splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 4:
+            continue
+        try:
+            index, name, used, total = parts[0], parts[1], float(parts[2]) / 1024, float(parts[3]) / 1024
+        except ValueError:
+            continue
+        if wanted and index not in wanted:
+            continue
+        gpus.append({"index": index, "name": name, "used_gb": used, "total_gb": total,
+                     "free_gb": max(total - used, 0.0)})
+    return gpus or None
+
+
+def read_gpu_processes() -> Optional[List[Dict]]:
+    """Compute processes on the GPUs, with per-process VRAM where offered.
+
+    ``used_memory`` is reported as ``[N/A]`` under WSL, so only the pids are
+    dependable there.  Knowing *that* another run still holds the card is
+    already the answer to a mysteriously tiny free figure.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+             "--format=csv,noheader,nounits"],
+            text=True, capture_output=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode:
+        return None
+    processes = []
+    for line in result.stdout.strip().splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 3 or not parts[0].isdigit():
+            continue
+        try:
+            used = float(parts[2]) / 1024
+        except ValueError:
+            used = None  # "[N/A]" under WSL
+        processes.append({"pid": int(parts[0]), "name": parts[1], "used_gb": used})
+    return processes
+
+
+def read_process_memory(pid: int) -> Optional[Dict[str, float]]:
+    """Current and peak resident set size of one process, in GB.
+
+    ``VmHWM`` is the kernel's own high-water mark, so it survives the spike
+    that a host out-of-memory kill ends on.
+    """
+    try:
+        status = Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return None
+    values = {}
+    for key, field in (("rss_gb", "VmRSS:"), ("peak_rss_gb", "VmHWM:")):
+        match = re.search(rf"^{field}\s+(\d+) kB", status, re.MULTILINE)
+        if match:
+            values[key] = float(match.group(1)) / 1024 / 1024
+    return values or None
+
+
+def estimate_vggt_vram_gb(num_frames: int, bundle_adjust: bool = False) -> float:
+    """Advisory estimate of VGGT-1B's peak VRAM at its fixed 518x518 input.
+
+    VGGT's aggregator alternates frame-wise attention with *global* attention
+    over the tokens of every frame at once, so cost grows with frame count
+    instead of staying per-image constant -- which is why a run that works at
+    8 frames can die at 30.  The two constants are a coarse fit to observed
+    usage, not a model of the network: they exist only to warn before a long
+    silent run and to propose a frame count, never to block one.
+    """
+    per_frame = _VGGT_GB_PER_FRAME * (1.6 if bundle_adjust else 1.0)
+    return _VGGT_WEIGHTS_GB + per_frame * max(num_frames, 1)
+
+
+def suggest_max_images(free_gb: float, bundle_adjust: bool = False) -> int:
+    """Frame count whose estimate fits in ``free_gb``, keeping a 10% margin."""
+    per_frame = _VGGT_GB_PER_FRAME * (1.6 if bundle_adjust else 1.0)
+    budget = free_gb * 0.9 - _VGGT_WEIGHTS_GB
+    return max(4, int(budget // per_frame))
+
+
+def format_elapsed(seconds: float) -> str:
+    seconds = int(max(seconds, 0))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def stage_for_line(backend: str, line: str) -> Optional[str]:
+    for marker, stage in _STAGE_HINTS.get(backend, ()):  # first match wins
+        if marker in line:
+            return stage
+    return None
+
+
+def report_run_environment(
+    backend: str,
+    num_images: int,
+    bundle_adjust: bool,
+    log_path: Path,
+    device: Optional[str] = None,
+) -> Dict:
+    """Print what the run is about to cost, before the model goes quiet.
+
+    The expensive stage produces no output for many minutes and is where
+    these models run out of memory, so the memory situation is far more
+    useful in front of it than in a post-mortem.
+    """
+    host, gpus = read_host_memory(), read_gpu_memory(device)
+    others = [proc for proc in (read_gpu_processes() or ()) if proc["pid"] != os.getpid()]
+    snapshot = {"num_images": num_images, "bundle_adjust": bundle_adjust, "host": host, "gpus": gpus,
+                "other_gpu_processes": others}
+    print(f"  {backend}: {num_images} masked frames"
+          f"{', bundle adjustment on' if bundle_adjust else ''}; live log {log_path}")
+    if host:
+        print(f"  host RAM: {host['available_gb']:.1f} GB available of {host['total_gb']:.1f} GB")
+    for gpu in gpus or ():
+        print(f"  GPU {gpu['index']} ({gpu['name']}): {gpu['free_gb']:.1f} GB free "
+              f"of {gpu['total_gb']:.1f} GB")
+    if gpus and others:
+        pids = ", ".join(f"pid {proc['pid']}" for proc in others)
+        print(f"  WARNING: {len(others)} other compute process(es) already hold this GPU ({pids}); "
+              f"only the free memory above is available. Stop them for the full card.")
+    if gpus is None:
+        print("  GPU memory could not be queried (no nvidia-smi); running on CPU is far slower")
+    elif backend == "vggt":
+        # Size against the free memory, but suggest against the whole card:
+        # a frame count worth retyping is one that works once the GPU is idle.
+        free = max(gpu["free_gb"] for gpu in gpus)
+        capacity = max(gpu["total_gb"] for gpu in gpus)
+        needed = estimate_vggt_vram_gb(num_images, bundle_adjust)
+        snapshot["estimated_vram_gb"] = round(needed, 1)
+        if needed > free:
+            print(f"  WARNING: VGGT needs roughly {needed:.1f} GB for {num_images} frames but "
+                  f"{free:.1f} GB is free. It attends over all frames at once, so expect an "
+                  f"out-of-memory failure or heavy swapping.")
+            print(f"  WARNING: consider --max-images {suggest_max_images(capacity, bundle_adjust)}"
+                  f"{' and dropping --bundle-adjust' if bundle_adjust else ''} "
+                  f"(an estimate from this card's {capacity:.0f} GB, not a hard limit).")
+    return snapshot
+
+
+def stream_exporter_output(
+    process: subprocess.Popen,
+    backend: str,
+    log_path: Path,
+    heartbeat_seconds: float = 30.0,
+) -> Tuple[str, Dict]:
+    """Relay exporter output with elapsed times, and speak up while it is silent.
+
+    Both exporters spend their longest stretch inside a single silent CUDA
+    call, which is indistinguishable from a hang and is exactly where memory
+    runs out.  A sampling thread therefore reports the last stage reached
+    together with live GPU/host/process memory, and returns the peaks so a
+    failure can say how close the run came to the limit.  Output is written
+    to ``log_path`` as it arrives, so an interrupt or a kill still leaves one.
+    """
+    started = time.monotonic()
+    lock = threading.Lock()
+    finished = threading.Event()
+    state = {
+        "stage": "starting the exporter process", "last_line": "", "last_output": started,
+        "peak_gpu_used_gb": 0.0, "gpu_total_gb": 0.0, "peak_process_rss_gb": 0.0,
+        "min_host_available_gb": None,
+    }
+
+    def sample() -> str:
+        gpus, host, proc = read_gpu_memory(), read_host_memory(), read_process_memory(process.pid)
+        parts = []
+        with lock:
+            if gpus:
+                busiest = max(gpus, key=lambda gpu: gpu["used_gb"])
+                state["peak_gpu_used_gb"] = max(state["peak_gpu_used_gb"], busiest["used_gb"])
+                state["gpu_total_gb"] = busiest["total_gb"]
+                parts.append(f"GPU {busiest['used_gb']:.1f}/{busiest['total_gb']:.1f} GB used")
+            if host:
+                previous = state["min_host_available_gb"]
+                state["min_host_available_gb"] = (host["available_gb"] if previous is None
+                                                  else min(previous, host["available_gb"]))
+                parts.append(f"host {host['available_gb']:.1f} GB free")
+            if proc:
+                peak = proc.get("peak_rss_gb", proc.get("rss_gb", 0.0))
+                state["peak_process_rss_gb"] = max(state["peak_process_rss_gb"], peak)
+                parts.append(f"RSS {proc.get('rss_gb', peak):.1f} GB (peak {peak:.1f})")
+        return "".join(f" | {part}" for part in parts)
+
+    def monitor() -> None:
+        last_beat = started
+        while not finished.wait(_SAMPLE_SECONDS):
+            usage = sample()  # sampled more often than reported, to catch peaks
+            now = time.monotonic()
+            with lock:
+                silent_for, stage = now - state["last_output"], state["stage"]
+            # Zero means "stay quiet", but keep sampling: the peak figures are
+            # what make a later out-of-memory failure explicable.
+            if heartbeat_seconds > 0 and silent_for >= heartbeat_seconds and now - last_beat >= heartbeat_seconds:
+                last_beat = now
+                print(f"    [{backend} {format_elapsed(now - started)}] still running, no output "
+                      f"for {int(silent_for)}s | {stage}{usage}", flush=True)
+
+    thread = threading.Thread(target=monitor, daemon=True)
+    thread.start()
+    lines: List[str] = []
+    assert process.stdout is not None
+    try:
+        with open(log_path, "w") as log:
+            for line in process.stdout:
+                now = time.monotonic()
+                lines.append(line)
+                log.write(line)
+                log.flush()
+                with lock:
+                    state["last_output"], state["last_line"] = now, line.strip()
+                    state["stage"] = stage_for_line(backend, line) or state["stage"]
+                print(f"    [{backend} {format_elapsed(now - started)}] {line}", end="", flush=True)
+    except KeyboardInterrupt:
+        print(f"\n  interrupted -- stopping the {backend} exporter so it releases the GPU", flush=True)
+        process.terminate()
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        raise
+    finally:
+        finished.set()
+        thread.join(timeout=_SAMPLE_SECONDS + 1)
+    with lock:
+        usage = {key: state[key] for key in
+                 ("stage", "last_line", "peak_gpu_used_gb", "gpu_total_gb",
+                  "peak_process_rss_gb", "min_host_available_gb")}
+    usage["elapsed_seconds"] = round(time.monotonic() - started, 1)
+    return "".join(lines), usage
+
+
+def diagnose_exporter_failure(
+    backend: str,
+    returncode: int,
+    output: str,
+    num_staged: int,
+    usage: Dict,
+    log_path: Path,
+    bundle_adjust: bool = False,
+) -> str:
+    """Explain a failed exporter run, naming out-of-memory when it fits.
+
+    A bare exit code is the least useful thing to report here: the two common
+    outcomes are a CUDA allocation failure in the child and a host
+    out-of-memory kill, which arrives as SIGKILL with no traceback at all.
+    """
+    elapsed = format_elapsed(usage.get("elapsed_seconds", 0))
+    detail = [f"{backend} exporter exited {returncode} after {elapsed} while: {usage.get('stage', 'unknown')}"]
+    killed_by_host = returncode in (-9, 137)
+    if killed_by_host:
+        detail.append("Killed by SIGKILL with no traceback, which is normally the host "
+                      "out-of-memory killer (common under WSL, whose RAM is capped) rather than a crash.")
+    cuda_oom = any(marker in output for marker in _OOM_MARKERS)
+    peak_gpu, gpu_total = usage.get("peak_gpu_used_gb") or 0.0, usage.get("gpu_total_gb") or 0.0
+    if gpu_total:
+        detail.append(f"Peak GPU memory in use on the device, all processes together: "
+                      f"{peak_gpu:.1f} of {gpu_total:.1f} GB.")
+    if usage.get("peak_process_rss_gb"):
+        detail.append(f"Peak exporter host memory: {usage['peak_process_rss_gb']:.1f} GB "
+                      f"(host free fell to {usage.get('min_host_available_gb') or 0.0:.1f} GB).")
+    if cuda_oom or killed_by_host:
+        suggestion = suggest_max_images(gpu_total or 8.0, bundle_adjust) if backend == "vggt" else max(4, num_staged // 2)
+        detail.append(f"This is an out-of-memory failure. {num_staged} frames were staged; retry with "
+                      f"--max-images {min(suggestion, max(num_staged - 1, 4))}"
+                      f"{' and without --bundle-adjust' if bundle_adjust else ''}.")
+    elif usage.get("last_line"):
+        detail.append(f"Last output: {usage['last_line']}")
+    detail.append(f"Full exporter output: {log_path}")
+    return "\n  ".join(detail)
 
 
 def find_colmap_model(root: Path) -> Path:
