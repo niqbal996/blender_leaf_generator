@@ -35,6 +35,7 @@ def run(
     auto_fetch_code: bool = True,
     dry_run: bool = False,
     heartbeat_seconds: float = 30.0,
+    skip_env_check: bool = False,
 ) -> dict:
     require_sparse_model(workdir, "colmap")
     selected = list(dict.fromkeys(backends))
@@ -48,7 +49,8 @@ def run(
                                      hf_token=hf_token, hf_home=hf_home,
                                      code_cache=code_cache,
                                      auto_fetch_code=auto_fetch_code, dry_run=dry_run,
-                                     heartbeat_seconds=heartbeat_seconds)
+                                     heartbeat_seconds=heartbeat_seconds,
+                                     skip_env_check=skip_env_check)
         if dry_run:
             print("  would run: " + " ".join(report["command"]))
         else:
@@ -95,14 +97,17 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--heartbeat-seconds", type=float, default=30.0,
                         help="While the exporter prints nothing, report its stage and GPU/host memory "
                              "this often. The peak-VRAM stage is silent for minutes; 0 disables it.")
-    parser.add_argument("--dry-run", action="store_true", help="Stage inputs and record, but do not start models")
+    parser.add_argument("--skip-env-check", action="store_true",
+                        help="Do not verify the exporter's Python version and imports before running")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Check the exporter environment and stage inputs, but do not start models")
     args = parser.parse_args(argv)
     run(args.workdir, args.backends, vggt_root=args.vggt_root, mapanything_root=args.mapanything_root,
         max_images=args.max_images, bundle_adjust=args.bundle_adjust, device=args.device,
         model_python=args.model_python, hf_token=args.hf_token, hf_home=args.hf_home,
         code_cache=args.code_cache,
         auto_fetch_code=not args.no_auto_fetch_code, dry_run=args.dry_run,
-        heartbeat_seconds=args.heartbeat_seconds)
+        heartbeat_seconds=args.heartbeat_seconds, skip_env_check=args.skip_env_check)
 
 
 if __name__ == "__main__":

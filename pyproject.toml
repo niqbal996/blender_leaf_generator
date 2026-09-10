@@ -101,6 +101,18 @@ semantic = [
 # CUDA wheel URL: install a CUDA-matching torch/torchvision build first if
 # needed, then this extra will retain it when its version satisfies >=2.3.
 # The exporter imports LightGlue even when --bundle-adjust is off.
+#
+# Two requirements cannot be expressed here, and `pose-geometry` checks both
+# before it stages anything:
+#   * Python >= 3.10. The exporter and its vendored files annotate with PEP 604
+#     unions (`np.ndarray | None`) in positions Python evaluates on import, so
+#     3.9 raises "unsupported operand type(s) for |" from inside
+#     vggt/dependency/projection.py. Only the model environment needs 3.10+:
+#     keep this project where it is and pass --model-python.
+#   * pycolmap, from whichever build you already use for pose-solve -- plain
+#     `pycolmap` or `pycolmap-cuda`. Naming either one here would clobber the
+#     other, since both install the same `pycolmap` module, so this extra
+#     names neither and the exporter's import of it is checked at runtime.
 vggt = [
     "torch>=2.3",
     "torchvision>=0.18",

@@ -147,9 +147,15 @@ def test_cuda_oom_in_the_output_is_recognised_without_a_signal(tmp_path):
         27, usage, tmp_path / "log", bundle_adjust=True)
     assert "out-of-memory" in oom and "without --bundle-adjust" in oom
 
-    other = diagnose_exporter_failure("vggt", 1, "ImportError: no module named lightglue",
+    # An import failure is an environment fault, so it must not read as OOM;
+    # a failure matching no pattern falls back to the last line the run printed.
+    imports = diagnose_exporter_failure("vggt", 1, "ImportError: no module named lightglue",
+                                        27, usage, tmp_path / "log")
+    assert "out-of-memory" not in imports and "environment problem" in imports
+
+    other = diagnose_exporter_failure("vggt", 1, "AssertionError: unexpected image shape",
                                       27, usage, tmp_path / "log")
-    assert "out-of-memory" not in other
+    assert "out-of-memory" not in other and "environment problem" not in other
     assert "Last output: x" in other
 
 
@@ -199,3 +205,139 @@ def test_zero_heartbeat_stays_quiet_but_still_records_peaks(tmp_path, monkeypatc
 
     assert "still running" not in capsys.readouterr().out
     assert usage["peak_gpu_used_gb"] == 6.5
+
+
+def _probe_output(python, modules, cuda=True):
+    import json
+
+    from pose_estimator.geometry import _PROBE_MARKER
+
+    report = {"python": list(python), "executable": "/env/bin/python", "modules": modules}
+    if cuda:
+        report["torch_cuda"] = {"available": True, "build": "12.4", "devices": ["A100"]}
+    return "some import warning\n" + _PROBE_MARKER + json.dumps(report) + "\n"
+
+
+def test_old_python_is_rejected_with_the_pep604_reason_and_the_model_python_fix(monkeypatch):
+    import subprocess as sp
+
+    import pytest
+
+    from pose_estimator import geometry
+
+    ready = {name: "2.0" for name in geometry._REQUIRED_MODULES["vggt"]}
+    monkeypatch.setattr(geometry.subprocess, "run",
+                        lambda command, **kw: sp.CompletedProcess(
+                            command, 0, stdout=_probe_output((3, 9, 18), ready), stderr=""))
+
+    with pytest.raises(RuntimeError) as failure:
+        geometry.require_model_environment("vggt")
+    message = str(failure.value)
+    assert "Python 3.9.18" in message and "3.10 or newer" in message
+    assert "--model-python" in message
+    assert "Nothing was staged or downloaded" in message
+
+
+def test_missing_pycolmap_explains_why_the_extra_cannot_pin_it(monkeypatch):
+    import subprocess as sp
+
+    import pytest
+
+    from pose_estimator import geometry
+
+    modules = {name: "2.0" for name in geometry._REQUIRED_MODULES["vggt"]}
+    modules["pycolmap"] = "MISSING: ModuleNotFoundError: No module named 'pycolmap'"
+    monkeypatch.setattr(geometry.subprocess, "run",
+                        lambda command, **kw: sp.CompletedProcess(
+                            command, 0, stdout=_probe_output((3, 11, 0), modules), stderr=""))
+
+    with pytest.raises(RuntimeError) as failure:
+        geometry.require_model_environment("vggt")
+    message = str(failure.value)
+    assert "pip install pycolmap" in message
+    assert "clobber" in message  # the reason it is not simply added to [vggt]
+
+
+def test_pycolmap_present_but_missing_its_cuda_runtime_gets_a_different_fix(monkeypatch):
+    import subprocess as sp
+
+    import pytest
+
+    from pose_estimator import geometry
+
+    modules = {name: "2.0" for name in geometry._REQUIRED_MODULES["vggt"]}
+    modules["pycolmap"] = ("MISSING: ImportError: libcudart.so.12: cannot open shared object file")
+    monkeypatch.setattr(geometry.subprocess, "run",
+                        lambda command, **kw: sp.CompletedProcess(
+                            command, 0, stdout=_probe_output((3, 11, 0), modules), stderr=""))
+
+    with pytest.raises(RuntimeError) as failure:
+        geometry.require_model_environment("vggt")
+    assert "LD_LIBRARY_PATH" in str(failure.value)
+    assert "pip install pycolmap" not in str(failure.value)
+
+
+def test_a_complete_environment_passes_and_reports_its_gpus(monkeypatch):
+    import subprocess as sp
+
+    from pose_estimator import geometry
+
+    ready = {name: "2.0" for name in geometry._REQUIRED_MODULES["vggt"]}
+    monkeypatch.setattr(geometry.subprocess, "run",
+                        lambda command, **kw: sp.CompletedProcess(
+                            command, 0, stdout=_probe_output((3, 11, 0), ready), stderr=""))
+
+    report = geometry.require_model_environment("vggt")
+    assert report["torch_cuda"]["devices"] == ["A100"]
+    assert report["python"] == [3, 11, 0]
+
+
+def test_the_probe_runs_in_the_interpreter_named_by_model_python(monkeypatch):
+    import subprocess as sp
+
+    from pose_estimator import geometry
+
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen["command"] = command
+        ready = {name: "2.0" for name in geometry._REQUIRED_MODULES["vggt"]}
+        return sp.CompletedProcess(command, 0, stdout=_probe_output((3, 12, 0), ready), stderr="")
+
+    monkeypatch.setattr(geometry.subprocess, "run", fake_run)
+    geometry.require_model_environment("vggt", "/opt/conda/envs/geometry/bin/python")
+    assert seen["command"][0] == "/opt/conda/envs/geometry/bin/python"
+    assert "pycolmap" in seen["command"]  # asked about in that environment, not this one
+
+
+def test_an_unreadable_probe_reports_the_interpreter_output(monkeypatch):
+    import subprocess as sp
+
+    import pytest
+
+    from pose_estimator import geometry
+
+    monkeypatch.setattr(geometry.subprocess, "run",
+                        lambda command, **kw: sp.CompletedProcess(
+                            command, 1, stdout="", stderr="bad interpreter"))
+
+    with pytest.raises(RuntimeError, match="bad interpreter"):
+        geometry.probe_model_environment("vggt")
+
+
+def test_an_import_time_crash_is_diagnosed_as_environment_not_memory(tmp_path):
+    from pose_estimator.geometry import diagnose_exporter_failure
+
+    usage = {"stage": "loading VGGT-1B weights", "last_line": "", "peak_gpu_used_gb": 0.2,
+             "gpu_total_gb": 8.0, "peak_process_rss_gb": 0.5,
+             "min_host_available_gb": 12.0, "elapsed_seconds": 4}
+    pep604 = diagnose_exporter_failure(
+        "vggt", 1, "TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'",
+        27, usage, tmp_path / "log")
+    assert "environment problem" in pep604
+    assert "3.10" in pep604 and "--model-python" in pep604
+    assert "out-of-memory" not in pep604
+
+    no_pycolmap = diagnose_exporter_failure(
+        "vggt", 1, "ModuleNotFoundError: No module named 'pycolmap'", 27, usage, tmp_path / "log")
+    assert "pip install pycolmap" in no_pycolmap

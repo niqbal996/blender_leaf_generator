@@ -283,6 +283,40 @@ once into the same environment that launches `pose-geometry`:
 pip install -e ".[vggt]"
 ```
 
+Two things that extra cannot install for you, both checked before a run
+stages anything:
+
+* **Python 3.10 or newer, for the model environment only.** VGGT's exporter
+  and its vendored files annotate with `np.ndarray | None` in positions
+  Python evaluates on import, so 3.9 fails with `TypeError: unsupported
+  operand type(s) for |` from inside `vggt/dependency/projection.py`. This
+  project itself does not need 3.10: keep it where it is and pass
+  `--model-python /path/to/py310/bin/python`.
+* **`pycolmap`**, from whichever build you already use for `pose-solve` --
+  plain `pycolmap` or `pycolmap-cuda`. The extra names neither on purpose:
+  both install the same `pycolmap` module, so pinning one would clobber the
+  other and break P3.
+
+`pose-geometry` asks the exporter's own interpreter what it has before it
+clears or stages anything, so a missing dependency costs seconds instead of
+surfacing as a traceback from a vendored file after a weight download:
+
+```text
+RuntimeError: the vggt exporter cannot run in this environment:
+    - /env/bin/python is Python 3.9.18, but the official vggt exporter needs
+      3.10 or newer: it annotates with `X | None` in positions Python
+      evaluates at import time ...
+      Create a newer environment and point --model-python at its python ...
+    - pycolmap cannot be imported in /env/bin/python: ModuleNotFoundError ...
+      Fix: pip install pycolmap  (or pycolmap-cuda for GPU SIFT). ...
+  Nothing was staged or downloaded. Re-run with --skip-env-check to try anyway.
+```
+
+`--dry-run` runs exactly this check and stages the inputs without loading a
+model, which makes it the quickest way to validate a new machine.  A
+`pycolmap-cuda` wheel that imports but cannot find `libcudart` is reported as
+its own case, since the fix there is `LD_LIBRARY_PATH`, not an install.
+
 This includes `trimesh`, LightGlue, the tracker configuration libraries, and
 the Hugging Face loader used by the upstream exporter. Install your
 CUDA-matched `torch`/`torchvision` build before this command if the existing

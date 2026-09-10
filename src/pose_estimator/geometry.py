@@ -123,6 +123,7 @@ def run_learned_backend(
     auto_fetch_code: bool = True,
     dry_run: bool = False,
     heartbeat_seconds: float = 30.0,
+    skip_env_check: bool = False,
 ) -> Dict:
     """Run an official exporter and standardize its output under P3.
 
@@ -139,6 +140,16 @@ def run_learned_backend(
         repo_root = backend_code_cache(code_cache) / backend
     else:
         repo_root = resolve_backend_repo(workdir, backend, repo_root, auto_fetch_code, code_cache=code_cache)
+
+    # Before staging: staging clears a previous attempt's outputs, and the
+    # failures this catches are certain, not probabilistic.
+    environment = None
+    if not skip_env_check:
+        print(f"  {backend}: checking the exporter environment ({model_python or sys.executable})...")
+        environment = require_model_environment(backend, model_python)
+        cuda = environment.get("torch_cuda") or {}
+        print(f"    Python {'.'.join(str(part) for part in environment['python'])}, torch CUDA "
+              f"{cuda.get('build') or 'n/a'}, devices: {', '.join(cuda.get('devices') or ['none'])}")
 
     experiment = geometry_dir(workdir, backend)
     input_images = experiment / "input" / "images"
@@ -204,7 +215,8 @@ def run_learned_backend(
     # Python tracebacks and dependency errors regardless of originating fd.
     (experiment / "stderr.log").write_text(output)
     (experiment / "resources.json").write_text(json.dumps(
-        {"preflight": preflight, "observed": usage, "exit_code": returncode}, indent=2))
+        {"preflight": preflight, "environment": environment, "observed": usage,
+         "exit_code": returncode}, indent=2))
     if returncode:
         raise RuntimeError(diagnose_exporter_failure(
             backend, returncode, output, len(staged), usage, log_path, bundle_adjust))
@@ -310,6 +322,127 @@ _OOM_MARKERS = (
     "CUDA error: out of memory", "MemoryError", "std::bad_alloc",
     "cannot allocate memory", "DefaultCPUAllocator: not enough memory",
 )
+
+
+# VGGT's exporter and its vendored dependencies annotate with PEP 604 unions
+# (``np.ndarray | None``) in evaluated positions, so they raise TypeError on
+# import below 3.10 rather than failing gracefully.
+_MIN_MODEL_PYTHON = {"vggt": (3, 10), "mapanything": (3, 10)}
+# What each official exporter imports before it does any work.  ``pycolmap``
+# is in this list but deliberately absent from the ``vggt`` extra: see
+# _PYCOLMAP_HELP.
+_REQUIRED_MODULES = {
+    "vggt": ("torch", "torchvision", "numpy", "PIL", "pycolmap", "trimesh",
+             "lightglue", "einops", "safetensors", "huggingface_hub"),
+    "mapanything": ("torch", "numpy", "PIL", "pycolmap", "huggingface_hub"),
+}
+_PYCOLMAP_HELP = (
+    "pip install pycolmap  (or pycolmap-cuda for GPU SIFT). The [vggt] extra "
+    "deliberately pins neither: both packages provide the same `pycolmap` module, "
+    "so naming one would clobber the build this project's own P3 solver uses."
+)
+_MODULE_HELP = {
+    "pycolmap": _PYCOLMAP_HELP,
+    "lightglue": 'pip install "lightglue @ git+https://github.com/jytime/LightGlue.git"',
+    "torch": "install a CUDA-matching torch build first: https://pytorch.org/get-started/locally/",
+}
+_ENVIRONMENT_MARKERS = (
+    ("unsupported operand type(s) for |",
+     "a vendored file uses PEP 604 `X | None` annotations, which need Python 3.10 or newer -- "
+     "point --model-python at a newer interpreter"),
+    ("ModuleNotFoundError: No module named 'pycolmap'", _PYCOLMAP_HELP),
+    ("libcudart", "an installed CUDA extension cannot find its CUDA runtime; put it on LD_LIBRARY_PATH"),
+    ("ModuleNotFoundError", "a dependency of the official exporter is missing from that environment"),
+    ("ImportError", "a dependency of the official exporter is present but unusable"),
+)
+# Printed as one line by the probe so surrounding warnings cannot confuse the
+# parse -- importing torch is noisy on many installs.
+_PROBE_MARKER = "POSE_GEOMETRY_PROBE "
+_PROBE_SCRIPT = f'''
+import json, sys
+report = {{"python": list(sys.version_info[:3]), "executable": sys.executable, "modules": {{}}}}
+for name in sys.argv[1:]:
+    try:
+        __import__(name)
+        report["modules"][name] = getattr(sys.modules[name], "__version__", "present")
+    except BaseException as exc:            # a bad wheel can raise anything
+        report["modules"][name] = f"MISSING: {{type(exc).__name__}}: {{exc}}"
+try:
+    import torch
+    count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    report["torch_cuda"] = {{
+        "available": torch.cuda.is_available(), "build": torch.version.cuda,
+        "devices": [torch.cuda.get_device_name(i) for i in range(count)],
+    }}
+except BaseException:
+    pass
+print({_PROBE_MARKER!r} + json.dumps(report))
+'''
+
+
+def probe_model_environment(backend: str, model_python: Optional[str] = None) -> Dict:
+    """Ask the model's interpreter what it actually has, without loading a model.
+
+    ``--model-python`` means the exporter may run in a different environment
+    from this CLI, so the only trustworthy answer comes from that interpreter.
+    Importing torch takes a few seconds; spending them here is far better than
+    failing after staging frames and downloading weights.
+    """
+    executable = model_python or sys.executable
+    required = _REQUIRED_MODULES.get(backend, ("torch", "numpy", "pycolmap"))
+    try:
+        result = subprocess.run([executable, "-c", _PROBE_SCRIPT, *required],
+                                text=True, capture_output=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"could not run {executable} to check the {backend} environment: {exc}")
+    for line in reversed(result.stdout.splitlines()):
+        if line.startswith(_PROBE_MARKER):
+            report = json.loads(line[len(_PROBE_MARKER):])
+            report["required"] = list(required)
+            return report
+    raise RuntimeError(
+        f"could not read the {backend} environment report from {executable} "
+        f"(exit {result.returncode}). Output was:\n{(result.stdout + result.stderr).strip()[:2000]}"
+    )
+
+
+def require_model_environment(backend: str, model_python: Optional[str] = None) -> Dict:
+    """Fail with instructions when the exporter's interpreter cannot run it.
+
+    Both failures this catches are environment mistakes, not model problems,
+    and both otherwise surface as an opaque traceback from inside a vendored
+    file several minutes into a run.
+    """
+    report = probe_model_environment(backend, model_python)
+    version = tuple(report["python"])
+    problems = []
+    minimum = _MIN_MODEL_PYTHON.get(backend)
+    if minimum and version < minimum:
+        problems.append(
+            f"{report['executable']} is Python {'.'.join(map(str, version))}, but the official "
+            f"{backend} exporter needs {'.'.join(map(str, minimum))} or newer: it annotates with "
+            f"`X | None` in positions Python evaluates at import time, which raises "
+            f"\"unsupported operand type(s) for |\" on older versions.\n"
+            f"      Create a newer environment and point --model-python at its python; the rest "
+            f"of this pipeline can stay where it is."
+        )
+    missing = {name: detail for name, detail in report["modules"].items() if detail.startswith("MISSING:")}
+    for name, detail in missing.items():
+        hint = _MODULE_HELP.get(name)
+        # A pycolmap wheel that imports but cannot find CUDA is a third case,
+        # distinct from an absent package, and needs a different fix.
+        if name == "pycolmap" and "libcudart" in detail:
+            hint = ("pycolmap-cuda is installed but its CUDA runtime is not on LD_LIBRARY_PATH; "
+                    "see the skeleton-gpu notes in pyproject.toml")
+        problems.append(f"{name} cannot be imported in {report['executable']}: "
+                        f"{detail[len('MISSING: '):]}" + (f"\n      Fix: {hint}" if hint else ""))
+    if problems:
+        raise RuntimeError(
+            f"the {backend} exporter cannot run in this environment:\n    - "
+            + "\n    - ".join(problems)
+            + "\n  Nothing was staged or downloaded. Re-run with --skip-env-check to try anyway."
+        )
+    return report
 
 
 def read_host_memory() -> Optional[Dict[str, float]]:
@@ -611,7 +744,11 @@ def diagnose_exporter_failure(
     if usage.get("peak_process_rss_gb"):
         detail.append(f"Peak exporter host memory: {usage['peak_process_rss_gb']:.1f} GB "
                       f"(host free fell to {usage.get('min_host_available_gb') or 0.0:.1f} GB).")
-    if cuda_oom or killed_by_host:
+    environment = next((help_text for marker, help_text in _ENVIRONMENT_MARKERS if marker in output), None)
+    if environment and not cuda_oom:
+        detail.append(f"This is an environment problem, not a model failure: {environment}.")
+        detail.append("Re-running with --dry-run checks the exporter environment without loading a model.")
+    elif cuda_oom or killed_by_host:
         suggestion = suggest_max_images(gpu_total or 8.0, bundle_adjust) if backend == "vggt" else max(4, num_staged // 2)
         detail.append(f"This is an out-of-memory failure. {num_staged} frames were staged; retry with "
                       f"--max-images {min(suggestion, max(num_staged - 1, 4))}"
