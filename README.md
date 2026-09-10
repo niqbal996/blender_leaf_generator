@@ -308,6 +308,43 @@ pose-geometry --workdir runs/plant_9 --backends vggt \
   --model-python ~/miniconda3/envs/vggt/bin/python
 ```
 
+MapAnything is installed from its own checkout rather than from an extra
+here, because it is a package with its own dependency set (`uniception`,
+`natsort`, `python-box`, ...) that no list in this repo should try to
+mirror. Its exporter lives in `scripts/`, and Python puts the *script's*
+directory on `sys.path` rather than the working directory, so the
+`mapanything` package beside it is invisible until the project is installed
+-- `pose-geometry` adds the checkout to `PYTHONPATH`, but that only fixes
+the path, not the missing dependencies:
+
+```bash
+conda create -n mapanything python=3.11 && conda activate mapanything
+git clone https://github.com/facebookresearch/map-anything.git
+pip install -e "map-anything[colmap]"   # [colmap] adds pycolmap==3.10.0
+```
+
+**The two backends need separate environments.** VGGT pins
+[jytime's LightGlue fork](https://github.com/jytime/LightGlue) and
+MapAnything pins [cvg's](https://github.com/cvg/LightGlue); both install as
+the module `lightglue`, so whichever lands last wins. `--vggt-python` and
+`--mapanything-python` therefore override `--model-python` per backend, which
+is what makes a single three-way comparison run possible:
+
+```bash
+pose-geometry --workdir runs/plant_9 --backends vggt mapanything \
+  --vggt-python ~/miniconda3/envs/vggt/bin/python \
+  --mapanything-python ~/miniconda3/envs/mapanything/bin/python \
+  --mapanything-root ~/src/map-anything
+```
+
+Both projects independently pin `pycolmap==3.10.0`, so the COLMAP models
+they write are directly comparable. To re-score experiments that already
+exist on disk without re-running any model:
+
+```bash
+pose-compare-geometry --workdir runs/plant_9   # discovers what is there
+```
+
 `pose-geometry` asks the exporter's own interpreter what it has before it
 clears or stages anything, so a missing dependency costs seconds instead of
 surfacing as a traceback from a vendored file after a weight download:

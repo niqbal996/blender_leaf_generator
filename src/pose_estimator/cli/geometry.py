@@ -29,6 +29,8 @@ def run(
     bundle_adjust: bool = False,
     device: Optional[str] = None,
     model_python: Optional[str] = None,
+    vggt_python: Optional[str] = None,
+    mapanything_python: Optional[str] = None,
     hf_token: Optional[str] = None,
     hf_home: Optional[Path] = None,
     code_cache: Optional[Path] = None,
@@ -43,9 +45,12 @@ def run(
         if backend == "colmap":
             continue
         root = vggt_root if backend == "vggt" else mapanything_root
+        # VGGT and MapAnything pin different forks of lightglue, which install
+        # under the same module name, so one environment cannot serve both.
+        backend_python = (vggt_python if backend == "vggt" else mapanything_python) or model_python
         print(f"Running {backend} on P2 plant-masked RGB frames...")
         report = run_learned_backend(workdir, backend, root, max_images=max_images,
-                                     bundle_adjust=bundle_adjust, device=device, model_python=model_python,
+                                     bundle_adjust=bundle_adjust, device=device, model_python=backend_python,
                                      hf_token=hf_token, hf_home=hf_home,
                                      code_cache=code_cache,
                                      auto_fetch_code=auto_fetch_code, dry_run=dry_run,
@@ -86,6 +91,12 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--device", help="CUDA_VISIBLE_DEVICES value for the model subprocess, e.g. 0")
     parser.add_argument("--model-python",
                         help="Python executable in the VGGT/MapAnything environment; default is this command's Python")
+    parser.add_argument("--vggt-python",
+                        help="Python for the VGGT environment specifically, overriding --model-python")
+    parser.add_argument("--mapanything-python",
+                        help="Python for the MapAnything environment specifically, overriding --model-python. "
+                             "The two backends pin different lightglue forks, so comparing both in one run "
+                             "needs an environment for each.")
     parser.add_argument("--hf-token", help="Hugging Face token; defaults to HF_TOKEN/HUGGINGFACE_HUB_TOKEN. "
                         "Prefer the environment variable so the token is not in shell history/process arguments.")
     parser.add_argument("--hf-home", type=Path,
@@ -104,7 +115,8 @@ def main(argv: Optional[list] = None) -> None:
     args = parser.parse_args(argv)
     run(args.workdir, args.backends, vggt_root=args.vggt_root, mapanything_root=args.mapanything_root,
         max_images=args.max_images, bundle_adjust=args.bundle_adjust, device=args.device,
-        model_python=args.model_python, hf_token=args.hf_token, hf_home=args.hf_home,
+        model_python=args.model_python, vggt_python=args.vggt_python,
+        mapanything_python=args.mapanything_python, hf_token=args.hf_token, hf_home=args.hf_home,
         code_cache=args.code_cache,
         auto_fetch_code=not args.no_auto_fetch_code, dry_run=args.dry_run,
         heartbeat_seconds=args.heartbeat_seconds, skip_env_check=args.skip_env_check)

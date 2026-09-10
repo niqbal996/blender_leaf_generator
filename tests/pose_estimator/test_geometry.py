@@ -418,3 +418,80 @@ def test_a_post_launch_pycolmap_api_break_is_named_rather_than_reported_as_exit_
     assert "environment problem" in message
     assert "requirements_demo.txt" in message
     assert "out-of-memory" not in message  # 10 of 45 GB is not a memory failure
+
+
+def test_the_checkout_is_put_on_pythonpath_because_scripts_shadow_it(tmp_path):
+    import os
+
+    from pose_estimator.geometry import exporter_pythonpath
+
+    repo = tmp_path / "map-anything"
+    # Python puts scripts/ on sys.path, not the repo root, so the package
+    # beside the exporter is invisible without this.
+    assert exporter_pythonpath(repo, {})["PYTHONPATH"] == str(repo)
+    appended = exporter_pythonpath(repo, {"PYTHONPATH": "/existing"})["PYTHONPATH"]
+    assert appended == f"{repo}{os.pathsep}/existing"
+    assert "PYTHONPATH" not in exporter_pythonpath(None, {})
+
+
+def test_the_exporters_own_imports_are_probed_not_just_third_party_packages():
+    from pose_estimator.geometry import _REQUIRED_MODULES
+
+    assert "mapanything.models" in _REQUIRED_MODULES["mapanything"]
+    assert "mapanything.utils.colmap_export" in _REQUIRED_MODULES["mapanything"]
+    assert "vggt.models.vggt" in _REQUIRED_MODULES["vggt"]
+
+
+def test_an_uninstalled_checkout_is_told_to_install_itself_not_to_fix_a_path(monkeypatch, tmp_path):
+    import subprocess as sp
+
+    import pytest
+
+    from pose_estimator import geometry
+
+    modules = {name: "2.0" for name in geometry._REQUIRED_MODULES["mapanything"]}
+    # What a checkout on PYTHONPATH but never installed actually reports.
+    modules["mapanything.models"] = "MISSING: ModuleNotFoundError: No module named 'uniception'"
+    monkeypatch.setattr(geometry.subprocess, "run",
+                        lambda command, **kw: sp.CompletedProcess(
+                            command, 0, stdout=_probe_output((3, 12, 0), modules), stderr=""))
+    repo = tmp_path / "map-anything"
+    repo.mkdir()
+
+    with pytest.raises(RuntimeError) as failure:
+        geometry.require_model_environment("mapanything", None, repo)
+    message = str(failure.value)
+    assert f'pip install -e "{repo}[colmap]"' in message
+    assert "uniception" in message
+    assert "lightglue forks" in message  # why it needs its own environment
+
+
+def test_the_pin_is_read_from_pyproject_when_there_is_no_requirements_file(tmp_path):
+    from pose_estimator.geometry import exporter_pinned_pycolmap
+
+    repo = tmp_path / "map-anything"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text(
+        'colmap = [\n  "open3d",\n  "pycolmap==3.10.0"\n]\n')
+    assert exporter_pinned_pycolmap(repo) == "3.10.0"
+
+
+def test_each_backend_can_use_its_own_interpreter(monkeypatch, tmp_path):
+    from pose_estimator.cli import geometry as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "require_sparse_model", lambda workdir, backend="colmap": tmp_path)
+    monkeypatch.setattr(cli, "compare_backends", lambda workdir, backends: {"comparisons": {}})
+
+    def record(workdir, backend, root, **kwargs):
+        calls.append((backend, kwargs["model_python"]))
+        return {"num_registered": 27, "num_input_frames": 27, "num_points3D": 1000}
+
+    monkeypatch.setattr(cli, "run_learned_backend", record)
+    cli.run(tmp_path, ["vggt", "mapanything"], model_python="/envs/shared/python",
+            vggt_python="/envs/vggt/python", mapanything_python="/envs/ma/python")
+    assert calls == [("vggt", "/envs/vggt/python"), ("mapanything", "/envs/ma/python")]
+
+    calls.clear()
+    cli.run(tmp_path, ["vggt", "mapanything"], model_python="/envs/shared/python")
+    assert calls == [("vggt", "/envs/shared/python"), ("mapanything", "/envs/shared/python")]

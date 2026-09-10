@@ -182,7 +182,7 @@ def run_learned_backend(
     # environment: never in command.json, stdout/stderr names, or reports.
     # HUGGINGFACE_HUB_TOKEN is included for older hub clients.
     resolved_token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-    env = os.environ.copy()
+    env = exporter_pythonpath(repo_root)
     if resolved_token:
         env["HF_TOKEN"] = resolved_token
         env["HUGGINGFACE_HUB_TOKEN"] = resolved_token
@@ -331,10 +331,16 @@ _MIN_MODEL_PYTHON = {"vggt": (3, 10), "mapanything": (3, 10)}
 # What each official exporter imports before it does any work.  ``pycolmap``
 # is in this list but deliberately absent from the ``vggt`` extra: see
 # _PYCOLMAP_HELP.
+# The dotted entries are the exporters' own top imports, checked with the
+# checkout on PYTHONPATH.  Importing those is what catches a missing
+# transitive dependency (mapanything needs uniception, natsort, python-box...)
+# without reimplementing either project's requirements here.
 _REQUIRED_MODULES = {
     "vggt": ("torch", "torchvision", "numpy", "PIL", "pycolmap", "trimesh",
-             "lightglue", "einops", "safetensors", "huggingface_hub"),
-    "mapanything": ("torch", "numpy", "PIL", "pycolmap", "huggingface_hub"),
+             "lightglue", "einops", "safetensors", "huggingface_hub",
+             "vggt.models.vggt", "vggt.dependency.np_to_pycolmap"),
+    "mapanything": ("torch", "numpy", "PIL", "pycolmap", "huggingface_hub",
+                    "mapanything.models", "mapanything.utils.colmap_export"),
 }
 _PYCOLMAP_HELP = (
     "pip install pycolmap  (or pycolmap-cuda for GPU SIFT). The [vggt] extra "
@@ -351,6 +357,11 @@ _ENVIRONMENT_MARKERS = (
      "a vendored file uses PEP 604 `X | None` annotations, which need Python 3.10 or newer -- "
      "point --model-python at a newer interpreter"),
     ("ModuleNotFoundError: No module named 'pycolmap'", _PYCOLMAP_HELP),
+    ("No module named 'mapanything'",
+     "the MapAnything checkout is not installed; its exporter lives in scripts/, so Python "
+     'does not put the package beside it on sys.path -- pip install -e "<checkout>[colmap]"'),
+    ("No module named 'uniception'",
+     'MapAnything\'s dependencies are not installed: pip install -e "<checkout>[colmap]"'),
     ("object has no attribute 'id'",
      "the installed pycolmap is newer than the API this exporter is written against "
      "(pycolmap 4.x renamed Image.id); install the version its requirements_demo.txt pins"),
@@ -398,6 +409,22 @@ print({_PROBE_MARKER!r} + json.dumps(report))
 '''
 
 
+def exporter_pythonpath(repo_root: Optional[Path], base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Environment with the checkout importable by the exporter's own imports.
+
+    Python puts the *script's* directory on ``sys.path``, not the working
+    directory, so MapAnything's ``scripts/demo_colmap.py`` cannot see the
+    ``mapanything`` package beside it.  VGGT only works without this because
+    its exporter happens to sit at its repository root.
+    """
+    env = dict(base if base is not None else os.environ)
+    if repo_root is None:
+        return env
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{existing}" if existing else str(repo_root)
+    return env
+
+
 def exporter_pinned_pycolmap(repo_root: Optional[Path], default: str = "3.10.0") -> str:
     """The pycolmap version the checked-out exporter pins for itself.
 
@@ -406,18 +433,24 @@ def exporter_pinned_pycolmap(repo_root: Optional[Path], default: str = "3.10.0")
     """
     if repo_root is None:
         return default
-    for name in ("requirements_demo.txt", "requirements.txt"):
+    # VGGT pins in requirements_demo.txt, MapAnything in its pyproject's
+    # "colmap" extra; both are plain `pycolmap==x.y.z` text.
+    for name in ("requirements_demo.txt", "requirements.txt", "pyproject.toml"):
         try:
             content = (Path(repo_root) / name).read_text()
         except OSError:
             continue
-        match = re.search(r"^pycolmap\s*==\s*([\w.]+)", content, re.MULTILINE)
+        match = re.search(r"pycolmap\s*==\s*([\w.]+)", content)
         if match:
             return match.group(1)
     return default
 
 
-def probe_model_environment(backend: str, model_python: Optional[str] = None) -> Dict:
+def probe_model_environment(
+    backend: str,
+    model_python: Optional[str] = None,
+    repo_root: Optional[Path] = None,
+) -> Dict:
     """Ask the model's interpreter what it actually has, without loading a model.
 
     ``--model-python`` means the exporter may run in a different environment
@@ -429,13 +462,15 @@ def probe_model_environment(backend: str, model_python: Optional[str] = None) ->
     required = _REQUIRED_MODULES.get(backend, ("torch", "numpy", "pycolmap"))
     try:
         result = subprocess.run([executable, "-c", _PROBE_SCRIPT, *required],
-                                text=True, capture_output=True, timeout=300)
+                                text=True, capture_output=True, timeout=300,
+                                env=exporter_pythonpath(repo_root))
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f"could not run {executable} to check the {backend} environment: {exc}")
     for line in reversed(result.stdout.splitlines()):
         if line.startswith(_PROBE_MARKER):
             report = json.loads(line[len(_PROBE_MARKER):])
             report["required"] = list(required)
+            report["repo_root"] = str(repo_root) if repo_root else None
             return report
     raise RuntimeError(
         f"could not read the {backend} environment report from {executable} "
@@ -454,7 +489,7 @@ def require_model_environment(
     and both otherwise surface as an opaque traceback from inside a vendored
     file several minutes into a run.
     """
-    report = probe_model_environment(backend, model_python)
+    report = probe_model_environment(backend, model_python, repo_root)
     version = tuple(report["python"])
     problems = []
     minimum = _MIN_MODEL_PYTHON.get(backend)
@@ -480,6 +515,13 @@ def require_model_environment(
                     f"nothing and only has to load")
         elif name == "pycolmap":
             hint = f'pip install "pycolmap=={pinned}"  ({_PYCOLMAP_HELP})'
+        elif name.startswith(backend + "."):
+            # The checkout is already on PYTHONPATH by here, so this is a real
+            # missing dependency of the project rather than a path problem.
+            extra = "[colmap]" if backend == "mapanything" else ""
+            hint = (f'pip install -e "{report.get("repo_root") or "<checkout>"}{extra}" '
+                    f"-- the official {backend} project and its dependencies, in an environment "
+                    f"of its own (the two backends pin different lightglue forks)")
         problems.append(f"{name} cannot be imported in {report['executable']}: "
                         f"{detail[len('MISSING: '):]}" + (f"\n      Fix: {hint}" if hint else ""))
     api = report.get("pycolmap_exporter_api", "")
@@ -899,7 +941,13 @@ def compare_backends(workdir: Path, backends: Sequence[str]) -> Dict:
     out = workdir / "p3" / "experiments"
     out.mkdir(parents=True, exist_ok=True)
     (out / "compare.json").write_text(json.dumps(report, indent=2))
-    _write_comparison_plot(out / "diag" / "camera_compare.png", models)
+    # The numbers are the deliverable; the plot is a convenience. An exporter
+    # environment need not have matplotlib, and losing the figure must not
+    # discard a comparison that is already written.
+    try:
+        _write_comparison_plot(out / "diag" / "camera_compare.png", models)
+    except ImportError as exc:
+        print(f"  (no comparison plot: {exc}; compare.json is written)")
     return report
 
 
