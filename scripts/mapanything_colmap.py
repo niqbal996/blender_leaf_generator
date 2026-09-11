@@ -27,7 +27,12 @@ import json
 import os
 from pathlib import Path
 
+import sys
+
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mv_fusion  # noqa: E402  - a sibling module, not an installed package
 
 
 def parse_args():
@@ -57,6 +62,20 @@ def parse_args():
                         help="Give the model the intrinsics instead of letting it guess: a COLMAP "
                              "sparse directory, or a JSON of {frame stem: focal in pixels}. "
                              "MapAnything converts them to ray directions internally")
+    parser.add_argument("--poses-from", default=None,
+                        help="Give the model the camera poses too: a COLMAP sparse directory. "
+                             "It then solves geometry on known cameras instead of predicting "
+                             "them, which takes its pose head out of the comparison entirely")
+    parser.add_argument("--use-pose-scale", action="store_true",
+                        help="Trust the translation magnitudes of --poses-from as metric. A "
+                             "COLMAP world is scale-free, so by default only their relative "
+                             "geometry is used and the model keeps its own metric scale")
+    parser.add_argument("--fuse-views", type=int, default=4,
+                        help="Keep only points this many OTHER views corroborate, by their own "
+                             "depth maps. 0 exports every masked pixel, which is upstream's "
+                             "behaviour and leaves the per-view shells superimposed")
+    parser.add_argument("--fuse-tolerance", type=float, default=0.02,
+                        help="Depth agreement band, as a fraction of the point's depth")
     parser.add_argument("--points-from", default="depth", choices=["depth", "pointmap"],
                         help="depth: unproject depth_z through the intrinsics and pose that are "
                              "written to the model, so points reproject where they came from. "
@@ -66,6 +85,47 @@ def parse_args():
                         help="Export voxel size as a fraction of scene extent. Upstream uses "
                              "0.01; a plant's petioles and leaf tips need finer than that")
     return parser.parse_args()
+
+
+def colmap_cam_to_world(source: str, names) -> dict:
+    """Per-frame 4x4 camera-to-world poses from a COLMAP sparse model.
+
+    COLMAP stores world-to-camera; MapAnything wants the inverse, in "any
+    world frame", so no alignment or rescaling is needed -- only the
+    convention flip.
+    """
+    import pycolmap
+
+    reconstruction = pycolmap.Reconstruction(str(Path(source)))
+    poses = {}
+    for image_id in reconstruction.reg_image_ids():
+        image = reconstruction.images[image_id]
+        # A property in pycolmap 3.x, a method in 4.x.
+        pose = image.cam_from_world
+        if callable(pose):
+            pose = pose()
+        world_to_cam = np.eye(4)
+        world_to_cam[:3, :] = np.asarray(pose.matrix(), dtype=float)
+        poses[Path(image.name).stem] = np.linalg.inv(world_to_cam)
+    return poses
+
+
+def check_first_view_has_a_pose(poses: dict, names, source: str) -> None:
+    """MapAnything requires view 0 to have a pose if any view does.
+
+    Partial poses are otherwise fine, which matters because SfM routinely
+    fails to register a frame or two -- but if the one it dropped happens to
+    be the first, the whole pose input has to go.
+    """
+    first = Path(names[0]).stem
+    if first in poses:
+        return
+    raise SystemExit(
+        f"{first} has no pose in {source}, and MapAnything requires the first view to have "
+        f"one if any view does.\n"
+        f"  {len(poses)} of {len(names)} frames are registered there. Re-solve P3 so the first "
+        f"frame registers, or drop --poses-from."
+    )
 
 
 def frame_pixel_intrinsics(source: str, names) -> dict:
@@ -157,6 +217,55 @@ def rebuild_points_from_depth(outputs) -> int:
     return rebuilt
 
 
+def fuse_masks_by_consistency(outputs, min_views: int, tolerance: float):
+    """Drop masked pixels no other view's depth map corroborates.
+
+    A depth error slides a point along the ray it was seen on, so it stays put
+    in its own view's image and is only visible to the others. Upstream's
+    export writes every masked pixel of every view, which superimposes as many
+    slightly-disagreeing shells of the subject as there are views -- on
+    thistle3 the median point was inside the silhouette in 16 of 27 views,
+    against 25 for an export that fuses.
+
+    Implemented as a mask shrink so upstream's own exporter still does the
+    writing: it builds points from `pts3d[mask]`.
+    """
+    import torch
+
+    depths, intrinsics, extrinsics, masks, points = [], [], [], [], []
+    for prediction in outputs:
+        depth = prediction["depth_z"][0].squeeze(-1).float().cpu().numpy()
+        mask = prediction["mask"][0].squeeze(-1).cpu().numpy().astype(bool)
+        cam_to_world = prediction["camera_poses"][0].float().cpu().numpy()
+        world_to_cam = np.linalg.inv(cam_to_world)[:3, :4]
+        depths.append(np.where(mask & (depth > 0), depth, np.nan))
+        masks.append(mask)
+        intrinsics.append(prediction["intrinsics"][0].float().cpu().numpy())
+        extrinsics.append(world_to_cam)
+        points.append(prediction["pts3d"][0].float().cpu().numpy())
+    depths = np.stack(depths); masks = np.stack(masks)
+    intrinsics = np.stack(intrinsics); extrinsics = np.stack(extrinsics)
+
+    before = int(masks.sum())
+    kept = 0
+    for index, prediction in enumerate(outputs):
+        rows, cols = np.nonzero(masks[index])
+        if len(rows) == 0:
+            continue
+        candidates = points[index][rows, cols]
+        agrees = mv_fusion.agreement_matrix(candidates, depths, intrinsics, extrinsics,
+                                            masks, tolerance)
+        agrees[:, index] = False                 # a view cannot corroborate itself
+        survives = agrees.sum(axis=1) >= min_views
+        fused = np.zeros_like(masks[index])
+        fused[rows[survives], cols[survives]] = True
+        kept += int(fused.sum())
+        current = prediction["mask"]
+        keep_t = torch.from_numpy(fused).to(current.device)[None, ..., None]
+        prediction["mask"] = current & keep_t
+    return kept, before
+
+
 def main():
     args = parse_args()
     import torch
@@ -194,6 +303,20 @@ def main():
               + (f" (focal {example:.1f} in the model's {tuple(views[0]['img'].shape[-2:])} frame)"
                  if example else ""))
 
+    if args.poses_from:
+        poses = colmap_cam_to_world(args.poses_from, names)
+        check_first_view_has_a_pose(poses, names, args.poses_from)
+        attached = 0
+        for view, name_ in zip(views, names):
+            pose = poses.get(Path(name_).stem)
+            if pose is None:
+                continue
+            view["camera_poses"] = torch.from_numpy(pose).to(view["img"].dtype)[None]
+            attached += 1
+        print(f"Known poses attached to {attached}/{len(views)} views from {args.poses_from}"
+              + ("" if args.use_pose_scale else "; their scale is ignored (a COLMAP world is "
+                                                "scale-free, so only relative geometry is used)"))
+
     name = "facebook/map-anything-apache" if args.apache else "facebook/map-anything"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = MapAnything.from_pretrained(name).to(device)
@@ -212,6 +335,7 @@ def main():
             apply_confidence_mask=not args.no_confidence_mask,
             confidence_percentile=args.confidence_percentile,
             use_multiview_confidence=not args.no_multiview_confidence,
+            ignore_pose_scale_inputs=not args.use_pose_scale,
         )
     print("Inference complete")
 
@@ -244,6 +368,11 @@ def main():
             dropped += before - int(prediction["mask"].sum())
         print(f"P2 plant masks applied: kept {kept} pixels, dropped {dropped} outside the plant")
 
+    if args.fuse_views > 0:
+        kept, before = fuse_masks_by_consistency(outputs, args.fuse_views, args.fuse_tolerance)
+        print(f"Multi-view fusion: kept {kept} of {before} masked pixels "
+              f"({kept / max(before, 1):.1%}) corroborated by >= {args.fuse_views} other views")
+
     from mapanything.utils.colmap_export import export_predictions_to_colmap
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -259,6 +388,10 @@ def main():
         "plant_masks_applied": bool(args.plant_masks),
         "points_from": args.points_from,
         "intrinsics_from": args.intrinsics_from,
+        "poses_from": args.poses_from,
+        "pose_scale_used": args.use_pose_scale,
+        "fuse_views": args.fuse_views,
+        "fuse_tolerance": args.fuse_tolerance,
     }, indent=2))
     print(f"Wrote {args.output_dir}")
 

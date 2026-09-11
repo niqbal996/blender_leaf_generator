@@ -153,3 +153,118 @@ def test_intrinsics_sources_resolve_to_real_files(tmp_path):
     assert resolve_intrinsics_source(tmp_path, "exif").endswith("p1/intrinsics.json")
     with _pytest.raises(FileNotFoundError):
         resolve_intrinsics_source(tmp_path, "/nope/missing.json")
+
+
+def _two_view_outputs(height=16, width=20, disagree=0.0, radius=0.5):
+    """Two views of one sphere, so both depth maps describe the same surface.
+
+    Two planes at constant depth would not do: they meet only along a line, so
+    even perfect cameras would agree nowhere. `disagree` slides view 1's depth
+    along its own rays, which leaves its points where they were in its own
+    image and is therefore invisible to it -- only the other view can notice.
+    """
+    focal = 25.0
+    K = torch.tensor([[focal, 0.0, width / 2], [0.0, focal, height / 2], [0.0, 0.0, 1.0]])
+    outputs = []
+    for index, angle in enumerate((0.0, 0.35)):
+        rotation = np.array([[np.cos(angle), 0.0, np.sin(angle)],
+                             [0.0, 1.0, 0.0],
+                             [-np.sin(angle), 0.0, np.cos(angle)]])
+        # centre = -1.5 * forward, so both cameras actually look at the sphere.
+        centre = np.array([-1.5 * np.sin(angle), 0.0, -1.5 * np.cos(angle)])
+        vs, us = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+        rays = np.stack([(us - width / 2) / focal, (vs - height / 2) / focal,
+                         np.ones_like(us, dtype=float)], axis=-1)
+        world_rays = rays @ rotation.T
+        # |centre + s * ray| = radius, nearest root; depth_z is s because the
+        # ray's camera-frame z component is 1.
+        a = (world_rays ** 2).sum(-1)
+        b = 2 * (world_rays * centre).sum(-1)
+        c = float(centre @ centre) - radius ** 2
+        disc = b ** 2 - 4 * a * c
+        s = np.where(disc > 0, (-b - np.sqrt(np.maximum(disc, 0))) / (2 * a), np.nan)
+        depth = s + (disagree if index else 0.0)
+        hit = np.isfinite(depth) & (depth > 0)
+
+        cam_to_world = torch.eye(4)
+        cam_to_world[:3, :3] = torch.from_numpy(rotation).float()
+        cam_to_world[:3, 3] = torch.from_numpy(centre).float()
+        outputs.append({
+            "depth_z": torch.from_numpy(np.nan_to_num(depth, nan=0.0)).float()[None, ..., None],
+            "intrinsics": K[None],
+            "camera_poses": cam_to_world,
+            "pts3d": torch.zeros(1, height, width, 3),
+            "mask": torch.from_numpy(hit)[None, ..., None],
+        })
+        outputs[-1]["camera_poses"] = cam_to_world[None]
+    exporter.rebuild_points_from_depth(outputs)
+    return outputs
+
+
+def test_fusion_keeps_pixels_the_other_view_corroborates():
+    outputs = _two_view_outputs()
+    kept, before = exporter.fuse_masks_by_consistency(outputs, min_views=1, tolerance=0.02)
+    assert before > 0
+    assert kept > 0.5 * before          # the sphere is seen by both views
+
+
+def test_fusion_drops_pixels_when_the_views_disagree_about_depth():
+    """The failure this exists for: shells that each look right alone."""
+    agreeing = exporter.fuse_masks_by_consistency(_two_view_outputs(), 1, 0.02)[0]
+    disagreeing = exporter.fuse_masks_by_consistency(
+        _two_view_outputs(disagree=0.5), 1, 0.02)[0]
+    assert disagreeing == 0
+    assert agreeing > 0
+
+
+def test_fusion_only_shrinks_the_mask_so_upstream_still_does_the_export():
+    outputs = _two_view_outputs()
+    original = [prediction["mask"].clone() for prediction in outputs]
+    exporter.fuse_masks_by_consistency(outputs, min_views=1, tolerance=0.02)
+    for prediction, before in zip(outputs, original):
+        assert prediction["mask"].shape == before.shape
+        # A mask may only lose pixels, never gain them.
+        assert not (prediction["mask"] & ~before).any()
+
+
+def _colmap_text_model(tmp_path, poses):
+    """A minimal COLMAP text model with the given (name, qvec, tvec) images."""
+    model = tmp_path / "sparse"
+    model.mkdir(parents=True, exist_ok=True)
+    (model / "cameras.txt").write_text("1 PINHOLE 64 48 50 50 32 24\n")
+    lines = []
+    for index, (name, q, t) in enumerate(poses, start=1):
+        lines.append(f"{index} {q[0]} {q[1]} {q[2]} {q[3]} {t[0]} {t[1]} {t[2]} 1 {name}\n\n")
+    (model / "images.txt").write_text("".join(lines))
+    (model / "points3D.txt").write_text("1 0 0 1 128 128 128 0\n")
+    return model
+
+
+def test_colmap_poses_are_inverted_into_camera_to_world():
+    """COLMAP stores world-to-camera; MapAnything wants the inverse."""
+    pytest.importorskip("pycolmap")
+    import tempfile
+
+    tmp_path = Path(tempfile.mkdtemp())
+    # Identity rotation, camera at world (0, 0, -3): world2cam translation is
+    # -R @ C = (0, 0, 3).
+    model = _colmap_text_model(tmp_path, [("frame_0000.jpg", (1, 0, 0, 0), (0, 0, 3))])
+
+    poses = exporter.colmap_cam_to_world(str(model), ["frame_0000.jpg"])
+    cam_to_world = poses["frame_0000"]
+    assert cam_to_world.shape == (4, 4)
+    np.testing.assert_allclose(cam_to_world[:3, 3], [0, 0, -3], atol=1e-9)
+    np.testing.assert_allclose(cam_to_world[:3, :3], np.eye(3), atol=1e-9)
+
+
+def test_a_missing_first_pose_is_refused_with_the_reason():
+    """Partial poses are fine, except for the one view the model insists on."""
+    names = ["frame_0000.jpg", "frame_0001.jpg"]
+    exporter.check_first_view_has_a_pose({"frame_0000": np.eye(4)}, names, "somewhere")
+
+    with pytest.raises(SystemExit) as failure:
+        exporter.check_first_view_has_a_pose({"frame_0001": np.eye(4)}, names, "somewhere")
+    message = str(failure.value)
+    assert "frame_0000" in message
+    assert "1 of 2 frames" in message
+    assert "--poses-from" in message

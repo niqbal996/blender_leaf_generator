@@ -39,6 +39,9 @@ from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mv_fusion  # noqa: E402  - a sibling module, not an installed package
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -170,34 +173,19 @@ def fuse_by_consistency(points, depths, intrinsics, extrinsics, masks,
             rows, cols = rows[pick], cols[pick]
         candidates = points[index][rows, cols]
 
-        agreements = np.zeros(len(candidates), dtype=np.int32)
-        observations = [[(index, int(c), int(r))] for c, r in zip(cols, rows)]
-        for other in range(num_views):
-            if other == index:
-                continue
-            rotation, translation = extrinsics[other][:3, :3], extrinsics[other][:3, 3]
-            camera_points = candidates @ rotation.T + translation
-            z = camera_points[:, 2]
-            in_front = z > 1e-6
-            safe = np.where(in_front, z, 1.0)
-            u = camera_points[:, 0] / safe * intrinsics[other][0, 0] + intrinsics[other][0, 2]
-            v = camera_points[:, 1] / safe * intrinsics[other][1, 1] + intrinsics[other][1, 2]
-            ui = np.round(u).astype(np.int64)
-            vi = np.round(v).astype(np.int64)
-            inside = in_front & (ui >= 0) & (ui < width) & (vi >= 0) & (vi < height)
-            ui_c, vi_c = np.clip(ui, 0, width - 1), np.clip(vi, 0, height - 1)
-            observed = depths[other][vi_c, ui_c]
-            if masks is not None:
-                inside &= masks[other][vi_c, ui_c]
-            close = inside & np.isfinite(observed) & (np.abs(observed - z) <= tolerance * np.maximum(z, 1e-9))
-            agreements += close
-            for position in np.nonzero(close)[0]:
-                observations[position].append((other, int(ui_c[position]), int(vi_c[position])))
-
-        survivors = np.nonzero(agreements >= min_views)[0]
+        agrees = mv_fusion.agreement_matrix(candidates, depths, intrinsics, extrinsics,
+                                            masks, tolerance)
+        agrees[:, index] = False              # a view cannot corroborate itself
+        survivors = np.nonzero(agrees.sum(axis=1) >= min_views)[0]
         for position in survivors:
+            track = [(index, int(cols[position]), int(rows[position]))]
+            for other in np.nonzero(agrees[position])[0]:
+                u, v, _ = mv_fusion.reprojected_pixels(
+                    candidates[position][None], intrinsics[other], extrinsics[other],
+                    (height, width))
+                track.append((int(other), int(u[0]), int(v[0])))
             kept_xyz.append(candidates[position])
-            kept_tracks.append(observations[position])
+            kept_tracks.append(track)
     if not kept_xyz:
         return np.zeros((0, 3)), []
     return np.asarray(kept_xyz), kept_tracks

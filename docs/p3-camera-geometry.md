@@ -146,6 +146,14 @@ exporter with them exposed, reusing upstream's own
 * `use_multiview_confidence` — off upstream; on here, which replaces learned
   per-pixel confidence with confidence derived from *agreement between views*.
   A point no other view corroborates is what a noisy cloud is made of.
+* `--fuse-views` (default 4) drops masked pixels that no other view's depth
+  map corroborates — the same criterion the VGGT-Omega exporter uses, shared
+  in `scripts/mv_fusion.py`. Upstream exports every masked pixel of every
+  view, which superimposes as many slightly-disagreeing shells of the plant as
+  there are views. Measured on `thistle3`: the median MapAnything point sat
+  inside the silhouette in 16 of 27 views and only 0.9% reached 25, against a
+  median of 25 and 53.6% for `vggt_omega`. `--fuse-views 0` restores
+  upstream's behaviour.
 * `--plant-masks` intersects the P2 silhouette into the prediction mask, so
   background geometry is never exported.
 * `--voxel-fraction` defaults to 0.002 rather than upstream's 0.01: a plant's
@@ -196,6 +204,32 @@ points reproject where they came from.
 
 For contrast, `vggt_omega` predicts 2,872 against COLMAP's 3,020 — within 5%,
 and it needs no help.
+
+**Giving it the poses as well** turns it into a depth-and-geometry engine on
+known cameras, which takes its pose head out of the question entirely:
+
+```bash
+pose-geometry --workdir <workdir> --backends mapanything \
+    --intrinsics-from exif --poses-from colmap
+```
+
+Its world frame may be anything, so COLMAP's is passed through unchanged — no
+alignment step. Two details the model imposes:
+
+* A COLMAP world is **scale-free**, so only the relative geometry of the poses
+  is used and the model keeps its own metric scale. `--use-pose-scale` trusts
+  the translation magnitudes instead, which is only meaningful if the poses
+  are metric to begin with.
+* **View 0 must have a pose if any view does.** Partial poses are otherwise
+  fine, which matters because SfM routinely drops a frame — on `thistle3`'s
+  two-pass solve, 26 of 27 frames have poses and the missing one is
+  `frame_0022`, so this is satisfied. If the frame it dropped had been the
+  first, the whole pose input would have to go, and the exporter says so
+  rather than failing inside the model.
+
+This makes the result a COLMAP-conditioned reconstruction rather than an
+independent method, which is the right experiment for "is MapAnything's
+*geometry* good" and the wrong one for "is MapAnything better than COLMAP".
 
 ## Environments
 

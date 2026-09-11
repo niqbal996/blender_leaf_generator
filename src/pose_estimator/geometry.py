@@ -142,6 +142,7 @@ def run_learned_backend(
     checkpoint: Optional[str] = None,
     use_plant_masks: bool = True,
     intrinsics_from: Optional[str] = None,
+    poses_from: Optional[str] = None,
 ) -> Dict:
     """Run an official exporter and standardize its output under P3.
 
@@ -222,6 +223,8 @@ def run_learned_backend(
         source = resolve_intrinsics_source(workdir, intrinsics_from)
         if source:
             command.append(f"--intrinsics-from={source}")
+        if poses_from:
+            command.append(f"--poses-from={resolve_intrinsics_source(workdir, poses_from)}")
 
     if not dry_run and not script.is_file():
         raise FileNotFoundError(f"official {backend} exporter not found at {script}")
@@ -246,6 +249,7 @@ def run_learned_backend(
         "exporter": "this project" if backend in _OUR_EXPORTERS else "upstream",
         "plant_masks": masks_argument, "image_resolution": image_resolution,
         "bundle_adjust": bundle_adjust, "intrinsics_from": intrinsics_from,
+        "poses_from": poses_from,
     }, indent=2))
     if dry_run:
         return {"backend": backend, "command": command, "staged_images": len(staged), "dry_run": True}
@@ -789,8 +793,13 @@ def report_run_environment(
     others = [proc for proc in (read_gpu_processes() or ()) if proc["pid"] != os.getpid()]
     snapshot = {"num_images": num_images, "bundle_adjust": bundle_adjust, "host": host, "gpus": gpus,
                 "other_gpu_processes": others}
+    # MapAnything's exporter has no bundle-adjustment stage, so saying it is on
+    # would be a lie the log carries for the rest of the run.
+    adjusts = bundle_adjust and backend in ("vggt", "vggt_omega")
     print(f"  {backend}: {num_images} masked frames"
-          f"{', bundle adjustment on' if bundle_adjust else ''}; live log {log_path}")
+          f"{', bundle adjustment on' if adjusts else ''}"
+          f"{', --bundle-adjust ignored (this exporter has no BA stage)' if bundle_adjust and not adjusts else ''}"
+          f"; live log {log_path}")
     if host:
         print(f"  host RAM: {host['available_gb']:.1f} GB available of {host['total_gb']:.1f} GB")
     for gpu in gpus or ():

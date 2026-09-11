@@ -39,7 +39,9 @@ def test_every_pose_command_exists():
     # rather than run, so they count as declared for this purpose.
     declared = set(project["scripts"]) | set(project.get("optional-dependencies", {}))
 
-    mentioned = set(re.findall(r"\bpose-[a-z0-9-]+", README))
+    # Not preceded by a hyphen: `--use-pose-scale` is a flag of an exporter,
+    # not a console script called `pose-scale`.
+    mentioned = set(re.findall(r"(?<!-)\bpose-[a-z0-9-]+", README))
     # Hyphenated CLI flags of the exporters are not console scripts.
     mentioned -= {"pose-enc"}
     # `pose-estimator` is the env/package name, not a command.

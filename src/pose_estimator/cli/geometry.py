@@ -44,6 +44,7 @@ def run(
     omega_checkpoint: Optional[str] = None,
     no_plant_masks: bool = False,
     intrinsics_from: Optional[str] = None,
+    poses_from: Optional[str] = None,
 ) -> dict:
     require_sparse_model(workdir, "colmap")
     selected = list(dict.fromkeys(backends))
@@ -67,7 +68,8 @@ def run(
                                      image_resolution=image_resolution,
                                      checkpoint=omega_checkpoint if backend == "vggt_omega" else None,
                                      use_plant_masks=not no_plant_masks,
-                                     intrinsics_from=intrinsics_from)
+                                     intrinsics_from=intrinsics_from,
+                                     poses_from=poses_from)
         if dry_run:
             print("  would run: " + " ".join(report["command"]))
         else:
@@ -130,6 +132,12 @@ def main(argv: Optional[list] = None) -> None:
                              "P3 baseline, which is more accurate but makes the result a "
                              "COLMAP-calibrated one. On thistle3 it predicts a focal of 1718 "
                              "where the truth is near 3000")
+    parser.add_argument("--poses-from", metavar="colmap|PATH",
+                        help="Also give MapAnything the camera poses, so it solves geometry on "
+                             "known cameras instead of predicting them. Its world frame may be "
+                             "anything, so COLMAP's is used as-is; only the relative geometry is "
+                             "taken, since a COLMAP world is scale-free. This makes the result "
+                             "a COLMAP-conditioned reconstruction, not an independent one")
     parser.add_argument("--no-plant-masks", action="store_true",
                         help="Do not tell the exporters which pixels P2 called plant")
     parser.add_argument("--mapanything-python",
@@ -162,7 +170,8 @@ def main(argv: Optional[list] = None) -> None:
         auto_fetch_code=not args.no_auto_fetch_code, dry_run=args.dry_run,
         heartbeat_seconds=args.heartbeat_seconds, skip_env_check=args.skip_env_check,
         image_resolution=args.image_resolution, omega_checkpoint=args.omega_checkpoint,
-        no_plant_masks=args.no_plant_masks, intrinsics_from=args.intrinsics_from)
+        no_plant_masks=args.no_plant_masks, intrinsics_from=args.intrinsics_from,
+        poses_from=args.poses_from)
 
 
 if __name__ == "__main__":
