@@ -27,6 +27,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from pose_estimator.checkpoints import resolve_checkpoint
 from pose_estimator.classify2d import load_class_map, read_manifest
 from pose_estimator.ply_io import read_ply_vertices, write_ply_vertices
 from pose_estimator.semantic import camera_from_colmap, render_points
@@ -242,8 +243,10 @@ def main(argv: Optional[list] = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workdir", required=True, type=Path)
-    parser.add_argument("--checkpoint", type=Path,
-                        default=Path("checkpoints/sam2.1_hiera_large.pt"))
+    parser.add_argument("--checkpoint", type=Path, default=None,
+                        help="SAM2 checkpoint, a file or the directory holding it. "
+                             "Defaults to $SAM2_CHECKPOINT / $SAM_CHECKPOINT_DIR / "
+                             "<repo>/checkpoints/.")
     parser.add_argument("--stride", type=int, default=4,
                         help="use every Nth registered view. A tip needs enough "
                              "directions to out-vote the views that disagree, not all of them")
@@ -261,7 +264,7 @@ def main(argv: Optional[list] = None) -> None:
                         help="SAM2 sampling density; higher finds smaller blades, slower")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
-    run(workdir=args.workdir, checkpoint=args.checkpoint, stride=args.stride,
+    run(workdir=args.workdir, checkpoint=resolve_checkpoint(args.checkpoint), stride=args.stride,
         min_votes=args.min_votes, min_hit_rate=args.min_hit_rate,
         cluster_voxels=args.cluster_voxels,
         points_per_side=args.points_per_side, device=args.device)

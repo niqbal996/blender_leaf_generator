@@ -581,6 +581,30 @@ mkdir -p checkpoints && wget -P checkpoints \
   https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
 ```
 
+`pip install -e ".[pose-all]"` deliberately does **not** install SAM2 -- the
+`sam2` name on PyPI is an unrelated upload -- so the two lines above are
+required on every new machine, and `./setup_env.sh` runs them for you.
+
+**Putting the weights somewhere else.** The checkpoint is ~900 MB, which a
+repo checkout under a disk quota has no room for. Either variable moves it,
+and both are read by `run_pipeline.sh`, `setup_env.sh` and the `pose-*` CLIs
+alike:
+
+```bash
+export SAM_CHECKPOINT_DIR=/netscratch/you/checkpoints   # all weights, one place
+export SAM2_CHECKPOINT=/netscratch/you/checkpoints      # just SAM2: a directory
+export SAM2_CHECKPOINT=/netscratch/you/ckpt/sam2.1_hiera_large.pt   # or the file
+
+./setup_env.sh --checkpoint-only                    # downloads to whichever is set
+./setup_env.sh --checkpoint-dir /netscratch/you/checkpoints   # same, as a flag
+```
+
+The search order is `$SAM2_CHECKPOINT`, `$SAM_CHECKPOINT_DIR`,
+`<repo>/checkpoints/`, `<repo>/third_party/sam2/checkpoints/`,
+`~/.cache/sam2/`; `--sam-checkpoint` on `run_pipeline.sh` overrides all of
+them and also takes a directory. If none of them has the file, the error
+lists every path it tried.
+
 DINOv3 is gated on HuggingFace: accept the licence at
 [facebook/dinov3-vitb16-pretrain-lvd1689m](https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m),
 then `export HF_TOKEN=hf_xxx`. Without a token use
@@ -1216,8 +1240,7 @@ For a batch of specimens there are two ways to avoid per-plant clicking:
 
 ```bash
 # no seeds at all -- SAM2 masks sorted by shape. Leaf/stem only, no root.
-pose-classify --workdir runs/plant_N/ --backend sam \
-    --checkpoint checkpoints/sam2.1_hiera_large.pt
+pose-classify --workdir runs/plant_N/ --backend sam
 
 # or click once, reuse the vectors everywhere
 pose-classify --workdir runs/plant_1/ --seeds-file runs/plant_1/p4c/seeds.json
@@ -1232,6 +1255,69 @@ sensibly. If it drifts, pool seeds from those few plants into one bank.
 Requires a display. WSLg on Windows 11 provides one; without it, fall back to
 the printed coordinate grid (`scripts/dinov3_organ_lab.py --mode reference`)
 and pass `--seeds "leaf:x,y" ... --seed-frame N` by hand.
+
+### SAM3: tracking leaf identity across frames (experimental)
+
+Not part of P1-P6, and not installed by `pose-all`. This is the experiment
+that would replace a hard part of the pipeline if it works.
+
+Every organ tool above segments one frame at a time, which leaves the same
+leaf as an unrelated mask in each of the 27 views, and associating those
+masks across viewpoints is the step that has never worked reliably here --
+it is why leaf correspondence is currently recovered in 3D (P4c/P5) rather
+than in 2D. SAM3's Promptable Concept Segmentation does the association
+inside the model: given the noun phrase `leaf`, it detects *every* matching
+instance and carries a stable id for each one across the sequence.
+
+```bash
+pip install -e ".[sam3]"          # or: ./setup_env.sh --with-sam3
+# gated weights: accept https://huggingface.co/facebook/sam3, then `hf auth login`
+
+# one capture pass at a time -- see below
+python scripts/sam3_leaf_track.py --images runs/plant_9/p1/frames \
+    --plant-mask-dir runs/plant_9/p2/masks/plant --out /tmp/sam3_leaves
+```
+
+It writes `frame_*.jpg` (one stable colour and number per tracked instance),
+`tracks.json`, and a table whose bottom line is the measurement:
+
+```
+'leaf': 14 tracks over 27 frames
+    -- 6/14 hold their id for all 27 frames; median track length 19
+    -- 3 appear after frame 0, 5 have gaps
+```
+
+Four things decide whether those numbers mean anything:
+
+* **One pass per run.** Frames from two passes in one directory are
+  discontinuous at the join and the tracker reads the jump as motion. Use
+  `--frames 0-26` to isolate a pass.
+* **Crop, always.** The plant is a few percent of the frame and SAM3 works at
+  1008 px, so uncropped there is nothing to segment. `--plant-mask-dir`
+  reuses P2's masks; without it the colour prepass guesses, less well.
+* **A broken track is not automatically a failure.** This is a still subject
+  and a moving camera, so a leaf goes edge-on and genuinely vanishes. What
+  matters is whether it comes back under the *same* id -- which is what the
+  gap count measures, and why the overlays use a fixed colour per id: a leaf
+  that changes colour mid-sequence is an identity switch.
+* **Text prompts only.** SAM3 accepts image exemplars too, but the video
+  concept API in transformers takes noun phrases; per-instance visual
+  prompting ("track *this* leaf") is the separate `Sam3Tracker*` models,
+  which follow one prompted object instead of detecting all of a concept.
+
+Two install caveats, both deliberate:
+
+* SAM3's video classes need **transformers 5.0**, a major version this
+  repo's DINOv3 path (P4c) has not been tested against. Installing this into
+  a working pipeline env upgrades transformers underneath it. A separate env
+  is the safe way to try it.
+* The official checkout (`git clone https://github.com/facebookresearch/sam3
+  third_party/sam3 && pip install -e third_party/sam3`) is *not* what this
+  uses: it requires Python 3.12+ and torch 2.7+, while `setup_env.sh` builds
+  a 3.10 env. The transformers port runs the same `facebook/sam3` weights.
+
+`scripts/text_organ_lab.py --backend sam3` is the per-frame counterpart, for
+comparing prompt wording against Grounding DINO + SAM2 on single frames.
 
 ### The one thing to know about this rig
 

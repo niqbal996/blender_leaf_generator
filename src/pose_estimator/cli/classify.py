@@ -39,6 +39,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from pose_estimator.checkpoints import resolve_checkpoint
 from pose_estimator.classify2d import (
     DinoClassifier,
     SamClassifier,
@@ -209,8 +210,9 @@ def run(
                                            hf_token, device, seeds_file)
         settings = {"model": dino_model, "size": dino_size, "stride": stride}
     elif backend == "sam":
-        if checkpoint is None:
-            raise SystemExit("--backend sam needs --checkpoint <sam2 checkpoint>")
+        # Falls back to the usual search rather than demanding --checkpoint:
+        # the weights are the same ones P2 already found.
+        checkpoint = resolve_checkpoint(checkpoint)
         print(f"Loading SAM2 from {checkpoint} ...")
         classifier = SamClassifier(checkpoint, device=device)
         settings = {"checkpoint": str(checkpoint), "stride": stride}
@@ -310,7 +312,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hf-token", default=None,
                         help="HuggingFace token for gated models (or set HF_TOKEN)")
     parser.add_argument("--checkpoint", type=Path,
-                        help="(sam) SAM2 checkpoint, e.g. checkpoints/sam2.1_hiera_large.pt")
+                        help="(sam) SAM2 checkpoint, a file or the directory holding it. "
+                             "Defaults to $SAM2_CHECKPOINT / $SAM_CHECKPOINT_DIR / "
+                             "<repo>/checkpoints/.")
     parser.add_argument("--stride", type=int, default=1, help="classify every Nth frame")
     parser.add_argument("--device", default="cuda")
 

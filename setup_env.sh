@@ -8,6 +8,11 @@
 #   ./setup_env.sh --cpu           # no GPU: CPU torch, CPU pycolmap, no gsplat
 #   ./setup_env.sh --check         # detect and report only, install nothing
 #   ./setup_env.sh --checkpoint-only  # just fetch the SAM2 weights
+#   ./setup_env.sh --with-sam3     # also install SAM3 (experimental, see below)
+#   ./setup_env.sh --checkpoint-dir /big/disk/checkpoints   # weights off this disk
+#                                  # (or export SAM_CHECKPOINT_DIR, which run_pipeline.sh
+#                                  #  reads too -- a repo under a disk quota has no room
+#                                  #  for a 900 MB checkpoint)
 #
 # Safe to re-run: every step is idempotent, so it doubles as a repair tool.
 #
@@ -28,6 +33,7 @@ CUDA_TAG=""
 MODE="gpu"
 CHECK_ONLY=0
 CKPT_ONLY=0
+WITH_SAM3=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --name)  ENV_NAME="$2"; shift 2 ;;
@@ -35,13 +41,21 @@ while [[ $# -gt 0 ]]; do
         --cpu)   MODE="cpu"; shift ;;
         --check) CHECK_ONLY=1; shift ;;
         --checkpoint-only) CKPT_ONLY=1; shift ;;
-        -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+        --checkpoint-dir) SAM_CHECKPOINT_DIR="$2"; export SAM_CHECKPOINT_DIR; shift 2 ;;
+        --with-sam3) WITH_SAM3=1; shift ;;
+        # 2..the last comment line, so adding to the header above cannot
+        # silently truncate --help the way a fixed range did.
+        -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
+# Shared with run_pipeline.sh: the directory this downloads into has to be
+# one that the pipeline's search actually looks in.
+# shellcheck source=scripts/sam_checkpoints.sh
+source "$REPO_ROOT/scripts/sam_checkpoints.sh"
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m    WARNING: %s\033[0m\n' "$*"; }
 die() { printf '\033[31m    ERROR: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -146,14 +160,18 @@ fi
 # so a fresh clone has nothing for P2 to load. Fetched here into a location
 # run_pipeline.sh already searches.
 fetch_checkpoint() {
-    local name="sam2.1_hiera_large.pt"
-    local dest="$REPO_ROOT/checkpoints/$name"
-    local url="https://dl.fbaipublicfiles.com/segment_anything_2/092824/$name"
-    if [[ -f "$dest" ]]; then
-        echo "    already present: $dest ($(du -h "$dest" | cut -f1))"
+    local name="$SAM2_CHECKPOINT_NAME"
+    local url="$SAM2_CHECKPOINT_URL"
+    local existing
+    # Anywhere the pipeline would find it counts as present, so relocating
+    # the weights does not trigger a second 900 MB download into the repo.
+    if existing="$(find_sam_checkpoint "$name")"; then
+        echo "    already present: $existing ($(du -h "$existing" | cut -f1))"
         return 0
     fi
-    mkdir -p "$REPO_ROOT/checkpoints"
+    local dir; dir="$(sam_checkpoint_dir)"
+    local dest="$dir/$name"
+    mkdir -p "$dir"
     echo "    downloading $name (~857 MiB) -> $dest"
     # -C - resumes a partial file; downloading to .part first means an
     # interrupted run never leaves a truncated checkpoint that loads and
@@ -337,6 +355,23 @@ else
 fi
 "$PY" -m pip install -e third_party/sam2
 
+# ---------------------------------------------------------------- sam3
+# Off by default and warned about, not because SAM3 is unready but because
+# installing it changes this environment underneath the pipeline: its video
+# classes need transformers 5.0, a major version P4c's DINOv3 path has not
+# been tested against. The safe way to try it is a second env.
+if [[ "$WITH_SAM3" -eq 1 ]]; then
+    say "Installing SAM3 (experimental -- scripts/sam3_leaf_track.py)"
+    CURRENT_TF="$("$PY" -c 'import transformers; print(transformers.__version__)' 2>/dev/null || echo none)"
+    echo "    transformers now: $CURRENT_TF -> >=5.0"
+    if [[ "$CURRENT_TF" != none && "$CURRENT_TF" != 5.* ]]; then
+        warn "this upgrades transformers in '$ENV_NAME', which P4c also uses."
+        warn "if P4c starts failing, that is where to look -- or use a separate env."
+    fi
+    "$PY" -m pip install -e ".[sam3]"
+    echo "    weights are gated: accept https://huggingface.co/facebook/sam3, then 'hf auth login'"
+fi
+
 say "Fetching SAM2 checkpoint"
 fetch_checkpoint
 
@@ -409,9 +444,11 @@ if [[ $STATUS -ne 0 ]]; then
     exit 1
 fi
 
-CKPT="$REPO_ROOT/checkpoints/sam2.1_hiera_large.pt"
-[[ -f "$CKPT" ]] && echo "    [ok]   sam2 weights    $(du -h "$CKPT" | cut -f1)" \
-                 || warn "SAM2 checkpoint missing -- run ./setup_env.sh --checkpoint-only"
+if CKPT="$(find_sam_checkpoint)"; then
+    echo "    [ok]   sam2 weights    $(du -h "$CKPT" | cut -f1)  $CKPT"
+else
+    warn "SAM2 checkpoint missing -- run ./setup_env.sh --checkpoint-only"
+fi
 
 say "Done. Activate with:  conda activate $ENV_NAME"
 cat <<'NOTE'

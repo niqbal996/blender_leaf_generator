@@ -607,3 +607,43 @@ def test_multi_pass_captures_are_scored_with_their_pass_map(tmp_path):
     assert read_capture_passes(tmp_path) is None            # single pass: one circle is right
     (tmp_path / "p1" / "sources.json").write_text('{"frame_0000": 0, "frame_0001": 1}')
     assert read_capture_passes(tmp_path) == {"frame_0000": 0, "frame_0001": 1}
+
+
+def test_a_model_exported_at_the_models_own_resolution_is_mapped_to_frame_pixels(tmp_path):
+    """MapAnything writes 518x336 for a 3:2 frame; masks are 1920x1280.
+
+    Unmapped, every point projects into the top-left corner of the mask and
+    scores exactly 0.000 in-silhouette -- which reads as a broken model
+    rather than the units bug it is.
+    """
+    import pytest
+
+    pytest.importorskip("pycolmap")
+    from pose_estimator.geometry import rescale_model_to_frames
+
+    model = tmp_path / "sparse" / "best"
+    model.mkdir(parents=True)
+    # Scale is max(518/1920, 336/1280) = 0.26979, so the resized height is
+    # 345 and 4.5px is cropped from top and bottom.
+    (model / "cameras.txt").write_text("1 PINHOLE 518 336 466.29 466.97 259.0 168.0\n")
+    (model / "images.txt").write_text("1 1 0 0 0 0 0 0 1 frame_0000.jpg\n\n")
+    (model / "points3D.txt").write_text("1 0 0 1 128 128 128 0\n")
+
+    result = rescale_model_to_frames(model, (1920, 1280))
+    assert result["crop_px"] == [0.0, 4.5]
+
+    import numpy as np
+    import pycolmap
+
+    camera = list(pycolmap.Reconstruction(str(model)).cameras.values())[0]
+    assert (camera.width, camera.height) == (1920, 1280)
+    scale = 518 / 1920
+    np.testing.assert_allclose(camera.params[0], 466.29 / scale, rtol=1e-6)
+    # The principal point lands at the frame centre, which is the check that
+    # the crop was undone rather than merely the scale.
+    np.testing.assert_allclose(camera.params[2], 259.0 / scale, rtol=1e-6)
+    np.testing.assert_allclose(camera.params[3], (168.0 + 4.5) / scale, rtol=1e-6)
+    assert abs(camera.params[2] - 960) < 1.0 and abs(camera.params[3] - 640) < 1.0
+
+    # Idempotent: a model already at frame resolution is left untouched.
+    assert rescale_model_to_frames(model, (1920, 1280)) is None

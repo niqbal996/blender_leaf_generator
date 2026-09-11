@@ -1595,3 +1595,73 @@ constructed models; layer 2's premise -- that reloading via `input_path` resets
 the per-image attempt counters -- follows from COLMAP building a fresh mapper,
 but has not been measured here. The first handheld top-down capture is the test,
 and the printed before/after count is what settles it.
+
+---
+
+## 2026-09-11 — Checkpoint location is configurable, and resolved in one place
+
+**Decision:** `$SAM2_CHECKPOINT` accepts a **directory as well as a file**,
+`$SAM_CHECKPOINT_DIR` names one directory for every checkpoint, and the search
+order lives in `scripts/sam_checkpoints.sh` (bash) and
+`pose_estimator.checkpoints` (Python) rather than being written out at each
+call site.
+
+**Why:** a remote machine put the repo on a quota'd disk with no room for a
+900 MB file, so the weights were moved to `/netscratch/...` and
+`SAM2_CHECKPOINT` set to that directory. The run still failed. The search
+tested every candidate with `-f`, a directory fails that test, so the value
+was skipped *without comment* and the error then named the repo path it had
+fallen back to — the one place the user already knew the weights were not.
+Pointing the variable at the directory the file was moved to is the obvious
+reading, so it is now the supported one; a path that does not exist yet is
+read as a file when it ends in `.pt` and a directory otherwise.
+
+The other half was `setup_env.sh` hardcoding `$REPO_ROOT/checkpoints` as the
+download target: fetching into a directory nothing searches fails the same
+way from the opposite end. Both now source the same resolver, and
+`--checkpoint-dir` sets it from the command line.
+
+Two consequences worth noting: `--sam-checkpoint` now applies to P1+P2, not
+just P4c (it was silently ignored by the earlier phase), and the failure
+message lists every path actually tried, flagging any that is a directory.
+
+**Evidence:** `tests/test_sam_checkpoint_resolution.py` (10 tests). The last
+of them is the one that matters — the bash and Python copies must resolve the
+same case identically, and two copies of a rule are exactly what drifted here.
+
+---
+
+## 2026-09-11 — SAM3 evaluated for leaf identity, kept out of the pipeline
+
+**Decision:** added `scripts/sam3_leaf_track.py` and a `sam3` extra. Neither is
+part of P1-P6, and `pose-all` does not install them.
+
+**Why try it:** every organ tool here segments one frame at a time, so the same
+leaf is an unrelated mask in each of 27 views. Associating those across
+viewpoints is the step that has never worked reliably, and the reason leaf
+correspondence is recovered in 3D instead. SAM3's Promptable Concept
+Segmentation returns masks *and stable identities* for all instances of a noun
+phrase across a sequence — the association happens inside the model. If it
+holds on a turntable pass, a hard part of P4c/P5 gets much easier.
+
+**Why it stays out of the pipeline for now:**
+
+* The video classes need **transformers 5.0**. P4c's DINOv3 path has not been
+  tested against that major version, so installing SAM3 into a working
+  pipeline env upgrades transformers underneath it.
+* The **official checkout requires Python 3.12+ and torch 2.7+**, while
+  `setup_env.sh` builds a 3.10 env. The transformers port runs the same
+  `facebook/sam3` weights on 3.10, which is why it is what the script uses.
+* The sequence is adversarial for a tracker: the camera moves and the subject
+  does not, so a leaf goes edge-on and genuinely disappears. A broken track
+  there is correct behaviour, not a defect.
+
+**What it measures:** track persistence, not mask quality — how many leaves get
+an id, how many hold it for the whole rotation, and how badly the rest
+fragment. Written to `tracks.json`. Identity switches are not separable from
+legitimate re-appearances by those counts alone, which is why the overlays fix
+one colour per id: a leaf that changes colour mid-sequence is a switch.
+
+**Not yet run on real frames.** The framing, overlay and reporting paths are
+exercised on synthetic sequences; the numbers above are the experiment, and
+nothing here claims an outcome.

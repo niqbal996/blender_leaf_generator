@@ -36,6 +36,7 @@ import cv2
 from pathlib import Path
 from typing import Optional, Tuple
 
+from pose_estimator.checkpoints import resolve_checkpoint
 from pose_estimator.frames import (
     check_capture_consistency,
     extract_sharpest_frames,
@@ -425,8 +426,11 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("checkpoints/sam2.1_hiera_large.pt"),
-        help="SAM2 checkpoint. The config is inferred from the filename.",
+        default=None,
+        help="SAM2 checkpoint, a file or the directory holding it. The config is "
+             "inferred from the filename. Defaults to the first hit among "
+             "$SAM2_CHECKPOINT, $SAM_CHECKPOINT_DIR, <repo>/checkpoints/, "
+             "<repo>/third_party/sam2/checkpoints/ and ~/.cache/sam2/.",
     )
     parser.add_argument(
         "--num-frames",
@@ -504,7 +508,7 @@ def main(argv: Optional[list] = None) -> None:
 
     run(
         workdir=args.workdir,
-        checkpoint=args.checkpoint,
+        checkpoint=resolve_checkpoint(args.checkpoint),
         video_paths=args.video,
         photo_dirs=args.photos,
         photo_max_edge=args.photo_max_edge,

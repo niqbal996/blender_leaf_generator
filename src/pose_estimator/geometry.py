@@ -229,6 +229,15 @@ def run_learned_backend(
         shutil.rmtree(standardized)
     standardized.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, standardized)
+    frame_size = frame_resolution(workdir)
+    if frame_size:
+        rescaled = rescale_model_to_frames(standardized, frame_size)
+        if rescaled and "skipped" in rescaled:
+            print(f"  WARNING: {backend} model is not at frame resolution and {rescaled['skipped']}")
+        elif rescaled:
+            print(f"  {backend}: model was exported at the model's own resolution; intrinsics "
+                  f"mapped back to {frame_size[0]}x{frame_size[1]} frame pixels "
+                  f"(scale {rescaled['scale']}, focal {rescaled['focal_in_frame_pixels']})")
     report = score_sparse_model(workdir, backend, len(staged))
     report.update({"backend": backend, "input": "P2 plant-masked RGB", "num_staged_images": len(staged),
                    "official_exporter": str(script), "bundle_adjust": bundle_adjust})
@@ -899,6 +908,70 @@ def read_capture_passes(workdir: Path) -> Optional[Dict[str, int]]:
         return None
     passes = {str(name): int(index) for name, index in sources.items()}
     return passes if len(set(passes.values())) > 1 else None
+
+
+def frame_resolution(workdir: Path) -> Optional[Tuple[int, int]]:
+    """(width, height) of the P1 frames, which the P2 masks share."""
+    frames = sorted((workdir / "p1" / "frames").glob("frame_*.jpg"))
+    if not frames:
+        return None
+    image = cv2.imread(str(frames[0]), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        return None
+    return int(image.shape[1]), int(image.shape[0])
+
+
+def rescale_model_to_frames(model_dir: Path, frame_size: Tuple[int, int]) -> Optional[Dict]:
+    """Express an exported model's cameras in original-frame pixels.
+
+    Every consumer downstream -- silhouette carving, organ-label fusion,
+    the silhouette metric -- projects into a full-resolution P2 mask, so a
+    model is only usable if its intrinsics speak that coordinate system.
+    VGGT's exporter rescales back to the input resolution itself; MapAnything's
+    writes the model in its own working resolution (518x336 for a 3:2 frame)
+    beside a folder of resized images, which is self-consistent but silently
+    projects every point into the top-left corner of a 1920x1280 mask.  That
+    scored exactly 0.000 in-silhouette -- a units bug wearing the costume of
+    a bad model.
+
+    Both projects reach that resolution the same way: scale by the larger of
+    the two ratios, then centre-crop to the target.  Inverting that is exact,
+    so nothing here is fitted.  Returns None when the model already matches.
+    """
+    import pycolmap
+
+    width, height = frame_size
+    reconstruction = pycolmap.Reconstruction(str(model_dir))
+    cameras = list(reconstruction.cameras.values())
+    if not cameras or all(int(c.width) == width and int(c.height) == height for c in cameras):
+        return None
+
+    changed = {}
+    for camera in reconstruction.cameras.values():
+        scale = max(int(camera.width) / width, int(camera.height) / height)
+        crop_x = (round(width * scale) - int(camera.width)) / 2.0
+        crop_y = (round(height * scale) - int(camera.height)) / 2.0
+        params = np.asarray(camera.params, dtype=float).copy()
+        # PINHOLE (fx, fy, cx, cy) and SIMPLE_PINHOLE (f, cx, cy) are what
+        # these exporters write; anything else is left alone rather than
+        # guessed at.
+        if len(params) == 4:
+            params[0] /= scale
+            params[1] /= scale
+            params[2] = (params[2] + crop_x) / scale
+            params[3] = (params[3] + crop_y) / scale
+        elif len(params) == 3:
+            params[0] /= scale
+            params[1] = (params[1] + crop_x) / scale
+            params[2] = (params[2] + crop_y) / scale
+        else:
+            return {"skipped": f"camera model with {len(params)} params left unscaled"}
+        camera.params = params
+        camera.width, camera.height = width, height
+        changed = {"scale": round(scale, 5), "crop_px": [crop_x, crop_y],
+                   "focal_in_frame_pixels": round(float(params[0]), 1)}
+    reconstruction.write(str(model_dir))
+    return changed
 
 
 def score_sparse_model(workdir: Path, backend: str, num_input_frames: int) -> Dict:

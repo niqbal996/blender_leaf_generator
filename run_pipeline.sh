@@ -718,20 +718,12 @@ fi
 
 # --- SAM2 checkpoint -------------------------------------------------------
 # Searched across the places it plausibly lives, so a new machine needs no
-# edits here. --sam-checkpoint or $SAM2_CHECKPOINT still win.
-find_sam_checkpoint() {
-    local name="sam2.1_hiera_large.pt"
-    local candidates=(
-        "${SAM2_CHECKPOINT:-}"
-        "$REPO_ROOT/checkpoints/$name"
-        "$REPO_ROOT/third_party/sam2/checkpoints/$name"
-        "$HOME/.cache/sam2/$name"
-    )
-    for c in "${candidates[@]}"; do
-        [[ -n "$c" && -f "$c" ]] && { echo "$c"; return 0; }
-    done
-    return 1
-}
+# edits here. --sam-checkpoint, $SAM2_CHECKPOINT (a file or a directory) and
+# $SAM_CHECKPOINT_DIR all win -- see scripts/sam_checkpoints.sh, which
+# setup_env.sh sources too, so the download and the search cannot point at
+# different directories.
+# shellcheck source=scripts/sam_checkpoints.sh
+source "$REPO_ROOT/scripts/sam_checkpoints.sh"
 [[ -n "$HF_TOKEN_ARG" ]] && export HF_TOKEN="$HF_TOKEN_ARG"
 
 mkdir -p "$WORKDIR"
@@ -812,11 +804,19 @@ if should_run p1p2; then
     phase "P1+P2  sharpest frames + SAM2 plant/holder masks   -> $WORKDIR/p1, p2"
     n_passes=$(( ${#VIDEOS[@]} + ${#PHOTOS[@]} ))
     [[ $n_passes -gt 1 ]] && echo "  $n_passes capture passes, tracked separately, solved together in P3"
-    if ! SAM_CKPT="$(find_sam_checkpoint)"; then
-        echo "ERROR: SAM2 checkpoint not found (looked for sam2.1_hiera_large.pt in" >&2
-        echo "  \$SAM2_CHECKPOINT, $REPO_ROOT/checkpoints/," >&2
-        echo "  $REPO_ROOT/third_party/sam2/checkpoints/, ~/.cache/sam2/)." >&2
-        echo "  Fetch it with:  ./setup_env.sh --checkpoint-only" >&2
+    # --sam-checkpoint applies here too, not just to P4c: it used to be read
+    # only by the later phase, so pointing it at relocated weights left P2
+    # searching the default locations and failing.
+    SAM_CKPT="$SAM_CHECKPOINT"
+    if [[ -n "$SAM_CKPT" && -d "$SAM_CKPT" ]]; then
+        SAM_CKPT="${SAM_CKPT%/}/$SAM2_CHECKPOINT_NAME"
+    fi
+    if [[ -n "$SAM_CKPT" && ! -f "$SAM_CKPT" ]]; then
+        echo "ERROR: --sam-checkpoint $SAM_CHECKPOINT does not exist." >&2
+        exit 1
+    fi
+    if [[ -z "$SAM_CKPT" ]] && ! SAM_CKPT="$(find_sam_checkpoint)"; then
+        sam_checkpoint_error "$SAM2_CHECKPOINT_NAME"
         exit 1
     fi
     echo "  SAM2 checkpoint: $SAM_CKPT"

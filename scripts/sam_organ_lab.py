@@ -279,7 +279,9 @@ def main() -> None:
     src.add_argument("--out", required=True, help="output directory")
 
     sam = p.add_argument_group("SAM2")
-    sam.add_argument("--checkpoint", default="checkpoints/sam2.1_hiera_large.pt")
+    sam.add_argument("--checkpoint", default=None,
+                     help="a file or the directory holding it; defaults to "
+                          "$SAM2_CHECKPOINT / $SAM_CHECKPOINT_DIR / <repo>/checkpoints/")
     sam.add_argument("--points-per-side", type=int, default=48,
                      help="sampling grid; higher finds smaller organs and costs time")
     sam.add_argument("--pred-iou", type=float, default=0.72)
@@ -322,9 +324,10 @@ def main() -> None:
     from sam2.build_sam import build_sam2
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from pose_estimator.checkpoints import resolve_checkpoint
     from pose_estimator.segmentation import _resolve_model_cfg
 
-    checkpoint = Path(args.checkpoint)
+    checkpoint = resolve_checkpoint(args.checkpoint)
     model = build_sam2(_resolve_model_cfg(checkpoint), str(checkpoint), device=args.device)
     generator = SAM2AutomaticMaskGenerator(
         model,

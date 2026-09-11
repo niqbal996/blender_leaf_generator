@@ -136,6 +136,27 @@ vggt = [
     "pyceres==2.3",
     "lightglue @ git+https://github.com/jytime/LightGlue.git",
 ]
+# scripts/sam3_leaf_track.py -- SAM3 concept tracking, experimental and not
+# part of P1-P6. SAM3 detects and tracks every instance of a noun phrase
+# ("leaf") across a sequence, keeping one id per instance, which is the thing
+# the pipeline currently has to reconstruct in 3D instead.
+#
+# DELIBERATELY OUT OF "pose-all", and worth its own environment: SAM3's video
+# classes arrived in transformers 5.0, a major version whose breaking changes
+# this repo's DINOv3 path (P4c) has not been tested against. Installing this
+# beside a working pipeline env upgrades transformers under it.
+#
+# The weights are gated: accept the licence at huggingface.co/facebook/sam3
+# and `hf auth login` (or export HF_TOKEN) before first use. There is also an
+# official checkout -- `git clone https://github.com/facebookresearch/sam3
+# third_party/sam3 && pip install -e third_party/sam3` -- which this repo does
+# NOT use: it requires Python 3.12+ and torch 2.7+, and setup_env.sh builds a
+# 3.10 env. The transformers port runs the same weights on 3.10.
+sam3 = [
+    "torch",
+    "transformers>=5.0",
+    "opencv-contrib-python",
+]
 # Everything the P1-P6 pipeline needs, in one name, for a machine that will
 # run the whole thing. Uses the GPU pycolmap build; swap to "skeleton" for
 # the CPU one (they are mutually exclusive -- same `pycolmap` module).

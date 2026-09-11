@@ -229,7 +229,9 @@ def main() -> None:
                         "Defaults already map leaf/tiny leaf->red, stem/petiole->purple, root->orange")
     p.add_argument("--sam3-model", default="facebook/sam3")
     p.add_argument("--gdino-model", default="IDEA-Research/grounding-dino-base")
-    p.add_argument("--sam2-checkpoint", default="checkpoints/sam2.1_hiera_large.pt")
+    p.add_argument("--sam2-checkpoint", default=None,
+                   help="a file or the directory holding it; defaults to "
+                        "$SAM2_CHECKPOINT / $SAM_CHECKPOINT_DIR / <repo>/checkpoints/")
     p.add_argument("--keep-background", action="store_true",
                    help="do not zero pixels outside the plant mask")
     p.add_argument("--device", default="cuda")
@@ -265,12 +267,13 @@ def main() -> None:
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+        from pose_estimator.checkpoints import resolve_checkpoint
         from pose_estimator.segmentation import _resolve_model_cfg
 
         print(f"\nloading {args.gdino_model} + SAM2 ...")
         processor = AutoProcessor.from_pretrained(args.gdino_model)
         model = AutoModelForZeroShotObjectDetection.from_pretrained(args.gdino_model).to(args.device).eval()
-        ckpt = Path(args.sam2_checkpoint)
+        ckpt = resolve_checkpoint(args.sam2_checkpoint)
         sam_predictor = SAM2ImagePredictor(
             build_sam2(_resolve_model_cfg(ckpt), str(ckpt), device=args.device))
 
