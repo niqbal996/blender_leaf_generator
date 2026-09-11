@@ -33,12 +33,26 @@ from pose_estimator.pose import evaluate_poses, export_scene_ply
 from pose_estimator.reconstruction import get_registered_camera_poses
 
 
-BACKENDS = ("colmap", "vggt", "mapanything")
+BACKENDS = ("colmap", "vggt", "vggt_omega", "mapanything")
+LEARNED_BACKENDS = tuple(name for name in BACKENDS if name != "colmap")
 _OFFICIAL_REPOS = {
     "vggt": "https://github.com/facebookresearch/vggt.git",
+    "vggt_omega": "https://github.com/facebookresearch/vggt-omega.git",
     "mapanything": "https://github.com/facebookresearch/map-anything.git",
 }
-_HF_MODELS = {"vggt": "facebook/VGGT-1B", "mapanything": "facebook/map-anything"}
+_HF_MODELS = {"vggt": "facebook/VGGT-1B", "vggt_omega": "facebook/VGGT-Omega",
+              "mapanything": "facebook/map-anything"}
+# Repository root, for the exporters this project ships itself.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+# VGGT-Omega ships no COLMAP exporter and MapAnything's hides its own quality
+# controls, so both are driven by scripts here instead of upstream demos.
+_OUR_EXPORTERS = {
+    "vggt_omega": _REPO_ROOT / "scripts" / "vggt_omega_colmap.py",
+    "mapanything": _REPO_ROOT / "scripts" / "mapanything_colmap.py",
+}
+# Only the upstream exporters build models through pycolmap's Python API, and
+# only they care that it is the version they pin. Ours write COLMAP text.
+_NEEDS_PYCOLMAP_IMAGE_API = ("vggt",)
 
 
 def geometry_dir(workdir: Path, backend: str = "colmap") -> Path:
@@ -124,6 +138,9 @@ def run_learned_backend(
     dry_run: bool = False,
     heartbeat_seconds: float = 30.0,
     skip_env_check: bool = False,
+    image_resolution: Optional[int] = None,
+    checkpoint: Optional[str] = None,
+    use_plant_masks: bool = True,
 ) -> Dict:
     """Run an official exporter and standardize its output under P3.
 
@@ -132,8 +149,8 @@ def run_learned_backend(
     repository is cloned automatically into P3; users therefore never need
     to fetch either model weights or exporter code by hand.
     """
-    if backend not in ("vggt", "mapanything"):
-        raise ValueError("run_learned_backend supports vggt or mapanything")
+    if backend not in LEARNED_BACKENDS:
+        raise ValueError("run_learned_backend supports " + ", ".join(LEARNED_BACKENDS))
     # A dry run is genuinely offline: show the future cache path rather than
     # cloning code just to prove a command can be assembled.
     if dry_run and repo_root is None:
@@ -165,16 +182,37 @@ def run_learned_backend(
     runner_images = runner / "images"
     _copy_images(staged, runner_images)
 
+    # The P2 silhouettes are known here, so the exporters this project owns are
+    # told which pixels are the plant rather than reconstructing a background
+    # that was masked to black and then filtering it back out downstream.
+    plant_masks = workdir / "p2" / "masks" / "plant"
+    masks_argument = str(plant_masks) if use_plant_masks and plant_masks.is_dir() else None
+    interpreter = model_python or sys.executable
     if backend == "vggt":
-        script = repo_root / "demo_colmap.py"
-        command = [model_python or sys.executable, "-u", str(script), f"--scene_dir={runner}"]
+        script = repo_root / "demo_colmap.py"          # upstream: it owns the BA path
+        command = [interpreter, "-u", str(script), f"--scene_dir={runner}"]
         if bundle_adjust:
             command.append("--use_ba")
+    elif backend == "vggt_omega":
+        script = _OUR_EXPORTERS[backend]               # upstream ships none
+        command = [interpreter, "-u", str(script), f"--scene_dir={runner}"]
+        if masks_argument:
+            command.append(f"--masks_dir={masks_argument}")
+        if image_resolution:
+            command.append(f"--image-resolution={image_resolution}")
+        if checkpoint:
+            command.append(f"--checkpoint={checkpoint}")
+        if bundle_adjust:
+            command.append("--bundle-adjust")
     else:
-        script = repo_root / "scripts" / "demo_colmap.py"
+        script = _OUR_EXPORTERS[backend]               # upstream hides its quality flags
         output = runner / "output"
-        command = [model_python or sys.executable, "-u", str(script),
+        command = [interpreter, "-u", str(script),
                    f"--images_dir={runner_images}", f"--output_dir={output}"]
+        if masks_argument:
+            command.append(f"--plant-masks={masks_argument}")
+        if image_resolution:
+            command += ["--resize-mode=longest_side", f"--size={image_resolution}"]
 
     if not dry_run and not script.is_file():
         raise FileNotFoundError(f"official {backend} exporter not found at {script}")
@@ -196,6 +234,9 @@ def run_learned_backend(
     (experiment / "command.json").write_text(json.dumps({
         "command": command, "dry_run": dry_run, "huggingface_model": _HF_MODELS[backend],
         "hf_token_supplied": bool(resolved_token), "code_repository": str(repo_root),
+        "exporter": "this project" if backend in _OUR_EXPORTERS else "upstream",
+        "plant_masks": masks_argument, "image_resolution": image_resolution,
+        "bundle_adjust": bundle_adjust,
     }, indent=2))
     if dry_run:
         return {"backend": backend, "command": command, "staged_images": len(staged), "dry_run": True}
@@ -302,7 +343,16 @@ def backend_code_cache(code_cache: Optional[Path] = None) -> Path:
 
 
 def _exporter_script(repo_root: Path, backend: str) -> Path:
-    return repo_root / ("demo_colmap.py" if backend == "vggt" else "scripts/demo_colmap.py")
+    """A file whose presence means the checkout is complete.
+
+    For backends this project exports itself, that is still a file from the
+    upstream checkout -- the package has to be importable either way.
+    """
+    if backend == "vggt":
+        return repo_root / "demo_colmap.py"
+    if backend == "vggt_omega":
+        return repo_root / "vggt_omega" / "models" / "vggt_omega.py"
+    return repo_root / "scripts" / "demo_colmap.py"
 
 
 _SAMPLE_SECONDS = 5.0
@@ -336,7 +386,7 @@ _OOM_MARKERS = (
 # VGGT's exporter and its vendored dependencies annotate with PEP 604 unions
 # (``np.ndarray | None``) in evaluated positions, so they raise TypeError on
 # import below 3.10 rather than failing gracefully.
-_MIN_MODEL_PYTHON = {"vggt": (3, 10), "mapanything": (3, 10)}
+_MIN_MODEL_PYTHON = {"vggt": (3, 10), "vggt_omega": (3, 10), "mapanything": (3, 10)}
 # What each official exporter imports before it does any work.  ``pycolmap``
 # is in this list but deliberately absent from the ``vggt`` extra: see
 # _PYCOLMAP_HELP.
@@ -348,8 +398,13 @@ _REQUIRED_MODULES = {
     "vggt": ("torch", "torchvision", "numpy", "PIL", "pycolmap", "trimesh",
              "lightglue", "einops", "safetensors", "huggingface_hub",
              "vggt.models.vggt", "vggt.dependency.np_to_pycolmap"),
-    "mapanything": ("torch", "numpy", "PIL", "pycolmap", "huggingface_hub",
-                    "mapanything.models", "mapanything.utils.colmap_export"),
+    "mapanything": ("torch", "numpy", "PIL", "cv2", "pycolmap", "huggingface_hub",
+                    "mapanything.models", "mapanything.utils.colmap_export",
+                    "mapanything.utils.image"),
+    # No pycolmap unless --bundle-adjust: the exporter here writes COLMAP text.
+    "vggt_omega": ("torch", "torchvision", "numpy", "PIL", "cv2", "einops", "safetensors",
+                   "huggingface_hub", "vggt_omega.models", "vggt_omega.utils.load_fn",
+                   "vggt_omega.utils.pose_enc"),
 }
 _PYCOLMAP_HELP = (
     "pip install pycolmap  (or pycolmap-cuda for GPU SIFT). The [vggt] extra "
@@ -534,7 +589,7 @@ def require_model_environment(
         problems.append(f"{name} cannot be imported in {report['executable']}: "
                         f"{detail[len('MISSING: '):]}" + (f"\n      Fix: {hint}" if hint else ""))
     api = report.get("pycolmap_exporter_api", "")
-    if api.startswith("INCOMPATIBLE:"):
+    if api.startswith("INCOMPATIBLE:") and backend in _NEEDS_PYCOLMAP_IMAGE_API:
         problems.append(
             f"pycolmap {report.get('pycolmap_version', '?')} in {report['executable']} cannot build "
             f"the model this exporter writes: {api[len('INCOMPATIBLE: '):]}\n"

@@ -157,6 +157,27 @@ sam3 = [
     "transformers>=5.0",
     "opencv-contrib-python",
 ]
+# pose-geometry --backends vggt_omega -- VGGT-Omega ships no COLMAP exporter,
+# so scripts/vggt_omega_colmap.py is ours; these are the model's own
+# requirements plus what that adapter needs. Its own environment, like the
+# other learned backends: VGGT pins jytime's lightglue fork and MapAnything
+# pins cvg's, and they install as the same module.
+#
+# The checkpoints are gated: request access on the model card, then either
+# export HF_TOKEN or pass --omega-checkpoint /path/to.pt.
+vggt-omega = [
+    "torch>=2.6",
+    "torchvision>=0.21",
+    "numpy<2",
+    "Pillow",
+    "einops",
+    "safetensors",
+    "opencv-contrib-python",
+    "huggingface_hub",
+    # Only --bundle-adjust needs it, and our exporter writes COLMAP text, so
+    # unlike the vggt extra this is not pinned to the 3.10 API.
+    "pycolmap",
+]
 # Everything the P1-P6 pipeline needs, in one name, for a machine that will
 # run the whole thing. Uses the GPU pycolmap build; swap to "skeleton" for
 # the CPU one (they are mutually exclusive -- same `pycolmap` module).

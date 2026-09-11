@@ -21,7 +21,12 @@ def _readme_without_history() -> str:
     """
     text = (REPO / "README.md").read_text()
     marker = "### Removed:"
-    return text[: text.index(marker)] if marker in text else text
+    text = text[: text.index(marker)] if marker in text else text
+    # The per-phase documents drift exactly like the README does, so they are
+    # held to the same standard rather than being a place names can hide.
+    for document in sorted((REPO / "docs").glob("*.md")) if (REPO / "docs").is_dir() else []:
+        text += "\n" + document.read_text()
+    return text
 
 
 README = _readme_without_history()
@@ -35,6 +40,8 @@ def test_every_pose_command_exists():
     declared = set(project["scripts"]) | set(project.get("optional-dependencies", {}))
 
     mentioned = set(re.findall(r"\bpose-[a-z0-9-]+", README))
+    # Hyphenated CLI flags of the exporters are not console scripts.
+    mentioned -= {"pose-enc"}
     # `pose-estimator` is the env/package name, not a command.
     mentioned -= {"pose-estimator"}
     missing = sorted(mentioned - declared)
@@ -50,7 +57,11 @@ def test_every_qc_check_exists():
     nowhere, which has happened: `camera_path_is_circular` was invented.
     """
     written = set()
-    for path in (REPO / "src" / "pose_estimator").rglob("*.py"):
+    sources = list((REPO / "src" / "pose_estimator").rglob("*.py"))
+    # The exporters in scripts/ are this project's code too, and the P3 docs
+    # name their flags.
+    sources += list((REPO / "scripts").glob("*.py"))
+    for path in sources:
         text = path.read_text()
         written |= set(re.findall(r'checks\["([a-z_]+)"\]', text))
         # QC reports built as one dict literal rather than by assignment.
@@ -69,6 +80,14 @@ def test_every_qc_check_exists():
     mentioned = set(re.findall(r"`([a-z]+(?:_[a-z]+){2,})`", README))
     # Only judge names that are plausibly checks, not any snake_case symbol.
     known_other = {"leaf_points", "sources_json", "min_branch_fraction"}
+    # Symbols belonging to the upstream projects we drive. Naming them is the
+    # point -- "VGGT's no-BA path" is vague where the function name is not --
+    # but this repository cannot be expected to define them.
+    upstream = {"batch_np_matrix_to_pycolmap_wo_track", "export_predictions_to_colmap",
+                "apply_confidence_mask", "use_multiview_confidence", "mask_edges",
+                "load_and_preprocess_images", "encoding_to_camera", "confidence_percentile",
+                "memory_efficient_inference", "rename_colmap_recons_and_rescale_camera"}
+    known_other |= upstream
     suspects = {m for m in mentioned if m not in known_other and not m.endswith("_json")}
 
     missing = sorted(s for s in suspects if s not in written)

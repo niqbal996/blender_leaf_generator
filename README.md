@@ -225,7 +225,7 @@ disk, so any one can be re-run or swapped without touching the others.
 |---|---|---|---|
 | P1+P2 | `pose-segment` | sharpest frame per angular bin, then SAM2 plant/holder masks | `p1/`, `p2/` |
 | P3 | `pose-solve` | camera poses, masked COLMAP, one shared camera | `p3/` |
-| P3x | `pose-geometry` | VGGT / MapAnything on the same masked frames; aligned comparison to COLMAP | `p3/experiments/` |
+| P3x | `pose-geometry` | VGGT / VGGT-Omega / MapAnything on the same masked frames; aligned comparison to COLMAP ([details](docs/p3-camera-geometry.md)) | `p3/experiments/` |
 | P4a | `pose-hull` | visual hull by silhouette carving | `p4/` |
 | P4b | `pose-surface` | 2DGS surfels, then a carved thin surface | `p4b/` |
 | P4c | `pose-classify` | per-frame organ class maps (DINOv3 or SAM2) | `p4c/class_maps/` |
@@ -237,7 +237,19 @@ disk, so any one can be re-run or swapped without touching the others.
 you stop for the two things that need a human, which are picking the P2
 plant/holder prompts and picking the P4c organ seeds.
 
-### Learned P3 geometry experiment (VGGT and MapAnything)
+### Per-phase documentation
+
+Detailed notes for a phase, including every backend it can run and what each
+one measured, live under `docs/`:
+
+| phase | document |
+|---|---|
+| P3 | [docs/p3-camera-geometry.md](docs/p3-camera-geometry.md) -- colmap, vggt, vggt_omega, mapanything |
+
+The rest of the phases are documented in the sections below for now, and move
+into `docs/` as they grow.
+
+### Learned P3 geometry experiment (VGGT, VGGT-Omega and MapAnything)
 
 P3's masked COLMAP solve remains the baseline.  `pose-geometry` is a separate
 experiment, not a replacement: it prepares the exact P2 plant-masked RGB

@@ -87,7 +87,7 @@
 # existing workdir; --stop-after <phase> ends early. P4c looks for clicked
 # seeds at <workdir>/p4c/seeds.json and uses them without being told.
 #
-#   --geometry-backend vggt|mapanything   run P3 with a learned model instead
+#   --geometry-backend vggt|vggt_omega|mapanything   run P3 with a learned model instead
 #               of COLMAP, and carve P4a from it. Everything lands under
 #               p3/experiments/<b>/ and p4/experiments/<b>/, leaving the
 #               baseline untouched, so the two hulls can be compared:
@@ -215,7 +215,7 @@ SEEDS=(); SKIP_TO=""; SEED_BANK=""; SEEDS_FILE=""; SKIP_P4B=0
 BACKEND="dino"; SAM_CHECKPOINT=""; STOP_AFTER=""
 PROMPT_BANK=""; PROMPT_ROOT=""; NO_PROMPT_BANK=0; USE_GPU=0; LOW_TEXTURE=0; ARCHITECTURE=""; PERSISTENCE=""; PROMPT_POINTS=""; KEEP_GOING=0
 CAMERAS=""; ALLOW_MIXED=0; STRICT_MIDRIBS=0
-GEOMETRY_BACKEND="colmap"; MODEL_PYTHON=""
+GEOMETRY_BACKEND="colmap"; MODEL_PYTHON=""; IMAGE_RESOLUTION=""; BUNDLE_ADJUST=0
 DATASET=""; DRY_RUN=0; CONF_FILES=()
 
 # Which settings the command line set explicitly. A config file fills in only
@@ -290,6 +290,8 @@ while [[ $# -gt 0 ]]; do
                         STOP_AFTER="$2"; shift 2 ;;
         --geometry-backend) GEOMETRY_BACKEND="$2"; shift 2 ;;
         --model-python) MODEL_PYTHON="$2"; shift 2 ;;
+        --image-resolution) IMAGE_RESOLUTION="$2"; shift 2 ;;
+        --bundle-adjust) BUNDLE_ADJUST=1; shift ;;
         --seed-bank) SET[seed_bank]=1;    SEED_BANK="$2"; shift 2 ;;
         --prompt-bank) SET[prompt_bank]=1;  PROMPT_BANK="$2"; shift 2 ;;
         --prompt-points) SET[prompt_points]=1; PROMPT_POINTS="$2"; shift 2 ;;
@@ -448,7 +450,8 @@ print_plan() {
     [[ "$USE_GPU" == 1 ]]     && echo "  gpu           on"
     [[ -z "$HF_TOKEN_ARG" ]] || echo "  hf token      set (${#HF_TOKEN_ARG} chars)"
     echo "  phases        ${SKIP_TO:-p1p2} -> ${STOP_AFTER:-p6}"
-    echo "  geometry      $GEOMETRY_BACKEND"
+    echo "  geometry      $GEOMETRY_BACKEND$([[ "$BUNDLE_ADJUST" == 1 ]] && echo " + bundle adjustment")"
+    [[ -z "$IMAGE_RESOLUTION" ]] || echo "  model res     $IMAGE_RESOLUTION"
     [[ -z "$MODEL_PYTHON" ]] || echo "  model python  $MODEL_PYTHON"
 
     # A bank belonging to another dataset is legitimate -- that is what banks
@@ -497,8 +500,8 @@ will_run_phase() {
 }
 
 case "$GEOMETRY_BACKEND" in
-    colmap|vggt|mapanything) ;;
-    *) echo "unknown --geometry-backend '$GEOMETRY_BACKEND' -- colmap, vggt or mapanything" >&2
+    colmap|vggt|vggt_omega|mapanything) ;;
+    *) echo "unknown --geometry-backend '$GEOMETRY_BACKEND' -- colmap, vggt, vggt_omega or mapanything" >&2
        exit 1 ;;
 esac
 
@@ -507,7 +510,7 @@ esac
 # would otherwise be accepted here and fail deep inside P4c.
 case "$BACKEND" in
     dino|sam) ;;
-    colmap|vggt|mapanything)
+    colmap|vggt|vggt_omega|mapanything)
         echo "--backend $BACKEND: --backend chooses P4c's organ classifier (dino or sam)." >&2
         echo "  For the P3 geometry model you want:  --geometry-backend $BACKEND" >&2
         exit 1 ;;
@@ -857,7 +860,9 @@ if should_run p3; then
         echo "  and is not modified."
         $PY -m pose_estimator.cli.geometry --workdir "$WORKDIR" \
             --backends "$GEOMETRY_BACKEND" \
-            ${MODEL_PYTHON:+--model-python "$MODEL_PYTHON"}
+            ${MODEL_PYTHON:+--model-python "$MODEL_PYTHON"} \
+            ${IMAGE_RESOLUTION:+--image-resolution "$IMAGE_RESOLUTION"} \
+            $([[ "$BUNDLE_ADJUST" == 1 ]] && echo --bundle-adjust)
         gate p3 "$WORKDIR/p3/experiments/$GEOMETRY_BACKEND/poses.json"
     fi
 fi

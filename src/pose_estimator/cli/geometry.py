@@ -24,12 +24,14 @@ def run(
     workdir: Path,
     backends,
     vggt_root: Optional[Path] = None,
+    vggt_omega_root: Optional[Path] = None,
     mapanything_root: Optional[Path] = None,
     max_images: int = 0,
     bundle_adjust: bool = False,
     device: Optional[str] = None,
     model_python: Optional[str] = None,
     vggt_python: Optional[str] = None,
+    vggt_omega_python: Optional[str] = None,
     mapanything_python: Optional[str] = None,
     hf_token: Optional[str] = None,
     hf_home: Optional[Path] = None,
@@ -38,16 +40,21 @@ def run(
     dry_run: bool = False,
     heartbeat_seconds: float = 30.0,
     skip_env_check: bool = False,
+    image_resolution: Optional[int] = None,
+    omega_checkpoint: Optional[str] = None,
+    no_plant_masks: bool = False,
 ) -> dict:
     require_sparse_model(workdir, "colmap")
     selected = list(dict.fromkeys(backends))
     for backend in selected:
         if backend == "colmap":
             continue
-        root = vggt_root if backend == "vggt" else mapanything_root
+        root = {"vggt": vggt_root, "vggt_omega": vggt_omega_root,
+                "mapanything": mapanything_root}[backend]
         # VGGT and MapAnything pin different forks of lightglue, which install
         # under the same module name, so one environment cannot serve both.
-        backend_python = (vggt_python if backend == "vggt" else mapanything_python) or model_python
+        backend_python = {"vggt": vggt_python, "vggt_omega": vggt_omega_python,
+                          "mapanything": mapanything_python}[backend] or model_python
         print(f"Running {backend} on P2 plant-masked RGB frames...")
         report = run_learned_backend(workdir, backend, root, max_images=max_images,
                                      bundle_adjust=bundle_adjust, device=device, model_python=backend_python,
@@ -55,7 +62,10 @@ def run(
                                      code_cache=code_cache,
                                      auto_fetch_code=auto_fetch_code, dry_run=dry_run,
                                      heartbeat_seconds=heartbeat_seconds,
-                                     skip_env_check=skip_env_check)
+                                     skip_env_check=skip_env_check,
+                                     image_resolution=image_resolution,
+                                     checkpoint=omega_checkpoint if backend == "vggt_omega" else None,
+                                     use_plant_masks=not no_plant_masks)
         if dry_run:
             print("  would run: " + " ".join(report["command"]))
         else:
@@ -84,10 +94,13 @@ def run(
 def main(argv: Optional[list] = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workdir", required=True, type=Path)
-    parser.add_argument("--backends", nargs="+", choices=BACKENDS, default=["vggt", "mapanything"],
+    parser.add_argument("--backends", nargs="+", choices=BACKENDS,
+                        default=["vggt_omega", "mapanything"],
                         help="Models to run; COLMAP is always included as the comparison reference")
     parser.add_argument("--vggt-root", type=Path,
                         help="Optional existing VGGT checkout; fetched automatically when omitted")
+    parser.add_argument("--vggt-omega-root", type=Path,
+                        help="Optional existing VGGT-Omega checkout; fetched automatically when omitted")
     parser.add_argument("--mapanything-root", type=Path,
                         help="Optional existing MapAnything checkout; fetched automatically when omitted")
     parser.add_argument("--max-images", type=int, default=0,
@@ -99,6 +112,17 @@ def main(argv: Optional[list] = None) -> None:
                         help="Python executable in the VGGT/MapAnything environment; default is this command's Python")
     parser.add_argument("--vggt-python",
                         help="Python for the VGGT environment specifically, overriding --model-python")
+    parser.add_argument("--vggt-omega-python",
+                        help="Python for the VGGT-Omega environment specifically, overriding --model-python")
+    parser.add_argument("--image-resolution", type=int,
+                        help="Model input resolution. Default is each model's own trained "
+                             "resolution, which is also its best: VGGT-Omega 512, MapAnything's "
+                             "aspect-matched bucket. Raising it leaves the training regime")
+    parser.add_argument("--omega-checkpoint",
+                        help="VGGT-Omega checkpoint: a local .pt, or a filename in the gated "
+                             "facebook/VGGT-Omega repo (default vggt_omega_1b_512.pt)")
+    parser.add_argument("--no-plant-masks", action="store_true",
+                        help="Do not tell the exporters which pixels P2 called plant")
     parser.add_argument("--mapanything-python",
                         help="Python for the MapAnything environment specifically, overriding --model-python. "
                              "The two backends pin different lightglue forks, so comparing both in one run "
@@ -119,13 +143,17 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--dry-run", action="store_true",
                         help="Check the exporter environment and stage inputs, but do not start models")
     args = parser.parse_args(argv)
-    run(args.workdir, args.backends, vggt_root=args.vggt_root, mapanything_root=args.mapanything_root,
+    run(args.workdir, args.backends, vggt_root=args.vggt_root,
+        vggt_omega_root=args.vggt_omega_root, mapanything_root=args.mapanything_root,
         max_images=args.max_images, bundle_adjust=args.bundle_adjust, device=args.device,
         model_python=args.model_python, vggt_python=args.vggt_python,
+        vggt_omega_python=args.vggt_omega_python,
         mapanything_python=args.mapanything_python, hf_token=args.hf_token, hf_home=args.hf_home,
         code_cache=args.code_cache,
         auto_fetch_code=not args.no_auto_fetch_code, dry_run=args.dry_run,
-        heartbeat_seconds=args.heartbeat_seconds, skip_env_check=args.skip_env_check)
+        heartbeat_seconds=args.heartbeat_seconds, skip_env_check=args.skip_env_check,
+        image_resolution=args.image_resolution, omega_checkpoint=args.omega_checkpoint,
+        no_plant_masks=args.no_plant_masks)
 
 
 if __name__ == "__main__":
