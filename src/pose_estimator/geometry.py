@@ -141,6 +141,7 @@ def run_learned_backend(
     image_resolution: Optional[int] = None,
     checkpoint: Optional[str] = None,
     use_plant_masks: bool = True,
+    intrinsics_from: Optional[str] = None,
 ) -> Dict:
     """Run an official exporter and standardize its output under P3.
 
@@ -218,6 +219,9 @@ def run_learned_backend(
             command.append(f"--plant-masks={masks_argument}")
         if image_resolution:
             command += ["--resize-mode=longest_side", f"--size={image_resolution}"]
+        source = resolve_intrinsics_source(workdir, intrinsics_from)
+        if source:
+            command.append(f"--intrinsics-from={source}")
 
     if not dry_run and not script.is_file():
         raise FileNotFoundError(f"official {backend} exporter not found at {script}")
@@ -241,7 +245,7 @@ def run_learned_backend(
         "hf_token_supplied": bool(resolved_token), "code_repository": str(repo_root),
         "exporter": "this project" if backend in _OUR_EXPORTERS else "upstream",
         "plant_masks": masks_argument, "image_resolution": image_resolution,
-        "bundle_adjust": bundle_adjust,
+        "bundle_adjust": bundle_adjust, "intrinsics_from": intrinsics_from,
     }, indent=2))
     if dry_run:
         return {"backend": backend, "command": command, "staged_images": len(staged), "dry_run": True}
@@ -994,6 +998,31 @@ def read_capture_passes(workdir: Path) -> Optional[Dict[str, int]]:
         return None
     passes = {str(name): int(index) for name, index in sources.items()}
     return passes if len(set(passes.values())) > 1 else None
+
+
+def resolve_intrinsics_source(workdir: Path, choice: Optional[str]) -> Optional[str]:
+    """Turn `exif` or `colmap` into the file that actually holds them.
+
+    Which one is used changes what a comparison means, so neither is a
+    default: `exif` is what the camera reported and keeps the run independent
+    of COLMAP, while `colmap` is solved from these very images and therefore
+    more accurate and no longer independent.
+    """
+    if not choice:
+        return None
+    if choice == "exif":
+        path = workdir / "p1" / "intrinsics.json"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"{path} not found -- P1 writes it from EXIF when the photos carry a focal "
+                f"length. Use --intrinsics-from colmap, or a path")
+        return str(path)
+    if choice == "colmap":
+        return str(require_sparse_model(workdir, "colmap"))
+    path = Path(choice)
+    if not path.exists():
+        raise FileNotFoundError(f"{path} does not exist")
+    return str(path)
 
 
 def frame_resolution(workdir: Path) -> Optional[Tuple[int, int]]:

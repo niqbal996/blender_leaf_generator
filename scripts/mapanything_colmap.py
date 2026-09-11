@@ -53,6 +53,10 @@ def parse_args():
     parser.add_argument("--memory-efficient", action="store_true",
                         help="Trade speed for peak memory; unnecessary on a large GPU")
     parser.add_argument("--minibatch-size", type=int, default=None)
+    parser.add_argument("--intrinsics-from", default=None,
+                        help="Give the model the intrinsics instead of letting it guess: a COLMAP "
+                             "sparse directory, or a JSON of {frame stem: focal in pixels}. "
+                             "MapAnything converts them to ray directions internally")
     parser.add_argument("--points-from", default="depth", choices=["depth", "pointmap"],
                         help="depth: unproject depth_z through the intrinsics and pose that are "
                              "written to the model, so points reproject where they came from. "
@@ -62,6 +66,57 @@ def parse_args():
                         help="Export voxel size as a fraction of scene extent. Upstream uses "
                              "0.01; a plant's petioles and leaf tips need finer than that")
     return parser.parse_args()
+
+
+def frame_pixel_intrinsics(source: str, names) -> dict:
+    """Per-frame (fx, fy, cx, cy) in original frame pixels, from what is known.
+
+    Two sources, and the difference matters for what a comparison means. P1's
+    `intrinsics.json` holds focals the camera itself reported, so using it
+    leaves the reconstruction independent of COLMAP. A COLMAP sparse model
+    holds focals solved from these very images -- more accurate, but it makes
+    the result a COLMAP-calibrated one rather than an independent method.
+    """
+    path = Path(source)
+    stems = [Path(name).stem for name in names]
+    if path.is_dir():
+        import pycolmap
+
+        reconstruction = pycolmap.Reconstruction(str(path))
+        by_stem = {}
+        for image_id in reconstruction.reg_image_ids():
+            image = reconstruction.images[image_id]
+            camera = reconstruction.cameras[image.camera_id]
+            K = np.asarray(camera.calibration_matrix(), dtype=float)
+            by_stem[Path(image.name).stem] = (K[0, 0], K[1, 1], K[0, 2], K[1, 2])
+        missing = [stem for stem in stems if stem not in by_stem]
+        if missing:
+            print(f"  {len(missing)} frames are not in {path}; their intrinsics stay predicted "
+                  f"(first: {missing[0]})")
+        return by_stem
+    focals = json.loads(path.read_text())
+    return {stem: (float(focals[stem]), float(focals[stem]), None, None)
+            for stem in stems if stem in focals}
+
+
+def processed_intrinsics(frame_intrinsics, frame_size, processed_hw):
+    """Frame-pixel intrinsics expressed in the model's working resolution.
+
+    `load_images` scales by the larger of the two ratios and centre-crops, so
+    undoing it is exact. A principal point of None means "the frame centre",
+    which is what a focal-only source such as EXIF implies.
+    """
+    fx, fy, cx, cy = frame_intrinsics
+    frame_width, frame_height = frame_size
+    height, width = processed_hw
+    if cx is None:
+        cx, cy = frame_width / 2.0, frame_height / 2.0
+    scale = max(width / frame_width, height / frame_height)
+    crop_x = (round(frame_width * scale) - width) / 2.0
+    crop_y = (round(frame_height * scale) - height) / 2.0
+    return np.array([[fx * scale, 0.0, cx * scale - crop_x],
+                     [0.0, fy * scale, cy * scale - crop_y],
+                     [0.0, 0.0, 1.0]], dtype=np.float64)
 
 
 def rebuild_points_from_depth(outputs) -> int:
@@ -119,6 +174,25 @@ def main():
     views = load_images(paths, **load_kwargs)
     print(f"Loaded {len(views)} views ({args.resize_mode}"
           f"{f', size {args.size}' if args.size else ''})")
+
+    if args.intrinsics_from:
+        from PIL import Image
+
+        known = frame_pixel_intrinsics(args.intrinsics_from, names)
+        attached = 0
+        for view, path, name_ in zip(views, paths, names):
+            entry = known.get(Path(name_).stem)
+            if entry is None:
+                continue
+            processed_hw = tuple(view["img"].shape[-2:])
+            K = processed_intrinsics(entry, Image.open(path).size, processed_hw)
+            view["intrinsics"] = torch.from_numpy(K).to(view["img"].dtype)[None]
+            attached += 1
+        example = next((v["intrinsics"][0, 0, 0].item() for v in views if "intrinsics" in v), None)
+        print(f"Known intrinsics attached to {attached}/{len(views)} views from "
+              f"{args.intrinsics_from}"
+              + (f" (focal {example:.1f} in the model's {tuple(views[0]['img'].shape[-2:])} frame)"
+                 if example else ""))
 
     name = "facebook/map-anything-apache" if args.apache else "facebook/map-anything"
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -184,6 +258,7 @@ def main():
         "voxel_fraction": args.voxel_fraction,
         "plant_masks_applied": bool(args.plant_masks),
         "points_from": args.points_from,
+        "intrinsics_from": args.intrinsics_from,
     }, indent=2))
     print(f"Wrote {args.output_dir}")
 

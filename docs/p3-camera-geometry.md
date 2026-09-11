@@ -168,11 +168,34 @@ that are actually written makes reprojection exact by construction, which is
 the property P4 carving and P4c label fusion rely on. `--points-from pointmap`
 restores upstream's behaviour.
 
-It recovers its own intrinsics, and on `thistle3` predicted a focal of 1,716
-frame pixels where COLMAP solves 3,051 — a 1.77× wider field of view than the
-lens has, which distorts the shape it reconstructs. MapAnything accepts known
-intrinsics as an input; feeding P1's EXIF focals is the obvious next step and
-is not wired yet.
+**Give it the intrinsics.** It predicts its own, and on `thistle3` guessed a
+focal of 1,718 frame pixels where EXIF says 2,880/3,040 and COLMAP solves
+2,970/3,020 — a 1.7× wider field of view than the lens has. That error scales
+every view's depth-to-3D mapping differently, so the per-view shells do not
+coincide: the median point sits inside the silhouette in only 18 of 27 views,
+against 25 of 27 for `vggt_omega`. That is what a thick, noisy cloud is.
+
+```bash
+pose-geometry --workdir <workdir> --backends mapanything --intrinsics-from exif
+```
+
+The choice of source changes what the comparison means, so there is no
+default:
+
+* `exif` reads `p1/intrinsics.json`, which P1 wrote from the focal each photo
+  reported, already converted to pixels. The run stays **independent of
+  COLMAP**, which is what you want when comparing against it.
+* `colmap` reads the P3 baseline, solved from these very images. More
+  accurate, but the result is then a COLMAP-calibrated MapAnything rather
+  than an independent method — label it as such.
+
+A focal-only source implies a principal point at the frame centre. The
+intrinsics are mapped into the model's working resolution with the exact
+inverse of its own resize-and-crop, and `--points-from depth` then guarantees
+points reproject where they came from.
+
+For contrast, `vggt_omega` predicts 2,872 against COLMAP's 3,020 — within 5%,
+and it needs no help.
 
 ## Environments
 

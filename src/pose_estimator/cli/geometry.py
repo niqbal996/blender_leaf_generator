@@ -43,6 +43,7 @@ def run(
     image_resolution: Optional[int] = None,
     omega_checkpoint: Optional[str] = None,
     no_plant_masks: bool = False,
+    intrinsics_from: Optional[str] = None,
 ) -> dict:
     require_sparse_model(workdir, "colmap")
     selected = list(dict.fromkeys(backends))
@@ -65,7 +66,8 @@ def run(
                                      skip_env_check=skip_env_check,
                                      image_resolution=image_resolution,
                                      checkpoint=omega_checkpoint if backend == "vggt_omega" else None,
-                                     use_plant_masks=not no_plant_masks)
+                                     use_plant_masks=not no_plant_masks,
+                                     intrinsics_from=intrinsics_from)
         if dry_run:
             print("  would run: " + " ".join(report["command"]))
         else:
@@ -121,6 +123,13 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--omega-checkpoint",
                         help="VGGT-Omega checkpoint: a local .pt, or a filename in the gated "
                              "facebook/VGGT-Omega repo (default vggt_omega_1b_512.pt)")
+    parser.add_argument("--intrinsics-from", metavar="exif|colmap|PATH",
+                        help="Give MapAnything the intrinsics rather than letting it predict "
+                             "them. 'exif' uses p1/intrinsics.json, which the camera reported "
+                             "and which keeps the run independent of COLMAP; 'colmap' uses the "
+                             "P3 baseline, which is more accurate but makes the result a "
+                             "COLMAP-calibrated one. On thistle3 it predicts a focal of 1718 "
+                             "where the truth is near 3000")
     parser.add_argument("--no-plant-masks", action="store_true",
                         help="Do not tell the exporters which pixels P2 called plant")
     parser.add_argument("--mapanything-python",
@@ -153,7 +162,7 @@ def main(argv: Optional[list] = None) -> None:
         auto_fetch_code=not args.no_auto_fetch_code, dry_run=args.dry_run,
         heartbeat_seconds=args.heartbeat_seconds, skip_env_check=args.skip_env_check,
         image_resolution=args.image_resolution, omega_checkpoint=args.omega_checkpoint,
-        no_plant_masks=args.no_plant_masks)
+        no_plant_masks=args.no_plant_masks, intrinsics_from=args.intrinsics_from)
 
 
 if __name__ == "__main__":

@@ -89,3 +89,67 @@ def test_predictions_without_depth_are_left_alone():
     before = prediction["pts3d"].clone()
     assert exporter.rebuild_points_from_depth([prediction]) == 0
     assert torch.equal(prediction["pts3d"], before)
+
+
+def test_known_intrinsics_land_in_the_models_working_resolution():
+    """The mapping must be the exact inverse of the model's own preprocessing.
+
+    MapAnything resizes by the larger ratio and centre-crops, so a focal
+    given in frame pixels has to be scaled and the principal point shifted by
+    the crop -- getting this wrong is how a correct focal still produces a
+    wrong reconstruction.
+    """
+    # 1920x1280 -> the 3:2 bucket MapAnything picks, which is 518x336.
+    K = exporter.processed_intrinsics((3020.48, 3020.48, 960.0, 640.0), (1920, 1280), (336, 518))
+    scale = 518 / 1920
+    assert np.isclose(K[0, 0], 3020.48 * scale)
+    # The crop is 4.5px top and bottom, so a centred principal point stays
+    # centred in the cropped image.
+    assert np.isclose(K[0, 2], 259.0, atol=0.5)
+    assert np.isclose(K[1, 2], 168.0, atol=0.5)
+
+
+def test_a_focal_only_source_puts_the_principal_point_at_the_frame_centre():
+    """EXIF gives a focal and nothing else, which implies a centred pinhole."""
+    exif = exporter.processed_intrinsics((2880.0, 2880.0, None, None), (1920, 1280), (336, 518))
+    explicit = exporter.processed_intrinsics((2880.0, 2880.0, 960.0, 640.0), (1920, 1280), (336, 518))
+    np.testing.assert_allclose(exif, explicit)
+
+
+def test_the_mapping_inverts_what_the_exporter_undoes_afterwards():
+    """Round-trip against the code that maps an exported model back to frames."""
+    pytest.importorskip("pycolmap")
+    from pose_estimator.geometry import rescale_model_to_frames
+
+    frame = (3020.48, 3020.48, 960.0, 640.0)
+    K = exporter.processed_intrinsics(frame, (1920, 1280), (336, 518))
+
+    model = Path(pytest.importorskip("tempfile").mkdtemp()) / "sparse"
+    model.mkdir(parents=True)
+    (model / "cameras.txt").write_text(
+        f"1 PINHOLE 518 336 {K[0, 0]} {K[1, 1]} {K[0, 2]} {K[1, 2]}\n")
+    (model / "images.txt").write_text("1 1 0 0 0 0 0 0 1 frame_0000.jpg\n\n")
+    (model / "points3D.txt").write_text("1 0 0 1 128 128 128 0\n")
+    rescale_model_to_frames(model, (1920, 1280))
+
+    import pycolmap
+
+    camera = list(pycolmap.Reconstruction(str(model)).cameras.values())[0]
+    np.testing.assert_allclose(camera.params[0], frame[0], rtol=1e-6)
+    np.testing.assert_allclose(camera.params[2], frame[2], atol=0.5)
+    np.testing.assert_allclose(camera.params[3], frame[3], atol=0.5)
+
+
+def test_intrinsics_sources_resolve_to_real_files(tmp_path):
+    import pytest as _pytest
+
+    from pose_estimator.geometry import resolve_intrinsics_source
+
+    assert resolve_intrinsics_source(tmp_path, None) is None
+    with _pytest.raises(FileNotFoundError, match="intrinsics.json"):
+        resolve_intrinsics_source(tmp_path, "exif")
+    (tmp_path / "p1").mkdir()
+    (tmp_path / "p1" / "intrinsics.json").write_text('{"frame_0000": 2880.0}')
+    assert resolve_intrinsics_source(tmp_path, "exif").endswith("p1/intrinsics.json")
+    with _pytest.raises(FileNotFoundError):
+        resolve_intrinsics_source(tmp_path, "/nope/missing.json")
