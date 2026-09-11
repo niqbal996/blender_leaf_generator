@@ -103,13 +103,16 @@ def run(
         else:
             normals = estimate_normals(points).astype(np.float64)
             print(f"  no normals in {cloud_path.name}; estimated by local PCA")
-            if cloud_path == hull:
+            if chosen.is_hull:
                 print("    WARNING: this is the P4a hull, a solid. Its interior points have no "
                       "surface to be normal to, so the weighting is far less meaningful here "
                       "than on P4b's carved surface.")
 
+    # P4b's surfels describe the baseline cloud, in the baseline's frame and
+    # scale. A learned branch reconstructs its own, so sampling those colours
+    # onto it would query a nearest neighbour in the wrong coordinate system.
     surfel_file = workdir / "p4b" / "surfels.npz"
-    if surfel_file.exists():
+    if surfel_file.exists() and chosen.is_baseline:
         surfels = np.load(surfel_file)
         colors = colors_from_surfels(points, surfels["means"], surfels["colors"])
     else:

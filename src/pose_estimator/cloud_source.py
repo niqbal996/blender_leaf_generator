@@ -42,6 +42,7 @@ class CloudSource:
     structure_dir: Path
     backend: str
     origin: str
+    is_hull: bool = False
 
     @property
     def is_baseline(self) -> bool:
@@ -73,13 +74,14 @@ def resolve(
             source == "auto" and surface.exists()) else hull
         origin = ("P4b carved surface" if chosen == surface
                   else "P4a hull (no P4b surface on disk)")
-        return CloudSource(chosen, labels_dir, structure_dir, backend, origin)
+        return CloudSource(chosen, labels_dir, structure_dir, backend, origin,
+                           is_hull=chosen == hull)
 
     experiment_hull = workdir / "p4" / "experiments" / backend / "hull_points.ply"
     learned = workdir / "p3" / "experiments" / backend / "sparse_points.ply"
     if source == "hull":
         return CloudSource(experiment_hull, labels_dir, structure_dir, backend,
-                           f"hull carved from {backend} poses")
+                           f"hull carved from {backend} poses", is_hull=True)
     return CloudSource(learned, labels_dir, structure_dir, backend,
                        f"{backend} P3 cloud, uncarved")
 

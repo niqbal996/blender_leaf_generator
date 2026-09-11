@@ -156,8 +156,19 @@ def find_base(
     extent = float(np.ptp(points, axis=0).max())
     radius = ball_fraction * extent
     tree = cKDTree(points)
-    aggregated = np.array([count[i].sum() for i in tree.query_ball_point(points, radius)],
-                          float)
+    # Scattered from the path nodes rather than gathered around every point.
+    # The two are identical -- a ball sum is symmetric, and `count` is zero
+    # except on the geodesics between at most `max_extremities` tips, so only
+    # those nodes can contribute anything. Gathering asked cKDTree for one
+    # Python list per point, which is fine at the 57k points of a carved
+    # surface and fatal at the 190k of a learned cloud: that form reached 6GB
+    # and was killed by the OOM killer, on a plant no bigger than before.
+    aggregated = np.zeros(len(points), float)
+    carriers = np.nonzero(count > 0)[0]
+    for start in range(0, len(carriers), 512):
+        chunk = carriers[start:start + 512]
+        for node, neighbours in zip(chunk, tree.query_ball_point(points[chunk], radius)):
+            aggregated[neighbours] += count[node]
     if aggregated.max() <= 0:
         return None
 
