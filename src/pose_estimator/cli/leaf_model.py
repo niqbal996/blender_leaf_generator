@@ -16,15 +16,18 @@ from typing import Optional
 
 import numpy as np
 
+from pose_estimator import cloud_source
 from pose_estimator.leaf import fit_leaf, frame_continuity_degrees, resolve_leaf_base
 from pose_estimator.ply_io import write_ply_vertices
 
 
-def run(workdir: Path, num_samples: int = 20) -> dict:
+def run(workdir: Path, num_samples: int = 20,
+        geometry_backend: str = cloud_source.BASELINE) -> dict:
     import pycolmap
 
-    p5_dir = workdir / "p5"
-    p6_dir = workdir / "p6"
+    p5_dir = cloud_source.phase_dirs(workdir, geometry_backend)[1]
+    p6_dir = (workdir / "p6" if geometry_backend == cloud_source.BASELINE
+              else workdir / "p6" / "experiments" / geometry_backend)
     (p6_dir / "diag").mkdir(parents=True, exist_ok=True)
 
     with open(p5_dir / "stem_graph.json") as f:
@@ -217,8 +220,11 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--workdir", required=True, type=Path)
     parser.add_argument("--num-samples", type=int, default=20,
                         help="Stations along each midrib at which to report frame, curvature and width")
+    parser.add_argument("--geometry-backend", default=cloud_source.BASELINE,
+                        help="Fit this P3 branch's leaves, from p5/experiments/<backend>")
     args = parser.parse_args(argv)
-    run(workdir=args.workdir, num_samples=args.num_samples)
+    run(workdir=args.workdir, num_samples=args.num_samples,
+        geometry_backend=args.geometry_backend)
 
 
 if __name__ == "__main__":

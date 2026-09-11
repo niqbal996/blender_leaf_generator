@@ -68,17 +68,18 @@ def leaf_hexes(n):
             for rgb in distinct_leaf_colors(n)]
 
 
-def load(workdir: Path, source: str):
+def load(workdir: Path, source: str, geometry_backend: str = "colmap"):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from pose_estimator import cloud_source
     from pose_estimator.ply_io import read_ply_vertices
 
-    p4c, p5 = workdir / "p4c", workdir / "p5"
+    chosen = cloud_source.resolve(workdir, geometry_backend)
+    p4c, p5 = chosen.labels_dir, chosen.structure_dir
     labels = np.load(p4c / "labels.npy")
     votes = np.load(p4c / "votes.npz", allow_pickle=True)
     class_order = [str(x) for x in votes["class_order"]]
 
-    surface = workdir / "p4b" / "surface.ply"
-    cloud_path = surface if surface.exists() else workdir / "p4" / "hull_points.ply"
+    cloud_path = chosen.path
     fields = read_ply_vertices(cloud_path)
     points = np.stack([fields["x"], fields["y"], fields["z"]], axis=1).astype(float)
 
@@ -165,6 +166,10 @@ def main() -> None:
     p.add_argument("--workdir", required=True, type=Path)
     p.add_argument("--mode", choices=["instances", "organs"], default="instances")
     p.add_argument("--source", choices=["auto", "p4c", "p5"], default="auto")
+    p.add_argument("--geometry-backend", default="colmap",
+                   help="Which P3 branch to show: colmap, vggt_omega or mapanything. "
+                        "A learned branch reads p4c/experiments/<backend> and "
+                        "p5/experiments/<backend>")
     p.add_argument("--max-points", type=int, default=60000,
                    help="points drawn; decimation affects the display only")
     p.add_argument("--save", type=Path, help="write PNGs here instead of opening a window")
@@ -176,7 +181,7 @@ def main() -> None:
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-    data = load(args.workdir, args.source)
+    data = load(args.workdir, args.source, args.geometry_backend)
     n_instances = int(data["leaf_ids"].max()) + 1 if data["leaf_ids"] is not None else 0
     print(f"  {len(data['points'])} points, classes {data['class_order']}, "
           f"{n_instances} leaf instance(s)")

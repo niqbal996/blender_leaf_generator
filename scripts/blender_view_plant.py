@@ -14,7 +14,22 @@ Three ways to run it.
    Windows Blender reading a WSL checkout, give the path Windows can resolve
    (\\\\wsl.localhost\\<distro>\\home\\...), not the /home/... form.
 
-What you get, as four collections:
+One geometry branch, or several side by side::
+
+    ./scripts/view_in_blender.sh runs/plant_9 --geometry-backend mapanything
+    ./scripts/view_in_blender.sh runs/plant_9 --compare
+    ./scripts/view_in_blender.sh runs/plant_9 --compare colmap,mapanything
+
+`--compare` draws each branch in a row, every collection prefixed with its
+backend name (`colmap_plant_cloud`, `mapanything_plant_midribs`), so one
+branch can be soloed or hidden in the outliner while the others stay put. The
+branches are scaled to a common size first: the backends reconstruct at
+unrelated scales and none of them is metric, so drawn in their own units the
+comparison would be one of arbitrary constants rather than of plants. The
+factor applied to each is printed, and `scripts/compare_branches.py` prints
+the raw extents beside the leaf counts.
+
+What you get, as four collections (prefixed per branch under --compare):
 
     plant_cloud    the leaf (and unassigned) points, in their own colours
     plant_root     the P4c root points, split out and drawn larger -- they are
@@ -135,10 +150,26 @@ def read_ply(path):
     return xyz, rgb
 
 
-def load(workdir):
-    """Returns (xyz, rgb, stem, leaves, graph), or None if the run is not there."""
+def branch_dirs(workdir, backend="colmap"):
+    """(p4c, p5) for one geometry branch.
+
+    The same rule as `pose_estimator.cloud_source.phase_dirs`, written out
+    again rather than imported: this file has to run inside Blender's bundled
+    Python, which cannot import the repo. Two lines of duplication is the
+    price of the whole script staying self-contained.
+    """
     workdir = Path(workdir)
-    graph_path = workdir / "p5" / "stem_graph.json"
+    if backend in (None, "", "colmap"):
+        return workdir / "p4c", workdir / "p5"
+    return (workdir / "p4c" / "experiments" / backend,
+            workdir / "p5" / "experiments" / backend)
+
+
+def load(workdir, backend="colmap"):
+    """Returns (xyz, rgb, stem, leaves, graph, extra), or None if not there."""
+    workdir = Path(workdir)
+    _p4c, p5 = branch_dirs(workdir, backend)
+    graph_path = p5 / "stem_graph.json"
     if not graph_path.exists():
         print(f"[plant] ERROR: {graph_path} not found.")
         print("[plant] Run `pose-structure --workdir <dir>` first, and check the path is")
@@ -147,14 +178,14 @@ def load(workdir):
     with open(graph_path) as f:
         graph = json.load(f)
 
-    cloud_path = workdir / "p5" / "structure.ply"
+    cloud_path = p5 / "structure.ply"
     xyz, rgb = read_ply(cloud_path) if cloud_path.exists() else (np.zeros((0, 3)), None)
 
     stem = np.array(graph.get("stem_path_xyz") or []).reshape(-1, 3)
-    return xyz, rgb, stem, graph.get("leaves", []), graph, tip_evidence(workdir)
+    return xyz, rgb, stem, graph.get("leaves", []), graph, tip_evidence(workdir, backend)
 
 
-def tip_evidence(workdir):
+def tip_evidence(workdir, backend="colmap"):
     """Tip evidence that does not come from P5's own instancing.
 
     Two independent sources, both written to disk and neither reaching the
@@ -168,27 +199,28 @@ def tip_evidence(workdir):
                       regions rather than points, so a prior, not a location.
     """
     out = {}
-    voted = workdir / "p4c" / "tips3d.ply"
+    p4c, p5 = branch_dirs(workdir, backend)
+    voted = p4c / "tips3d.ply"
     if voted.exists():
         xyz, rgb = read_ply(voted)
         # Green carries how well supported each tip is. Drawing every cluster
         # the same size made twelve noise votes look exactly like the seven
         # real tips -- the detection was right and the picture was not.
         out["voted_support"] = rgb[:, 1] if len(rgb) else np.zeros(0)
-        graph_path = workdir / "p5" / "stem_graph.json"
+        graph_path = p5 / "stem_graph.json"
         if len(xyz) and graph_path.stat().st_mtime > voted.stat().st_mtime:
             print("[plant] NOTE: p4c/tips3d.ply predates this P5 run -- "
                   "re-run pose-tips to refresh it.")
         out["voted"] = xyz
-    prior = workdir / "p5" / "tip_class.ply"
+    prior = p5 / "tip_class.ply"
     if prior.exists():
         out["prior"], _ = read_ply(prior)
 
     # Per-leaf membership, so each instance can be shown, hidden or checked on
     # its own. One merged cloud shows the colours but gives no way to ask
     # "which points does leaf 3 actually own".
-    ids_path = workdir / "p5" / "leaf_points.npy"
-    xyz_path = workdir / "p5" / "leaf_points_xyz.npy"
+    ids_path = p5 / "leaf_points.npy"
+    xyz_path = p5 / "leaf_points_xyz.npy"
     if ids_path.exists() and xyz_path.exists():
         out["leaf_ids"] = np.load(ids_path)
         out["leaf_xyz"] = np.load(xyz_path)
@@ -237,13 +269,18 @@ def vertex_colour_material(name):
 _PREPARED = set()
 
 
+def _identity(points):
+    """The transform a single-branch view uses: leave the geometry alone."""
+    return np.asarray(points, float)
+
+
 def _in_scene(coll):
     """Whether `coll` hangs anywhere under the current scene."""
     root = bpy.context.scene.collection
     return coll is root or coll in root.children_recursive
 
 
-def collection(name):
+def _collection(name):
     existing = bpy.data.collections.get(name)
     if existing is None:
         made = bpy.data.collections.new(name)
@@ -410,10 +447,23 @@ def clear_startup_scene():
         print("[plant] cleared startup objects: " + ", ".join(removed))
 
 
-def build(workdir, point_radius=None, stem_radius=None, frame=True):
-    _PREPARED.clear()
-    clear_startup_scene()
-    loaded = load(workdir)
+def build(workdir, point_radius=None, stem_radius=None, frame=True,
+          backend="colmap", prefix="", place=None, clear=True):
+    """Build one branch. `place` puts it somewhere other than where it sits.
+
+    `place` is (target_extent, offset): the branch is scaled so its longest
+    side measures `target_extent`, stood on z=0, centred in x and y, and then
+    moved by `offset`. That is what makes three branches comparable in one
+    scene -- the backends reconstruct at unrelated, non-metric scales, so
+    drawn in their own units VGGT-Omega's plant is a quarter the size of
+    COLMAP's and the comparison becomes one of scale rather than of shape.
+    Left as None the branch is drawn exactly where it is, which is what a
+    single-branch view has always done.
+    """
+    if clear:
+        _PREPARED.clear()
+        clear_startup_scene()
+    loaded = load(workdir, backend)
     if loaded is None:
         return None
     xyz, rgb, stem, leaves, graph, extra = loaded
@@ -424,6 +474,36 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True):
         return None
     low, high = reference.min(axis=0), reference.max(axis=0)
     extent = float((high - low).max())
+
+    def collection(name):                       # noqa: F811 -- prefixed per branch
+        return _collection(f"{prefix}{name}")
+
+    xform = _identity
+    if place is not None:
+        target, offset = place
+        scale = (target / extent) if extent else 1.0
+        # Stood on its base rather than centred on its middle: the branches
+        # then share a ground line, and a leaf that droops below the crown in
+        # one reconstruction and not in another is visible at a glance.
+        centre = np.array([(low[0] + high[0]) / 2.0,
+                           (low[1] + high[1]) / 2.0, low[2]])
+        shift = np.asarray(offset, float)
+
+        def xform(points):                      # noqa: F811
+            points = np.asarray(points, float)
+            if not points.size:
+                return points
+            flat = points.reshape(-1, 3)
+            return ((flat - centre) * scale + shift).reshape(points.shape)
+
+        xyz = xform(xyz)
+        stem = xform(stem)
+        for key in ("voted", "prior", "leaf_xyz"):
+            if key in extra and len(extra[key]):
+                extra[key] = xform(extra[key])
+        reference = xyz if len(xyz) else stem
+        low, high = reference.min(axis=0), reference.max(axis=0)
+        extent = float((high - low).max())
 
     point_radius = point_radius or extent * 0.0016
     stem_radius = stem_radius or extent * 0.010     # bold on purpose
@@ -437,62 +517,64 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True):
         # cannot be isolated, soloed or hidden. Root is drawn larger for the
         # same reason.
         if rgb is None:
-            add_point_cloud(xyz, rgb, point_radius, collection("plant_cloud"))
+            add_point_cloud(xyz, rgb, point_radius, collection("plant_cloud"),
+                            name=f"{prefix}plant_cloud")
         else:
             is_root = _matches_colour(rgb, ROOT_RGB01)
             is_stem = _matches_colour(rgb, STEM_RGB01)
             rest = ~(is_root | is_stem)
             if rest.any():
                 add_point_cloud(xyz[rest], rgb[rest], point_radius,
-                                collection("plant_cloud"))
+                                collection("plant_cloud"), name=f"{prefix}plant_cloud")
             if is_stem.any():
                 add_point_cloud(xyz[is_stem], rgb[is_stem], point_radius,
-                                collection("plant_stem_cloud"), name="plant_stem_cloud")
+                                collection("plant_stem_cloud"), name=f"{prefix}plant_stem_cloud")
             if is_root.any():
                 add_point_cloud(xyz[is_root], rgb[is_root], point_radius * 1.8,
-                                collection("plant_root"), name="plant_root")
+                                collection("plant_root"), name=f"{prefix}plant_root")
             print(f"[plant] cloud split: {int(rest.sum())} leaf/unassigned, "
                   f"{int(is_stem.sum())} stem, {int(is_root.sum())} root")
 
     if len(stem) > 1:
-        add_curve(stem, "plant_stem_line", STEM_RGBA, stem_radius, collection("plant_stem"))
+        add_curve(stem, f"{prefix}plant_stem_line", STEM_RGBA, stem_radius, collection("plant_stem"))
 
     # Named ends, when P5 measured them (the upright path). Bigger than the
     # line is thick, so they read as landmarks and not as kinks in it.
-    for key, name, rgba in (("crown_xyz", "plant_crown", CROWN_RGBA),
-                            ("heart_xyz", "plant_heart", HEART_RGBA)):
+    for key, name, rgba in (("crown_xyz", f"{prefix}plant_crown", CROWN_RGBA),
+                            ("heart_xyz", f"{prefix}plant_heart", HEART_RGBA)):
         point = graph.get(key)
         if point:
-            add_sphere(np.array(point, float), name, rgba, stem_radius * 2.5,
-                       collection("plant_stem"))
-            print(f"[plant] {name} at {np.round(point, 4).tolist()}")
+            placed = xform(np.array(point, float))
+            add_sphere(placed, name, rgba, stem_radius * 2.5, collection("plant_stem"))
+            print(f"[plant] {name} at {np.round(placed, 4).tolist()}")
 
     if len(stem) == 1:
         # A rosette: P5 reports its base as one node because the leaves meet at
         # a crown rather than along a stem. Drawn as a curve that would be an
         # elbow of pipe no thistle has, so it gets a sphere instead.
-        add_sphere(stem[0], "plant_crown", STEM_RGBA, stem_radius * 2.5,
+        add_sphere(stem[0], f"{prefix}plant_crown", STEM_RGBA, stem_radius * 2.5,
                    collection("plant_stem"))
 
-    chords = np.array(graph.get("chords_xyz") or []).reshape(-1, 24, 3) \
+    chords = xform(np.array(graph.get("chords_xyz") or []).reshape(-1, 24, 3)) \
         if graph.get("chords_xyz") else np.zeros((0, 24, 3))
     if len(chords):
         # Straight tip-to-base reference lines. A midrib that wanders is
         # obvious beside one; alone it just looks like a curve.
         chord_group = collection("plant_chords")
         for i, chord in enumerate(chords):
-            add_curve(chord, f"chord_{i:02d}", (0.75, 0.75, 0.75, 1.0),
+            add_curve(chord, f"{prefix}chord_{i:02d}", (0.75, 0.75, 0.75, 1.0),
                       leaf_radius * 0.35, chord_group)
 
     midribs = collection("plant_midribs")
     tips = collection("plant_tips")
     for leaf in leaves:
-        axis = np.array(leaf["axis_xyz"]).reshape(-1, 3)
+        axis = xform(np.array(leaf["axis_xyz"]).reshape(-1, 3))
         colour = LEAF_RGBA[leaf["id"] % len(LEAF_RGBA)]
         if len(axis) > 1:
-            add_curve(axis, f"midrib_{leaf['id']:02d}", colour, leaf_radius, midribs)
+            add_curve(axis, f"{prefix}midrib_{leaf['id']:02d}", colour, leaf_radius, midribs)
         if "tip_xyz" in leaf:
-            add_sphere(leaf["tip_xyz"], f"tip_{leaf['id']:02d}", TIP_RGBA, tip_radius, tips)
+            add_sphere(xform(np.array(leaf["tip_xyz"], float)),
+                       f"{prefix}tip_{leaf['id']:02d}", TIP_RGBA, tip_radius, tips)
 
     # Evidence P5's instancing did not produce. Drawn distinctly on purpose:
     # where these disagree with plant_tips is exactly where to look.
@@ -506,7 +588,7 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True):
             # `support` is already 0..1: read_ply normalises colours, and
             # dividing by 255 a second time pinned every sphere to the floor.
             scale = 0.25 + 0.75 * float(np.clip(support[i], 0.0, 1.0))
-            add_sphere(position, f"voted_tip_{i:02d}_{int(support[i]):03d}",
+            add_sphere(position, f"{prefix}voted_tip_{i:02d}_{int(support[i]):03d}",
                        VOTED_TIP_RGBA, tip_radius * 1.3 * scale, coll)
 
     ids = extra.get("leaf_ids")
@@ -520,20 +602,21 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True):
             rgba = LEAF_RGBA[leaf_id % len(LEAF_RGBA)]
             add_point_cloud(leaf_xyz[member],
                             np.tile(np.array([rgba[:3]]), (int(member.sum()), 1)),
-                            point_radius * 1.4, coll, name=f"leaf_{leaf_id:02d}",
-                            material=emission_material(f"leaf_{leaf_id:02d}_mat", rgba))
+                            point_radius * 1.4, coll, name=f"{prefix}leaf_{leaf_id:02d}",
+                            material=emission_material(f"{prefix}leaf_{leaf_id:02d}_mat", rgba))
         unassigned = ids < 0
         if unassigned.any():
             add_point_cloud(leaf_xyz[unassigned],
                             np.tile(np.array([[0.45, 0.45, 0.45]]), (int(unassigned.sum()), 1)),
-                            point_radius, coll, name="leaf_unassigned",
-                            material=emission_material("leaf_unassigned_mat",
+                            point_radius, coll, name=f"{prefix}leaf_unassigned",
+                            material=emission_material(f"{prefix}leaf_unassigned_mat",
                                                        (0.45, 0.45, 0.45, 1.0)))
 
     prior = extra.get("prior", np.zeros((0, 3)))
     if len(prior):
         add_point_cloud(prior, np.tile(np.array([[0.15, 0.9, 0.45]]), (len(prior), 1)),
-                        point_radius * 2.2, collection("plant_tip_class"))
+                        point_radius * 2.2, collection("plant_tip_class"),
+                        name=f"{prefix}plant_tip_class")
 
     if frame:
         frame_view((low + high) / 2.0, extent)
@@ -542,21 +625,142 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True):
     print(f"[plant] origin: {graph.get('origin_definition', 'unknown')}")
     print(f"[plant] extent {extent:.3f}, stem radius {stem_radius:.4f}, "
           f"points {point_radius:.4f}")
-    print("[plant] collections: plant_cloud, plant_root, plant_stem_cloud, "
-          "plant_stem, plant_midribs, plant_tips")
-    return {"points": len(xyz), "leaves": len(leaves), "stem_nodes": len(stem)}
+    print(f"[plant] collections: {prefix}plant_cloud, {prefix}plant_root, "
+          f"{prefix}plant_stem_cloud, {prefix}plant_stem, {prefix}plant_midribs, "
+          f"{prefix}plant_tips")
+    return {"points": len(xyz), "leaves": len(leaves), "stem_nodes": len(stem),
+            "bounds": (low, high), "extent": extent}
+
+
+def branch_extent(workdir, backend):
+    """The longest side of a branch's P5 cloud, or None if it has not run."""
+    _p4c, p5 = branch_dirs(workdir, backend)
+    cloud = p5 / "structure.ply"
+    if not cloud.exists():
+        return None
+    xyz, _rgb = read_ply(cloud)
+    if not len(xyz):
+        return None
+    return float((xyz.max(axis=0) - xyz.min(axis=0)).max())
+
+
+def add_label(text, centre, size, into, name, rgba=(0.85, 0.85, 0.85, 1.0)):
+    """A flat text object naming a branch, standing under it.
+
+    Built from data like everything else here. Rotated upright so it faces the
+    default front view, which is where you stand to compare three plants in a
+    row.
+    """
+    curve = bpy.data.curves.new(name, "FONT")
+    curve.body = text
+    curve.size = size
+    curve.align_x = "CENTER"
+    obj = bpy.data.objects.new(name, curve)
+    obj.location = tuple(float(c) for c in centre)
+    obj.rotation_euler = (np.pi / 2.0, 0.0, 0.0)
+    obj.data.materials.append(emission_material(f"{name}_mat", rgba))
+    into.objects.link(obj)
+    return obj
+
+
+def build_comparison(workdir, backends, gap=1.45, frame=True):
+    """Draw several geometry branches side by side in one scene.
+
+    The branches are normalised to a common size before being placed. That is
+    a deliberate loss of information -- the backends' scales genuinely differ,
+    by a factor of four between COLMAP and VGGT-Omega on thistle3 -- but none
+    of those scales is metric, so drawing them in their own units compares
+    arbitrary constants instead of plants. The scale factor applied to each
+    branch is printed, and `scripts/compare_branches.py` prints the raw
+    extents, so the discarded information is one command away.
+
+    Missing branches are reported and skipped rather than being fatal: a
+    comparison of the two that ran is still worth looking at.
+    """
+    _PREPARED.clear()
+    clear_startup_scene()
+
+    present = [(b, branch_extent(workdir, b)) for b in backends]
+    missing = [b for b, e in present if e is None]
+    present = [(b, e) for b, e in present if e is not None]
+    if not present:
+        print(f"[plant] ERROR: none of {', '.join(backends)} has a P5 result under {workdir}.")
+        print("[plant] Run:  ./run_pipeline.sh <dataset> --compare " + ",".join(backends))
+        return None
+    if missing:
+        print(f"[plant] NOTE: no P5 result for {', '.join(missing)} -- skipped.")
+
+    # The first branch present keeps its own size, and the others are matched
+    # to it, so a familiar branch still looks the size it always did.
+    target = present[0][1]
+    results = {}
+    for index, (backend, extent) in enumerate(present):
+        offset = (index * target * gap, 0.0, 0.0)
+        print(f"\n[plant] --- {backend}: extent {extent:.3f} "
+              f"-> x{target / extent:.3f}, placed at x={offset[0]:.3f} ---")
+        built = build(workdir, backend=backend, prefix=f"{backend}_",
+                      place=(target, offset), frame=False, clear=False)
+        if built is None:
+            continue
+        results[backend] = built
+        add_label(backend, (offset[0], 0.0, -target * 0.12), target * 0.09,
+                  _collection("comparison_labels"), f"label_{backend}")
+
+    if not results:
+        return None
+
+    lows = np.array([r["bounds"][0] for r in results.values()])
+    highs = np.array([r["bounds"][1] for r in results.values()])
+    low, high = lows.min(axis=0), highs.max(axis=0)
+    if frame:
+        frame_view((low + high) / 2.0, float((high - low).max()))
+
+    print("\n[plant] side by side, left to right: " + ", ".join(results))
+    for backend, built in results.items():
+        print(f"[plant]   {backend:<12} {built['points']:>7} points, "
+              f"{built['leaves']} leaves, collections prefixed {backend}_")
+    print("[plant] sizes are normalised -- see scripts/compare_branches.py for "
+          "the real extents")
+    return results
+
+
+def script_args(argv):
+    """Whatever follows the `--` Blender stops parsing at."""
+    return argv[argv.index("--") + 1:] if "--" in argv else []
+
+
+def _after(rest, flag, default=""):
+    if flag in rest and rest.index(flag) + 1 < len(rest):
+        return rest[rest.index(flag) + 1]
+    return default
 
 
 def resolve_workdir(argv):
     if WORKDIR:
         return WORKDIR
-    if "--" in argv:
-        rest = argv[argv.index("--") + 1:]
-        if "--workdir" in rest:
-            return rest[rest.index("--workdir") + 1]
-        if rest:
-            return rest[0]
+    rest = script_args(argv)
+    if "--workdir" in rest:
+        return _after(rest, "--workdir")
+    if rest and not rest[0].startswith("--"):
+        return rest[0]
     return os.environ.get("PLANT_WORKDIR", "")
+
+
+def resolve_branches(argv):
+    """(backends to compare, single backend) from the command line.
+
+    `--compare a,b,c` builds them side by side; `--geometry-backend b` builds
+    one branch where it stands. Neither given is the historical behaviour:
+    the baseline COLMAP branch, alone, unmoved.
+    """
+    rest = script_args(argv)
+    compare = _after(rest, "--compare", os.environ.get("PLANT_COMPARE", ""))
+    if "--compare" in rest and (compare.startswith("--") or not compare):
+        compare = "colmap,vggt_omega,mapanything"
+    backends = [b.strip() for b in compare.split(",") if b.strip()]
+    single = _after(rest, "--geometry-backend",
+                    os.environ.get("PLANT_GEOMETRY_BACKEND", "colmap"))
+    return backends, single
 
 
 def hide_splash():
@@ -584,8 +788,13 @@ def main():
         print("[plant] or launch as:")
         print("[plant]   blender --python blender_view_plant.py -- --workdir runs/plant_9")
         return
+    backends, single = resolve_branches(list(sys.argv))
     try:
-        build(target)
+        if backends:
+            build_comparison(target, backends)
+        else:
+            build(target, backend=single,
+                  prefix="" if single == "colmap" else f"{single}_")
     except Exception:
         print("[plant] failed while building the scene:")
         traceback.print_exc()

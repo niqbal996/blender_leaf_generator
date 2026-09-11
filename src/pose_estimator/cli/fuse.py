@@ -30,6 +30,7 @@ import numpy as np
 
 from pose_estimator.classify2d import load_class_map, read_manifest
 from pose_estimator.dino import leaf_instances
+from pose_estimator import cloud_source
 from pose_estimator.ply_io import read_ply_vertices, write_ply_vertices
 from pose_estimator.semantic import (
     accumulate_votes,
@@ -64,12 +65,18 @@ def run(
     source: str = "auto",
     instance_radius_voxels: float = 2.5,
     normal_weighting: bool = True,
+    geometry_backend: str = cloud_source.BASELINE,
+    cloud: Optional[Path] = None,
 ) -> dict:
     import pycolmap
 
-    p4c = workdir / "p4c"
-    class_map_dir = p4c / "class_maps"
-    manifest = read_manifest(p4c)
+    chosen = cloud_source.resolve(workdir, geometry_backend, cloud, source)
+    p4c = chosen.labels_dir
+    p4c.mkdir(parents=True, exist_ok=True)
+    # The class maps are 2D and shared: classification knows nothing about the
+    # cloud, so every branch labels the same maps and differs only in geometry.
+    class_map_dir = cloud_source.class_map_dir(workdir)
+    manifest = read_manifest(class_map_dir.parent)
     class_order = manifest["class_order"]
     print(f"  class maps from the {manifest['backend']} backend: {', '.join(class_order)}")
 
@@ -77,13 +84,13 @@ def run(
     # points and poses, so the hull works -- it is simply a solid, so the
     # coloured cloud is blobbier and its interior points have no surface to be
     # normal to, which makes the obliquity weighting far less meaningful.
-    surface = workdir / "p4b" / "surface.ply"
-    hull = workdir / "p4" / "hull_points.ply"
-    cloud_path = surface if source == "surface" or (
-        source == "auto" and surface.exists()) else hull
+    cloud_path = chosen.path
     if not cloud_path.exists():
-        raise SystemExit(f"{cloud_path} not found -- run pose-hull (and ideally pose-surface) first")
-    print(f"  labelling {cloud_path}")
+        raise SystemExit(
+            f"{cloud_path} not found ({chosen.origin}) -- "
+            + ("run pose-hull (and ideally pose-surface) first" if chosen.is_baseline
+               else f"run pose-geometry --backends {geometry_backend} first"))
+    print(f"  labelling {cloud_path} -- {chosen.origin}")
 
     fields = read_ply_vertices(cloud_path)
     points = np.stack([fields["x"], fields["y"], fields["z"]], axis=1).astype(np.float64)
@@ -109,10 +116,11 @@ def run(
         # Colours only feed the index-map render, which uses positions alone,
         # so grey is fine when P4b was skipped.
         colors = np.full((len(points), 3), 160, np.uint8)
-    with open(workdir / "p4" / "hull.json") as f:
-        voxel = json.load(f)["voxel_size"]
+    voxel, voxel_origin = cloud_source.voxel_size(workdir, geometry_backend, points)
+    print(f"  voxel {voxel:.5f} ({voxel_origin})")
 
-    reconstruction = pycolmap.Reconstruction(str(workdir / "p3" / "sparse" / "best"))
+    sparse_model, _ = cloud_source.geometry(workdir, geometry_backend)
+    reconstruction = pycolmap.Reconstruction(str(sparse_model))
     image_ids = sorted(reconstruction.reg_image_ids())
     print(f"  {len(points)} points, {len(image_ids)} registered views")
 
@@ -311,6 +319,12 @@ def _ply(path: Path, xyz, rgb) -> None:
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     """Shared with pose-semantic, which runs the classify stage and this one."""
+    parser.add_argument("--geometry-backend", default=cloud_source.BASELINE,
+                        help="Label the cloud from this P3 backend. colmap uses the P4b surface "
+                             "or P4a hull as before; a learned backend labels its own P3 cloud "
+                             "directly and writes to p4c/experiments/<backend>")
+    parser.add_argument("--cloud", type=Path,
+                        help="Label this PLY instead, whatever produced it")
     parser.add_argument("--source", choices=["auto", "surface", "hull"], default="auto",
                         help="label the P4b thin surface or the P4a hull. 'auto' prefers the "
                              "surface when present")
@@ -332,6 +346,7 @@ def main(argv: Optional[list] = None) -> None:
     args = parser.parse_args(argv)
 
     run(workdir=args.workdir, source=args.source,
+        geometry_backend=args.geometry_backend, cloud=args.cloud,
         instance_radius_voxels=args.instance_radius_voxels,
         normal_weighting=not args.no_normal_weighting)
 

@@ -26,6 +26,7 @@ from typing import Optional
 
 import numpy as np
 
+from pose_estimator import cloud_source
 from pose_estimator.ply_io import read_ply_vertices, write_ply_vertices
 from pose_estimator.pose import orbit_frame
 from pose_estimator.structure import solve_plant_frame
@@ -57,45 +58,51 @@ def run(
     min_tip_depth_voxels: float = 8.0,
     min_persistence_ratio: Optional[float] = None,
     architecture: str = "caulescent",
+    geometry_backend: str = cloud_source.BASELINE,
+    cloud: Optional[Path] = None,
 ) -> dict:
     import pycolmap
 
     # Prefer the P4b surface over the P4a hull. The hull is a solid bound --
     # 71.5% enclosed interior voxels, near-isotropic local neighbourhoods --
     # so organ labels on it describe volume rather than surface.
-    surface_path = workdir / "p4b" / "surface.ply"
-    hull_path = workdir / "p4" / "hull_points.ply"
-    cloud_path = surface_path if source == "surface" or (
-        source == "auto" and surface_path.exists()) else hull_path
+    chosen = cloud_source.resolve(workdir, geometry_backend, cloud, source)
+    cloud_path = chosen.path
     if not cloud_path.exists():
-        raise FileNotFoundError(f"{cloud_path} not found -- run pose-hull / pose-surface first")
-    print(f"  structure source: {cloud_path}")
+        raise FileNotFoundError(
+            f"{cloud_path} not found ({chosen.origin}) -- "
+            + ("run pose-hull / pose-surface first" if chosen.is_baseline
+               else f"run pose-geometry --backends {geometry_backend} first"))
+    print(f"  structure source: {cloud_path} -- {chosen.origin}")
 
-    labels_file = workdir / "p4c" / "labels.npy"
+    labels_file = chosen.labels_dir / "labels.npy"
     if not labels_file.exists():
         raise SystemExit(
             f"{labels_file} not found. P5 is driven by the P4c organ labels -- "
-            "run pose-classify + pose-fuse (or pose-semantic) first.")
+            f"run pose-classify + pose-fuse (or pose-semantic)"
+            + ("" if chosen.is_baseline
+               else f" --geometry-backend {geometry_backend}") + " first.")
 
-    p5_dir = workdir / "p5"
+    p5_dir = chosen.structure_dir
     (p5_dir / "diag").mkdir(parents=True, exist_ok=True)
 
     fields = read_ply_vertices(cloud_path)
-    cloud = np.stack([fields["x"], fields["y"], fields["z"]], axis=1).astype(np.float64)
+    cloud_points = np.stack([fields["x"], fields["y"], fields["z"]], axis=1).astype(np.float64)
 
     labels = np.load(labels_file)
-    votes = np.load(workdir / "p4c" / "votes.npz", allow_pickle=True)
+    votes = np.load(chosen.labels_dir / "votes.npz", allow_pickle=True)
     class_order = [str(x) for x in votes["class_order"]]
-    if len(labels) != len(cloud):
+    if len(labels) != len(cloud_points):
         raise SystemExit(
-            f"p4c/labels.npy has {len(labels)} entries but {cloud_path.name} has {len(cloud)} "
+            f"{labels_file} has {len(labels)} entries but {cloud_path.name} has {len(cloud_points)} "
             "points -- they were produced from different clouds. Re-run pose-fuse.")
 
-    with open(workdir / "p4" / "hull.json") as f:
-        voxel = json.load(f)["voxel_size"]
-    with open(workdir / "p3" / "poses.json") as f:
+    voxel, voxel_origin = cloud_source.voxel_size(workdir, geometry_backend, cloud_points)
+    print(f"  voxel {voxel:.5f} ({voxel_origin})")
+    sparse_model, poses_json = cloud_source.geometry(workdir, geometry_backend)
+    with open(poses_json) as f:
         orbit = json.load(f)["orbit"]
-    reconstruction = pycolmap.Reconstruction(str(workdir / "p3" / "sparse" / "best"))
+    reconstruction = pycolmap.Reconstruction(str(sparse_model))
     sparse = np.array([p.xyz for p in reconstruction.points3D.values()])
 
     orbit_origin, orbit_rotation = orbit_frame(orbit)
@@ -108,9 +115,9 @@ def run(
 
         cameras = load_carve_cameras(reconstruction, workdir / "p2" / "masks" / "plant",
                                      occluder_dir=holder_dir)
-    frame, clamp = solve_plant_frame(cloud, sparse, orbit_origin, orbit_rotation, voxel,
+    frame, clamp = solve_plant_frame(cloud_points, sparse, orbit_origin, orbit_rotation, voxel,
                                      cameras=cameras)
-    upright = frame.apply(cloud)
+    upright = frame.apply(cloud_points)
 
     if clamp is not None:
         print(f"  clamp line detected as a {voxel * 4:.4f}+ gap in the cloud; origin placed there")
@@ -456,6 +463,11 @@ def main(argv: Optional[list] = None) -> None:
                         help="Specimen run directory (needs p3/, p4/ and p4c/)")
     parser.add_argument("--source", choices=["auto", "surface", "hull"], default="auto",
                         help="Which cloud to read. 'auto' prefers the P4b surface when present.")
+    parser.add_argument("--geometry-backend", default=cloud_source.BASELINE,
+                        help="Skeletonise this P3 backend's branch, reading its labels from "
+                             "p4c/experiments/<backend> and writing to p5/experiments/<backend>")
+    parser.add_argument("--cloud", type=Path,
+                        help="Skeletonise this PLY instead, whatever produced it")
     parser.add_argument("--contact-voxels", type=float, default=3.0,
                         help="How close a leaf point must be to a stem point to count as "
                              "touching it. Only seeds the depth field now -- it no longer "
@@ -500,7 +512,8 @@ def main(argv: Optional[list] = None) -> None:
         # "caulescent" is the old name for "upright", kept as an alias so
         # existing commands and scripts keep working.
         architecture=args.architecture,
-        strict_midribs=args.strict_midribs)
+        strict_midribs=args.strict_midribs,
+        geometry_backend=args.geometry_backend, cloud=args.cloud)
 
 
 if __name__ == "__main__":

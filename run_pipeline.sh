@@ -87,18 +87,48 @@
 # existing workdir; --stop-after <phase> ends early. P4c looks for clicked
 # seeds at <workdir>/p4c/seeds.json and uses them without being told.
 #
-#   --geometry-backend vggt|vggt_omega|mapanything   run P3 with a learned model instead
-#               of COLMAP, and carve P4a from it. Everything lands under
-#               p3/experiments/<b>/ and p4/experiments/<b>/, leaving the
-#               baseline untouched, so the two hulls can be compared:
+#   --geometry-backend vggt|vggt_omega|mapanything   run P3 with a learned model
+#               instead of COLMAP, and run that branch all the way to P6.
+#               Everything lands under .../experiments/<b>/, so the baseline
+#               is never written to:
 #
 #                 ./run_pipeline.sh --workdir runs/plant_9 --skip-to p3 \
 #                     --geometry-backend vggt \
 #                     --model-python ~/miniconda3/envs/vggt/bin/python
 #
-#               Needs a COLMAP P3 already on disk (it is the reference), and
-#               stops after p4a: P4b onward read the baseline p3/ and p4/,
-#               so running them would mix backends.
+#               A learned branch skips P4a and P4b. Both exist to manufacture
+#               a cloud COLMAP cannot give, and a pointmap already is one.
+#               What that costs is real and worth knowing: the hull is an
+#               occlusion-aware upper bound -- it can be too big but cannot
+#               invent surface -- and P4b's normals are fitted against the
+#               photographs, where a bare pointmap's are estimated by local
+#               PCA, which weakens the obliquity weighting in label fusion.
+#               --carve-check carves the hull anyway, as a validator rather
+#               than a dependency: learned points outside it are suspect.
+#
+#   --compare [b1,b2,b3]    run each branch in turn and put them side by side.
+#               Defaults to colmap,vggt_omega,mapanything. The shared work is
+#               done once -- P1, P2, the COLMAP model, and the P4c class maps,
+#               which are 2D and belong to no branch -- and each branch then
+#               runs P3 -> P4c fusion -> P5 -> P6 of its own:
+#
+#                 ./run_pipeline.sh /data/2026-09-01/thistle3 --compare
+#
+#               MapAnything is given --poses-from colmap, which is the
+#               configuration worth comparing; --branch-flags <b>=<flags>
+#               changes what any one branch is run with, e.g.
+#               --branch-flags "vggt_omega=--image-resolution 1024".
+#
+#               It ends by printing the branches side by side on leaf counts
+#               and midribs -- the deliverable, rather than the geometry
+#               proxies (silhouette IoU, pose residuals) every earlier
+#               comparison was judged on -- and the command that draws all
+#               three in one Blender scene.
+#
+#   --reuse-class-maps      skip P4c's classify stage when the class maps are
+#               already on disk and go straight to fusion. Implied by
+#               --compare for every branch after the first, and the reason
+#               those branches differ in geometry alone.
 #
 # The run STOPS at a phase whose QC shows a catastrophic failure (P2 tracking
 # the tool instead of the plant, a failed P3 circle fit, a hull that does not
@@ -216,6 +246,8 @@ BACKEND="dino"; SAM_CHECKPOINT=""; STOP_AFTER=""
 PROMPT_BANK=""; PROMPT_ROOT=""; NO_PROMPT_BANK=0; USE_GPU=0; LOW_TEXTURE=0; ARCHITECTURE=""; PERSISTENCE=""; PROMPT_POINTS=""; KEEP_GOING=0
 CAMERAS=""; ALLOW_MIXED=0; STRICT_MIDRIBS=0
 GEOMETRY_BACKEND="colmap"; MODEL_PYTHON=""; IMAGE_RESOLUTION=""; BUNDLE_ADJUST=0
+CARVE_CHECK=0; INTRINSICS_FROM=""; POSES_FROM=""; REUSE_CLASS_MAPS=0; COMPARE=""
+declare -A BRANCH_FLAGS=()
 DATASET=""; DRY_RUN=0; CONF_FILES=()
 
 # Which settings the command line set explicitly. A config file fills in only
@@ -274,6 +306,8 @@ unknown_option() {
     exit 1
 }
 
+ORIGINAL_ARGS=("$@")
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --video)        SET[video]=1; shift; while [[ $# -gt 0 && "$1" != --* ]]; do VIDEOS+=("$1"); shift; done ;;
@@ -292,6 +326,13 @@ while [[ $# -gt 0 ]]; do
         --model-python) MODEL_PYTHON="$2"; shift 2 ;;
         --image-resolution) IMAGE_RESOLUTION="$2"; shift 2 ;;
         --bundle-adjust) BUNDLE_ADJUST=1; shift ;;
+        --carve-check)  CARVE_CHECK=1; shift ;;
+        --reuse-class-maps) REUSE_CLASS_MAPS=1; shift ;;
+        --branch-flags) BRANCH_FLAGS["${2%%=*}"]="${2#*=}"; shift 2 ;;
+        --compare)      if [[ $# -ge 2 && "$2" != --* ]]; then COMPARE="$2"; shift 2
+                        else COMPARE="colmap,vggt_omega,mapanything"; shift; fi ;;
+        --intrinsics-from) INTRINSICS_FROM="$2"; shift 2 ;;
+        --poses-from)   POSES_FROM="$2"; shift 2 ;;
         --seed-bank) SET[seed_bank]=1;    SEED_BANK="$2"; shift 2 ;;
         --prompt-bank) SET[prompt_bank]=1;  PROMPT_BANK="$2"; shift 2 ;;
         --prompt-points) SET[prompt_points]=1; PROMPT_POINTS="$2"; shift 2 ;;
@@ -518,25 +559,146 @@ case "$BACKEND" in
        exit 1 ;;
 esac
 
-# An experimental backend writes to p3/experiments/<b> and p4/experiments/<b>.
-# P4b onward read the baseline p3/ and p4/ and have no notion of an
-# experiment, so running them here would silently mix one backend's hull with
-# another's poses. The comparison stops at the carved hull; promoting an
-# experiment into the baseline paths stays a deliberate, separate act.
+# A learned backend runs its own branch end to end: every result lands under
+# .../experiments/<backend>/ and the baseline is never written to. What it
+# does NOT do is carve or splat. P4a and P4b exist to manufacture a cloud
+# COLMAP cannot provide, and a pointmap already is one -- so they are skipped
+# rather than run on geometry that does not need them. --carve-check puts P4a
+# back, not as a dependency but as a validator: the hull is an upper bound, so
+# learned points outside it are suspect.
 if [[ "$GEOMETRY_BACKEND" != "colmap" ]]; then
-    case "$STOP_AFTER" in
-        ""|p4b|p4c|p5|p6)
-            if [[ -n "$STOP_AFTER" ]]; then
-                echo "--geometry-backend $GEOMETRY_BACKEND cannot run $STOP_AFTER: phases after p4a read" >&2
-                echo "  the baseline p3/ and p4/, so they would mix backends. Use --stop-after p4a," >&2
-                echo "  compare p4/experiments/$GEOMETRY_BACKEND against p4/, and promote deliberately." >&2
-                exit 1
-            fi
-            STOP_AFTER="p4a" ;;
-    esac
+    if [[ "$CARVE_CHECK" == 1 ]]; then
+        echo "  $GEOMETRY_BACKEND: P4a will carve a hull as a check on the learned cloud"
+    fi
 fi
 
+
+# --compare runs the branches one after another in this same script, so the
+# three-way comparison is one command rather than three remembered ones.
+#
+# What is shared is shared exactly once. P1 and P2 are branch-independent, the
+# COLMAP model is what --poses-from colmap hands MapAnything, and the P4c
+# class maps are 2D -- classification reads frames and masks and never sees a
+# cloud. Running the classifier once and fusing it three times is not only
+# faster, it is the fairer experiment: the branches then differ in geometry
+# alone, which is the whole question being asked.
+run_comparison() {
+    local requested=() ordered=() learned=() branch status=0
+    local -a child=()
+    local -a failed=()
+    IFS=',' read -r -a requested <<< "$COMPARE"
+
+    for branch in "${requested[@]}"; do
+        case "$branch" in
+            colmap|vggt|vggt_omega|mapanything) ;;
+            *) echo "--compare: unknown backend '$branch' -- colmap, vggt, vggt_omega, mapanything" >&2
+               return 1 ;;
+        esac
+        if [[ "$branch" == "colmap" ]]; then ordered+=("$branch"); else learned+=("$branch"); fi
+    done
+    ordered+=("${learned[@]+"${learned[@]}"}")
+    [[ ${#ordered[@]} -gt 0 ]] || { echo "--compare: no backends given" >&2; return 1; }
+
+    # Everything the parser already consumed is replayed to each child, minus
+    # the flags this driver decides for itself.
+    local -a orig=("${ORIGINAL_ARGS[@]+"${ORIGINAL_ARGS[@]}"}")
+    local i=0 arg
+    while (( i < ${#orig[@]} )); do
+        arg="${orig[$i]}"
+        case "$arg" in
+            --geometry-backend|--skip-to|--stop-after|--branch-flags)
+                i=$(( i + 2 )); continue ;;
+            --compare)
+                # Its value is optional, so only a following non-flag is one.
+                if (( i + 1 < ${#orig[@]} )) && [[ "${orig[$(( i + 1 ))]}" != --* ]]; then
+                    i=$(( i + 2 ))
+                else
+                    i=$(( i + 1 ))
+                fi
+                continue ;;
+        esac
+        child+=("$arg")
+        i=$(( i + 1 ))
+    done
+
+    echo ""
+    echo "=== comparing branches: ${ordered[*]} ==="
+    echo "  shared once: P1 frames, P2 masks, the COLMAP model, and the P4c class maps."
+    echo "  per branch:  P3 -> P4c fusion -> P5 -> P6, under .../experiments/<backend>/"
+    echo ""
+
+    local -a steps=()
+    if [[ " ${ordered[*]} " != *" colmap "* ]]; then
+        # No COLMAP branch was asked for, but the learned backends still need
+        # P1, P2 and -- for --poses-from colmap -- the COLMAP model itself.
+        steps+=("prefix|--geometry-backend colmap --stop-after p3")
+    fi
+    # Flags that belong to one branch only. MapAnything defaults to COLMAP's
+    # poses because that is the configuration being compared -- solving its
+    # own poses is a different experiment, and a markedly worse one here. A
+    # --branch-flags entry, or a global --poses-from, replaces the default.
+    if [[ -z "${BRANCH_FLAGS[mapanything]:-}" && -z "$POSES_FROM" ]]; then
+        BRANCH_FLAGS[mapanything]="--poses-from colmap"
+    fi
+    for branch in "${ordered[@]}"; do
+        local per_branch="${BRANCH_FLAGS[$branch]:-}"
+        [[ -z "$per_branch" ]] || echo "  $branch: $per_branch"
+        if [[ "$branch" == "colmap" ]]; then
+            steps+=("colmap|--geometry-backend colmap $per_branch")
+        else
+            steps+=("$branch|--skip-to p3 --geometry-backend $branch --reuse-class-maps $per_branch")
+        fi
+    done
+
+    local step name extra
+    for step in "${steps[@]}"; do
+        name="${step%%|*}"; extra="${step#*|}"
+        echo ""
+        echo "================================================================"
+        echo "  branch $name   ($(date '+%H:%M:%S'))"
+        echo "================================================================"
+        if [[ "$DRY_RUN" == 1 ]]; then
+            echo "  would run: ${BASH_SOURCE[0]} ${child[*]+${child[*]}} $extra"
+            continue
+        fi
+        # shellcheck disable=SC2086
+        if ! "${BASH_SOURCE[0]}" ${child[@]+"${child[@]}"} $extra; then
+            status=1
+            failed+=("$name")
+            echo ""
+            echo "  branch $name FAILED -- continuing with the rest, so one bad backend" >&2
+            echo "  does not cost you the branches that did work." >&2
+        fi
+    done
+
+    [[ "$DRY_RUN" == 1 ]] && { echo ""; echo "--dry-run: nothing was run."; return 0; }
+
+    echo ""
+    echo "================================================================"
+    echo "  comparison  ($(date '+%H:%M:%S'))"
+    echo "================================================================"
+    $PY "$REPO_ROOT/scripts/compare_branches.py" "$WORKDIR" \
+        --branches "$(IFS=,; echo "${ordered[*]}")" \
+        --json "$WORKDIR/branch_comparison.json" || true
+
+    echo ""
+    echo "See all three in one Blender scene, side by side:"
+    echo "  ./scripts/view_in_blender.sh $WORKDIR --compare $(IFS=,; echo "${ordered[*]}")"
+    echo ""
+    echo "One branch on its own:"
+    echo "  ./scripts/view_in_blender.sh $WORKDIR --geometry-backend ${ordered[-1]}"
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        echo ""
+        echo "  branches that failed: ${failed[*]}   (see $WORKDIR/pipeline.log)" >&2
+    fi
+    return $status
+}
+
 print_plan
+if [[ -n "$COMPARE" ]]; then
+    run_comparison
+    exit $?
+fi
 if [[ "$DRY_RUN" == 1 ]]; then
     echo
     echo "--dry-run: nothing was run."
@@ -752,6 +914,16 @@ should_run() {
 
 phase() { printf '\n\033[1m=== %s ===\033[0m\n' "$1"; }
 
+# Where this branch's later phases read and write. The baseline keeps the
+# historical paths; a learned backend gets a sibling under experiments/.
+if [[ "$GEOMETRY_BACKEND" == "colmap" ]]; then
+    P4C_DIR="$WORKDIR/p4c"; P5_DIR="$WORKDIR/p5"; P6_DIR="$WORKDIR/p6"
+else
+    P4C_DIR="$WORKDIR/p4c/experiments/$GEOMETRY_BACKEND"
+    P5_DIR="$WORKDIR/p5/experiments/$GEOMETRY_BACKEND"
+    P6_DIR="$WORKDIR/p6/experiments/$GEOMETRY_BACKEND"
+fi
+
 # Stop the run when a phase's QC shows a failure nothing downstream can
 # absorb. Only catastrophic signatures gate -- advisory failures happen on
 # good runs (a root blinking behind the pliers fails area smoothness, a root
@@ -862,6 +1034,8 @@ if should_run p3; then
             --backends "$GEOMETRY_BACKEND" \
             ${MODEL_PYTHON:+--model-python "$MODEL_PYTHON"} \
             ${IMAGE_RESOLUTION:+--image-resolution "$IMAGE_RESOLUTION"} \
+            ${INTRINSICS_FROM:+--intrinsics-from "$INTRINSICS_FROM"} \
+            ${POSES_FROM:+--poses-from "$POSES_FROM"} \
             $([[ "$BUNDLE_ADJUST" == 1 ]] && echo --bundle-adjust)
         gate p3 "$WORKDIR/p3/experiments/$GEOMETRY_BACKEND/poses.json"
     fi
@@ -872,18 +1046,29 @@ if should_run p4a; then
         phase "P4a    visual hull by silhouette carving           -> $WORKDIR/p4"
         $PY -m pose_estimator.cli.hull --workdir "$WORKDIR" --resolution 256
         gate p4a "$WORKDIR/p4/hull.json"
-    else
-        phase "P4a    hull carved from $GEOMETRY_BACKEND poses  -> $WORKDIR/p4/experiments/$GEOMETRY_BACKEND"
+    elif [[ "$CARVE_CHECK" == 1 ]]; then
+        phase "P4a    hull carved from $GEOMETRY_BACKEND poses (a check, not the geometry)"
         $PY -m pose_estimator.cli.hull --workdir "$WORKDIR" --resolution 256 \
             --geometry-backend "$GEOMETRY_BACKEND"
         gate p4a "$WORKDIR/p4/experiments/$GEOMETRY_BACKEND/hull.json"
         echo ""
         echo "  compare against the baseline hull:"
         echo "    $WORKDIR/p4/hull.json  vs  $WORKDIR/p4/experiments/$GEOMETRY_BACKEND/hull.json"
+    else
+        phase "P4a    SKIPPED -- $GEOMETRY_BACKEND already produces a dense cloud"
+        echo "  Carving exists to manufacture geometry COLMAP cannot give; a pointmap is"
+        echo "  already a surface sample, so P4c labels it directly. --carve-check carves"
+        echo "  anyway, as an upper bound to judge the learned cloud against."
     fi
 fi
 
-if should_run p4b && [[ "$SKIP_P4B" == 0 ]]; then
+if should_run p4b && [[ "$GEOMETRY_BACKEND" != "colmap" ]]; then
+    phase "P4b    SKIPPED -- $GEOMETRY_BACKEND needs no surfel pass"
+    echo "  P4b refines the P4a hull into a thin surface. The learned cloud is already"
+    echo "  a surface sample, so there is nothing to thin. Its normals are estimated by"
+    echo "  local PCA in P4c rather than fitted against the photographs, which is the"
+    echo "  real cost of skipping this."
+elif should_run p4b && [[ "$SKIP_P4B" == 0 ]]; then
     phase "P4b    2DGS surfels -> carved thin surface         -> $WORKDIR/p4b"
     $PY -m pose_estimator.cli.surface --workdir "$WORKDIR" --iterations 5000
 elif [[ "$SKIP_P4B" == 1 ]]; then
@@ -910,41 +1095,55 @@ if should_run p4c; then
         if [[ -z "$SAM_CKPT_P4C" && "$BACKEND" == "sam" ]]; then
             SAM_CKPT_P4C="$(find_sam_checkpoint || true)"
         fi
-        phase "P4c    organ labels + coloured clouds            -> $WORKDIR/p4c"
+        phase "P4c    organ labels + coloured clouds            -> $P4C_DIR"
         echo "  two stages: classify (frames -> p4c/class_maps) then fuse (maps -> labels)."
         echo "  Run them separately with pose-classify / pose-fuse when debugging -- the"
         echo "  class maps are what tell you whether a bad label came from the 2D"
         echo "  classifier or from the multi-view voting."
-        $PY -m pose_estimator.cli.semantic \
-            --workdir "$WORKDIR" --backend "$BACKEND" --dino-model "$DINO_MODEL" \
-            ${HF_TOKEN_ARG:+--hf-token "$HF_TOKEN_ARG"} \
-            ${SAM_CKPT_P4C:+--checkpoint "$SAM_CKPT_P4C"} \
-            ${SEEDS_FILE:+--seeds-file "$SEEDS_FILE"} \
-            ${SEED_BANK:+--seed-bank "$SEED_BANK"} \
-            ${SEED_FRAME:+--seed-frame "$SEED_FRAME"} \
-            ${SEEDS[0]:+--seeds} ${SEEDS[@]+"${SEEDS[@]}"}
+        # The class maps are 2D and belong to no branch: classification reads
+        # frames and P2 masks and never touches a cloud. --reuse-class-maps
+        # skips straight to fusion when they are already on disk, which is
+        # both faster across a comparison and fairer -- the branches then
+        # differ in geometry alone rather than in two independent DINO runs.
+        if [[ "$REUSE_CLASS_MAPS" == 1 && -f "$WORKDIR/p4c/classify.json" ]]; then
+            echo "  --reuse-class-maps: fusing $WORKDIR/p4c/class_maps, classify not re-run."
+            $PY -m pose_estimator.cli.fuse \
+                --workdir "$WORKDIR" --geometry-backend "$GEOMETRY_BACKEND"
+        else
+            $PY -m pose_estimator.cli.semantic \
+                --workdir "$WORKDIR" --backend "$BACKEND" --dino-model "$DINO_MODEL" \
+                --geometry-backend "$GEOMETRY_BACKEND" \
+                ${HF_TOKEN_ARG:+--hf-token "$HF_TOKEN_ARG"} \
+                ${SAM_CKPT_P4C:+--checkpoint "$SAM_CKPT_P4C"} \
+                ${SEEDS_FILE:+--seeds-file "$SEEDS_FILE"} \
+                ${SEED_BANK:+--seed-bank "$SEED_BANK"} \
+                ${SEED_FRAME:+--seed-frame "$SEED_FRAME"} \
+                ${SEEDS[0]:+--seeds} ${SEEDS[@]+"${SEEDS[@]}"}
+        fi
     fi
 fi
 
 if should_run p5; then
-    if [[ -f "$WORKDIR/p4c/labels.npy" ]]; then
-        phase "P5     stem centreline + leaf instances           -> $WORKDIR/p5"
+    if [[ -f "$P4C_DIR/labels.npy" ]]; then
+        phase "P5     stem centreline + leaf instances           -> $P5_DIR"
         $PY -m pose_estimator.cli.structure --workdir "$WORKDIR" \
+            --geometry-backend "$GEOMETRY_BACKEND" \
             ${ARCHITECTURE:+--architecture "$ARCHITECTURE"} \
             $([[ "$STRICT_MIDRIBS" == 1 ]] && echo --strict-midribs) \
             ${PERSISTENCE:+--min-persistence-ratio "$PERSISTENCE"}
     else
-        phase "P5     SKIPPED -- no $WORKDIR/p4c/labels.npy"
+        phase "P5     SKIPPED -- no $P4C_DIR/labels.npy"
         echo "  P5 is driven by the P4c organ labels; run P4c first."
     fi
 fi
 
 if should_run p6; then
-    if [[ -f "$WORKDIR/p5/leaf_points.npy" ]]; then
-        phase "P6     per-leaf midrib, curvature, width          -> $WORKDIR/p6"
-        $PY -m pose_estimator.cli.leaf_model --workdir "$WORKDIR"
+    if [[ -f "$P5_DIR/leaf_points.npy" ]]; then
+        phase "P6     per-leaf midrib, curvature, width          -> $P6_DIR"
+        $PY -m pose_estimator.cli.leaf_model --workdir "$WORKDIR" \
+            --geometry-backend "$GEOMETRY_BACKEND"
     else
-        phase "P6     SKIPPED -- no $WORKDIR/p5/leaf_points.npy"
+        phase "P6     SKIPPED -- no $P5_DIR/leaf_points.npy"
         echo "  P6 fits midribs to P5's per-leaf point subsets; run P5 first."
     fi
 fi
@@ -952,30 +1151,37 @@ fi
 phase "done  ($(date '+%H:%M:%S'))"
 cat <<EOF
 Open in Blender:
-  $WORKDIR/p6/midribs.ply           per-leaf midrib curves
-  $WORKDIR/p5/structure.ply         leaf / stem / root points, coloured
-  $WORKDIR/p4c/labels_vis.ply       cloud coloured by organ (leaf/stem/root)
-  $WORKDIR/p4c/leaf_instances.ply   leaf points, one colour per leaf
-  $WORKDIR/p4c/confidence.ply       cloud coloured by vote confidence
+  ./scripts/view_in_blender.sh $WORKDIR$([[ "$GEOMETRY_BACKEND" == "colmap" ]] || echo " --geometry-backend $GEOMETRY_BACKEND")
+  $P6_DIR/midribs.ply           per-leaf midrib curves
+  $P5_DIR/structure.ply         leaf / stem / root points, coloured
+  $P4C_DIR/labels_vis.ply       cloud coloured by organ (leaf/stem/root)
+  $P4C_DIR/leaf_instances.ply   leaf points, one colour per leaf
+  $P4C_DIR/confidence.ply       cloud coloured by vote confidence
   $WORKDIR/p4b/surface.ply          the uncoloured surface P4c labelled
   $WORKDIR/p4/hull.ply              visual hull mesh
 
-Measurements: $WORKDIR/p6/leaves.json
+Measurements: $P6_DIR/leaves.json
   Per leaf: arclength, insertion angle, azimuth, width profile along the midrib.
   Units are COLMAP units, NOT metric -- no scale reference is solved yet.
 
 QC reports -- read before trusting anything:
   $WORKDIR/p2/qc.json   $WORKDIR/p3/poses.json   $WORKDIR/p4/hull.json
-  $WORKDIR/p4b/p4b.json $WORKDIR/p4c/qc.json     $WORKDIR/p5/p5.json
-  $WORKDIR/p6/p6.json
+  $WORKDIR/p4b/p4b.json $P4C_DIR/qc.json     $P5_DIR/p5.json
+  $P6_DIR/p6.json
+
+Compare this branch against the others on the deliverable, not on geometry:
+  ./run_pipeline.sh <dataset> --compare              run all three branches
+  ./scripts/compare_branches.py $WORKDIR    leaf counts + midribs
+  ./scripts/view_in_blender.sh $WORKDIR --compare    all three, side by side
 
 Check the 2D classification before blaming the 3D labels:
   $WORKDIR/p4c/diag/parts_*.jpg     photograph | classification, side by side
   $WORKDIR/p4c/class_maps/          the per-frame maps the fusion voted on
+  (2D and branch-independent: every geometry branch votes on these same maps)
 
 Is the structure real? These two answer it faster than any number:
-  $WORKDIR/p5/diag/skeleton_*.jpg   stem + leaf axes drawn on the photographs
-  $WORKDIR/p6/diag/midribs_3d.png   midribs and width profiles
+  $P5_DIR/diag/skeleton_*.jpg   stem + leaf axes drawn on the photographs
+  $P6_DIR/diag/midribs_3d.png   midribs and width profiles
 
 Diagnostics: $WORKDIR/p*/diag/
 Full log:    $LOG

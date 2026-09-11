@@ -28,7 +28,8 @@ from pose_estimator.cli import fuse as fuse_stage
 CLASSIFY_KEYS = ("backend", "seeds", "seed_frame", "seed_bank", "save_seed_bank",
                  "seeds_file",
                  "dino_model", "dino_size", "hf_token", "checkpoint", "stride", "device")
-FUSE_KEYS = ("source", "instance_radius_voxels", "normal_weighting")
+FUSE_KEYS = ("source", "instance_radius_voxels", "normal_weighting",
+             "geometry_backend", "cloud")
 
 
 def run(workdir: Path, **kwargs) -> dict:
@@ -63,6 +64,8 @@ def main(argv: Optional[list] = None) -> None:
         source=args.source,
         instance_radius_voxels=args.instance_radius_voxels,
         normal_weighting=not args.no_normal_weighting,
+        geometry_backend=args.geometry_backend,
+        cloud=args.cloud,
     )
 
 

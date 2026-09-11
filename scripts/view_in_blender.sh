@@ -4,6 +4,16 @@
 #   ./scripts/view_in_blender.sh runs/plant_9
 #   ./scripts/view_in_blender.sh runs/plant_9 --background     # build only, no window
 #
+# Three geometry branches side by side in one scene, normalised to a common
+# size because their reconstruction scales differ and none is metric:
+#
+#   ./scripts/view_in_blender.sh runs/plant_9 --compare
+#   ./scripts/view_in_blender.sh runs/plant_9 --compare colmap,mapanything
+#
+# or one learned branch on its own:
+#
+#   ./scripts/view_in_blender.sh runs/plant_9 --geometry-backend mapanything
+#
 # Blender inside WSL is the awkward option here: Ubuntu 20.04 ships a
 # libwayland-client too old for recent Blender builds, and Mesa 21.2's d3d12
 # driver predates the OpenGL 4.3 that Blender needs, so the GUI falls back and
@@ -50,8 +60,26 @@ to_windows_path() {
 main() {
     local WORKDIR="${1:-}"
     shift || true
-    [[ -n "$WORKDIR" ]] || { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1; }
+    [[ -n "$WORKDIR" ]] || { sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1; }
     [[ -d "$WORKDIR" ]] || { echo "no such directory: $WORKDIR" >&2; exit 1; }
+
+    # Two kinds of argument end up on this command line and they go to
+    # different places: --compare and --geometry-backend belong to the Python
+    # script, after the `--` Blender stops parsing at, while anything else
+    # (--background, --factory-startup) belongs to Blender itself. Passing a
+    # script flag to Blender gets it silently ignored, which looked exactly
+    # like the comparison mode not working.
+    local -a BLENDER_ARGS=() SCRIPT_ARGS=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --compare)
+                if [[ $# -ge 2 && "$2" != -* ]]; then SCRIPT_ARGS+=("$1" "$2"); shift 2
+                else SCRIPT_ARGS+=("$1" "colmap,vggt_omega,mapanything"); shift; fi ;;
+            --geometry-backend)
+                SCRIPT_ARGS+=("$1" "${2:-colmap}"); shift 2 ;;
+            *) BLENDER_ARGS+=("$1"); shift ;;
+        esac
+    done
 
     local REPO
     REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -74,9 +102,10 @@ main() {
 
     echo "blender : $BLENDER"
     echo "workdir : $WIN_WORKDIR"
-    exec "$BLENDER" "$@" \
+    [[ ${#SCRIPT_ARGS[@]} -eq 0 ]] || echo "branches: ${SCRIPT_ARGS[*]}"
+    exec "$BLENDER" ${BLENDER_ARGS[@]+"${BLENDER_ARGS[@]}"} \
         --python "$WIN_REPO" \
-        -- --workdir "$WIN_WORKDIR"
+        -- --workdir "$WIN_WORKDIR" ${SCRIPT_ARGS[@]+"${SCRIPT_ARGS[@]}"}
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
