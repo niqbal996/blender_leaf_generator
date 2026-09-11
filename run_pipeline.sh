@@ -114,6 +114,12 @@
 #
 #                 ./run_pipeline.sh /data/2026-09-01/thistle3 --compare
 #
+#               Each branch resumes rather than recomputes: a branch whose P3
+#               is already on disk restarts at p4c, so re-running a comparison
+#               after re-clicking seeds or re-tuning P5 costs minutes rather
+#               than hours -- and needs no model environment, since the
+#               exporter never runs. Delete a phase's directory to force it.
+#
 #               MapAnything is given --poses-from colmap, which is the
 #               configuration worth comparing; --branch-flags <b>=<flags>
 #               changes what any one branch is run with, e.g.
@@ -627,8 +633,25 @@ run_comparison() {
     echo "  per branch:  P3 -> P4c fusion -> P5 -> P6, under .../experiments/<backend>/"
     echo ""
 
+    # Where each branch picks up. A comparison is normally run more than once
+    # -- new seeds, a re-tuned P5 -- and re-solving a P3 that is already on
+    # disk costs many minutes and changes nothing. So a branch starts at the
+    # first phase whose input is missing, and says which and why. To force a
+    # phase to run again, delete its directory.
     local -a steps=()
-    if [[ " ${ordered[*]} " != *" colmap "* ]]; then
+    resume_from() {   # resume_from <backend> -> the --skip-to phase, or "" for all
+        local b="$1"
+        if [[ "$b" == "colmap" ]]; then
+            [[ -f "$WORKDIR/p4b/surface.ply" ]] && { echo p4c; return; }
+            [[ -d "$WORKDIR/p3/sparse/best" ]] && { echo p4a; return; }
+            echo ""
+        else
+            [[ -d "$WORKDIR/p3/experiments/$b/sparse/best" ]] && { echo p4c; return; }
+            echo p3
+        fi
+    }
+
+    if [[ " ${ordered[*]} " != *" colmap "* && ! -d "$WORKDIR/p3/sparse/best" ]]; then
         # No COLMAP branch was asked for, but the learned backends still need
         # P1, P2 and -- for --poses-from colmap -- the COLMAP model itself.
         steps+=("prefix|--geometry-backend colmap --stop-after p3")
@@ -641,12 +664,21 @@ run_comparison() {
         BRANCH_FLAGS[mapanything]="--poses-from colmap"
     fi
     for branch in "${ordered[@]}"; do
-        local per_branch="${BRANCH_FLAGS[$branch]:-}"
-        [[ -z "$per_branch" ]] || echo "  $branch: $per_branch"
+        local per_branch="${BRANCH_FLAGS[$branch]:-}" from
+        from="$(resume_from "$branch")"
+        if [[ -n "$from" && "$from" != "p3" ]]; then
+            # Its geometry is already solved, so neither COLMAP nor a learned
+            # exporter runs -- which is why a re-run needs no model
+            # environment for a branch whose P3 is on disk.
+            echo "  $branch: geometry already on disk, resuming at $from"
+            [[ "$from" == "p3" ]] || per_branch=""
+        elif [[ -n "$per_branch" ]]; then
+            echo "  $branch: $per_branch"
+        fi
         if [[ "$branch" == "colmap" ]]; then
-            steps+=("colmap|--geometry-backend colmap $per_branch")
+            steps+=("colmap|${from:+--skip-to $from} --geometry-backend colmap $per_branch")
         else
-            steps+=("$branch|--skip-to p3 --geometry-backend $branch --reuse-class-maps $per_branch")
+            steps+=("$branch|--skip-to ${from:-p3} --geometry-backend $branch --reuse-class-maps $per_branch")
         fi
     done
 
@@ -677,7 +709,12 @@ run_comparison() {
     echo "================================================================"
     echo "  comparison  ($(date '+%H:%M:%S'))"
     echo "================================================================"
-    $PY "$REPO_ROOT/scripts/compare_branches.py" "$WORKDIR" \
+    # Resolved here rather than reused: the driver runs before the script
+    # sets REPO_ROOT and PY, and both are cheap to work out again.
+    local repo py
+    repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    py="${POSE_PYTHON:-$(command -v python3 || command -v python)}"
+    "$py" "$repo/scripts/compare_branches.py" "$WORKDIR" \
         --branches "$(IFS=,; echo "${ordered[*]}")" \
         --json "$WORKDIR/branch_comparison.json" || true
 
