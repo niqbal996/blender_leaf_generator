@@ -647,3 +647,110 @@ def test_a_model_exported_at_the_models_own_resolution_is_mapped_to_frame_pixels
 
     # Idempotent: a model already at frame resolution is left untouched.
     assert rescale_model_to_frames(model, (1920, 1280)) is None
+
+
+def test_a_dry_run_fetches_the_checkout_it_is_about_to_check(tmp_path, monkeypatch):
+    """--dry-run is a preflight, so it needs the package it validates.
+
+    It used to skip the clone as "offline", which made the environment check
+    report the model package as missing from an interpreter that was fine --
+    the exact opposite of what a dry run is for.
+    """
+    import cv2
+    import numpy as np
+
+    from pose_estimator import geometry
+
+    frames = tmp_path / "p1" / "frames"
+    masks = tmp_path / "p2" / "masks" / "plant"
+    frames.mkdir(parents=True); masks.mkdir(parents=True)
+    image = np.full((16, 24, 3), 180, np.uint8)
+    mask = np.zeros((16, 24), np.uint8); mask[4:12, 6:18] = 255
+    cv2.imwrite(str(frames / "frame_0000.jpg"), image)
+    cv2.imwrite(str(masks / "frame_0000.png"), mask)
+
+    resolved = []
+
+    def fake_resolve(workdir, backend, repo_root, auto_fetch_code=True, code_cache=None):
+        resolved.append(backend)
+        checkout = tmp_path / "checkout"
+        checkout.mkdir(exist_ok=True)
+        return checkout
+
+    monkeypatch.setattr(geometry, "resolve_backend_repo", fake_resolve)
+    report = geometry.run_learned_backend(tmp_path, "vggt_omega", dry_run=True,
+                                          skip_env_check=True)
+    assert resolved == ["vggt_omega"], "a dry run must resolve the checkout, not guess its path"
+    assert report["dry_run"] is True
+    assert "--masks_dir" in " ".join(report["command"])   # P2 silhouettes are passed on
+
+
+def test_no_auto_fetch_still_reports_the_path_without_cloning(tmp_path, monkeypatch):
+    import pytest
+
+    from pose_estimator import geometry
+
+    called = []
+    monkeypatch.setattr(geometry, "resolve_backend_repo",
+                        lambda *a, **k: called.append(1) or tmp_path)
+    cache = tmp_path / "cache"
+    with pytest.raises(FileNotFoundError):
+        # No images staged, so it fails later -- what matters is that the
+        # checkout was not fetched first.
+        geometry.run_learned_backend(tmp_path, "vggt_omega", dry_run=True,
+                                     skip_env_check=True, auto_fetch_code=False,
+                                     code_cache=cache)
+    assert called == []
+
+
+def test_a_missing_checkout_is_not_reported_as_a_missing_dependency(monkeypatch, tmp_path):
+    import subprocess as sp
+
+    import pytest
+
+    from pose_estimator import geometry
+
+    modules = {name: "2.0" for name in geometry._REQUIRED_MODULES["vggt_omega"]}
+    modules["vggt_omega.models"] = "MISSING: ModuleNotFoundError: No module named 'vggt_omega'"
+    monkeypatch.setattr(geometry.subprocess, "run",
+                        lambda command, **kw: sp.CompletedProcess(
+                            command, 0, stdout=_probe_output((3, 11, 0), modules), stderr=""))
+
+    absent = tmp_path / "never-cloned"
+    with pytest.raises(RuntimeError) as failure:
+        geometry.require_model_environment("vggt_omega", None, absent)
+    message = str(failure.value)
+    assert "does not exist" in message
+    assert "--vggt-omega-root" in message
+    assert "pip install -e" not in message      # the package is not pip-installed from there
+
+
+def test_the_install_hint_matches_how_each_project_is_obtained(monkeypatch, tmp_path):
+    import subprocess as sp
+
+    import pytest
+
+    from pose_estimator import geometry
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    def probe_missing(backend, module):
+        modules = {name: "2.0" for name in geometry._REQUIRED_MODULES[backend]}
+        modules[module] = "MISSING: ModuleNotFoundError: No module named 'einops'"
+        monkeypatch.setattr(geometry.subprocess, "run",
+                            lambda command, **kw: sp.CompletedProcess(
+                                command, 0, stdout=_probe_output((3, 11, 0), modules), stderr=""))
+        with pytest.raises(RuntimeError) as failure:
+            geometry.require_model_environment(backend, None, checkout)
+        return str(failure.value)
+
+    # VGGT-Omega is imported from the checkout; its dependencies come from the
+    # extra in this project.
+    omega = probe_missing("vggt_omega", "vggt_omega.models")
+    assert 'pip install -e ".[vggt-omega]"' in omega
+    assert "PYTHONPATH automatically" in omega
+
+    # MapAnything is a package installed from its own checkout.
+    mapanything = probe_missing("mapanything", "mapanything.models")
+    assert f'pip install -e "{checkout}[colmap]"' in mapanything

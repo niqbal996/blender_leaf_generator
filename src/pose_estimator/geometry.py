@@ -151,9 +151,14 @@ def run_learned_backend(
     """
     if backend not in LEARNED_BACKENDS:
         raise ValueError("run_learned_backend supports " + ", ".join(LEARNED_BACKENDS))
-    # A dry run is genuinely offline: show the future cache path rather than
-    # cloning code just to prove a command can be assembled.
-    if dry_run and repo_root is None:
+    # A dry run still fetches the exporter checkout. It used to skip that --
+    # "offline, it only has to assemble a command" -- but the environment
+    # check now imports the model package to see whether this interpreter can
+    # run it, and that needs the checkout on PYTHONPATH. Without it a dry run
+    # reports the package as missing from the environment, which is both wrong
+    # and the opposite of what --dry-run is for. The clone is small, public
+    # and cached, so paying for it here is the lesser cost.
+    if repo_root is None and not auto_fetch_code:
         repo_root = backend_code_cache(code_cache) / backend
     else:
         repo_root = resolve_backend_repo(workdir, backend, repo_root, auto_fetch_code, code_cache=code_cache)
@@ -567,7 +572,21 @@ def require_model_environment(
             f"of this pipeline can stay where it is."
         )
     pinned = exporter_pinned_pycolmap(repo_root)
+    # A path that cannot even be stat'ed (someone else's home, a dead mount)
+    # must be reported, not raised from inside a diagnostic.
+    try:
+        checkout_missing = repo_root is not None and not Path(repo_root).is_dir()
+    except OSError:
+        checkout_missing = True
     missing = {name: detail for name, detail in report["modules"].items() if detail.startswith("MISSING:")}
+    # The exporter's own submodules fail together and for one reason, so they
+    # are reported once rather than repeating the same fix per import.
+    own = [name for name in missing if name.startswith(backend + ".")]
+    if len(own) > 1:
+        for name in own[1:]:
+            missing.pop(name)
+        missing[own[0]] = missing[own[0]].replace(
+            "MISSING:", f"MISSING: (also {', '.join(own[1:])})")
     for name, detail in missing.items():
         hint = _MODULE_HELP.get(name)
         # A pycolmap wheel that is installed but broken is a separate case from
@@ -580,12 +599,24 @@ def require_model_environment(
         elif name == "pycolmap":
             hint = f'pip install "pycolmap=={pinned}"  ({_PYCOLMAP_HELP})'
         elif name.startswith(backend + "."):
-            # The checkout is already on PYTHONPATH by here, so this is a real
-            # missing dependency of the project rather than a path problem.
-            extra = "[colmap]" if backend == "mapanything" else ""
-            hint = (f'pip install -e "{report.get("repo_root") or "<checkout>"}{extra}" '
-                    f"-- the official {backend} project and its dependencies, in an environment "
-                    f"of its own (the two backends pin different lightglue forks)")
+            if checkout_missing:
+                hint = (f"the {backend} checkout at {repo_root} does not exist, so its package "
+                        f"could not be put on PYTHONPATH. Allow the automatic fetch, or point "
+                        f"--{backend.replace('_', '-')}-root at an existing checkout")
+            elif backend == "mapanything":
+                # MapAnything is a package with its own dependency set, and is
+                # installed from the checkout.
+                hint = (f'pip install -e "{repo_root}[colmap]" -- the official project and its '
+                        f"dependencies, in an environment of its own (the backends pin "
+                        f"different lightglue forks)")
+            else:
+                # VGGT and VGGT-Omega are imported straight from the checkout,
+                # which this adapter puts on PYTHONPATH; what can be missing is
+                # what they import.
+                extra = "vggt-omega" if backend == "vggt_omega" else "vggt"
+                hint = (f'pip install -e ".[{extra}]" in that environment -- the checkout itself '
+                        f"is put on PYTHONPATH automatically, so what is missing here is one of "
+                        f"the packages it imports")
         problems.append(f"{name} cannot be imported in {report['executable']}: "
                         f"{detail[len('MISSING: '):]}" + (f"\n      Fix: {hint}" if hint else ""))
     api = report.get("pycolmap_exporter_api", "")

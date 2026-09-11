@@ -173,7 +173,9 @@ which install as the module `lightglue`. Whichever lands last wins.
 Python version, every module the exporter imports, and whether the installed
 pycolmap can build the model the exporter writes — and names the command that
 fixes what is missing. `--dry-run` runs exactly that check without loading a
-model, which is the quickest way to validate a new machine.
+model, which is the quickest way to validate a new machine -- and it fetches
+the exporter checkout first, because a preflight that cannot import the
+package it is validating would report a working interpreter as broken.
 
 `--vggt-python`, `--vggt-omega-python` and `--mapanything-python` override
 `--model-python` per backend, which is what makes one comparison run across
