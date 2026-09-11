@@ -42,16 +42,22 @@ Measured on `thistle3` (27 frames, two elevation passes, an RTX A6000).
 P2 plant mask — comparable across backends, higher is better. Coverage is the
 fraction of mask area explained, which rewards dense models by construction.
 
-| | registered | points | in-silhouette | coverage | per-pass circle RMS |
-|---|---|---|---|---|---|
-| colmap | 16/27 | 1,372 | **0.829** | 0.392 | **0.09%** |
-| vggt (no BA) | 27/27 | 34,719 | 0.279 | 0.410 | 2.2% |
-| mapanything | 27/27 | 189,316 | 0.480 | **0.998** | 3.7–5.2% |
+Measured on `thistle3` declared as **two capture passes**, which is how it was
+shot. The same capture ingested as one pass registers 16/27 in COLMAP and
+scores far worse everywhere — declaring the passes is not a formality.
 
-Read it as: COLMAP is by far the most *accurate* and by far the least
-*complete*; the learned models are the reverse. Pick COLMAP when its
-registration fraction is high, and a learned backend when it is not — or when
-you need points on thin structure that SIFT cannot see.
+| | registered | points | in-silhouette | coverage |
+|---|---|---|---|---|
+| colmap | 26/27 | 5,853 | 0.766 | 0.628 |
+| vggt_omega | 27/27 | 360,831 | **0.874** | 0.781 |
+| mapanything | 27/27 | 264,083 | 0.644 | **0.808** |
+
+`vggt_omega` wins on both accuracy and completeness here, which is not the
+result the single-pass numbers predicted. A useful second cut is whether a
+point lands in the silhouette of the view it *came from*, which separates
+"the geometry is wrong" from "this point is occluded in other views":
+`vggt_omega` scores 0.999 there against 0.874 across all views, so its
+misses are occlusion rather than error.
 
 ## colmap — the baseline
 
@@ -149,6 +155,18 @@ exporter with them exposed, reusing upstream's own
 pose-geometry --workdir <workdir> --backends mapanything \
     --mapanything-python ~/miniconda3/envs/mapanything/bin/python
 ```
+
+`--points-from depth` (the default) is the other correction, and it is not a
+tuning knob. MapAnything predicts `pts3d` (world points), `intrinsics` and
+`camera_poses` as *separate heads*; upstream's exporter writes points from the
+first and cameras from the other two, and nothing constrains them to agree.
+On `thistle3` they did not: only 60% of the exported points fell inside the P2
+silhouette their pixels had been masked to, **in the model's own coordinate
+frame** — a cloud that looks unmasked and noisy no matter how carefully the
+pixels were masked. Unprojecting `depth_z` through the intrinsics and pose
+that are actually written makes reprojection exact by construction, which is
+the property P4 carving and P4c label fusion rely on. `--points-from pointmap`
+restores upstream's behaviour.
 
 It recovers its own intrinsics, and on `thistle3` predicted a focal of 1,716
 frame pixels where COLMAP solves 3,051 — a 1.77× wider field of view than the

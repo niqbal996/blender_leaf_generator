@@ -53,10 +53,53 @@ def parse_args():
     parser.add_argument("--memory-efficient", action="store_true",
                         help="Trade speed for peak memory; unnecessary on a large GPU")
     parser.add_argument("--minibatch-size", type=int, default=None)
+    parser.add_argument("--points-from", default="depth", choices=["depth", "pointmap"],
+                        help="depth: unproject depth_z through the intrinsics and pose that are "
+                             "written to the model, so points reproject where they came from. "
+                             "pointmap: upstream's behaviour, which exports the separately "
+                             "predicted world pointmap instead")
     parser.add_argument("--voxel-fraction", type=float, default=0.002,
                         help="Export voxel size as a fraction of scene extent. Upstream uses "
                              "0.01; a plant's petioles and leaf tips need finer than that")
     return parser.parse_args()
+
+
+def rebuild_points_from_depth(outputs) -> int:
+    """Replace the world pointmap with one the exported cameras agree with.
+
+    MapAnything predicts `pts3d` (world points), `intrinsics` and
+    `camera_poses` as separate heads, and upstream's exporter writes points
+    from the first and cameras from the other two. Nothing constrains those
+    heads to agree exactly, and on thistle3 they did not: only 60% of the
+    exported points landed inside the P2 silhouette they were masked to, in
+    the model's own coordinate frame -- a cloud that looks unmasked and noisy
+    however carefully the pixels were masked.
+
+    Unprojecting `depth_z` through the very intrinsics and pose that get
+    written makes reprojection exact by construction, which is the property
+    P4 carving and P4c label fusion depend on.
+    """
+    import torch
+
+    rebuilt = 0
+    for prediction in outputs:
+        if not all(key in prediction for key in ("depth_z", "intrinsics", "camera_poses")):
+            continue
+        depth = prediction["depth_z"][0].squeeze(-1)                  # (H, W)
+        K = prediction["intrinsics"][0].to(depth.dtype)               # (3, 3)
+        cam_to_world = prediction["camera_poses"][0].to(depth.dtype)  # (4, 4)
+        height, width = depth.shape
+        vs, us = torch.meshgrid(
+            torch.arange(height, device=depth.device, dtype=depth.dtype),
+            torch.arange(width, device=depth.device, dtype=depth.dtype),
+            indexing="ij")
+        x = (us - K[0, 2]) / K[0, 0] * depth
+        y = (vs - K[1, 2]) / K[1, 1] * depth
+        camera_points = torch.stack([x, y, depth], dim=-1)            # (H, W, 3)
+        world = camera_points @ cam_to_world[:3, :3].transpose(0, 1) + cam_to_world[:3, 3]
+        prediction["pts3d"] = world[None].to(prediction["pts3d"].dtype)
+        rebuilt += 1
+    return rebuilt
 
 
 def main():
@@ -98,6 +141,10 @@ def main():
         )
     print("Inference complete")
 
+    if args.points_from == "depth":
+        rebuilt = rebuild_points_from_depth(outputs)
+        print(f"Rebuilt pts3d from depth_z for {rebuilt} views, so points and cameras agree")
+
     if args.plant_masks:
         import cv2
 
@@ -136,6 +183,7 @@ def main():
         "multiview_confidence": not args.no_multiview_confidence,
         "voxel_fraction": args.voxel_fraction,
         "plant_masks_applied": bool(args.plant_masks),
+        "points_from": args.points_from,
     }, indent=2))
     print(f"Wrote {args.output_dir}")
 
