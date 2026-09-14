@@ -77,12 +77,14 @@ def parse_args():
     parser.add_argument("--fuse-tolerance", type=float, default=0.02,
                         help="Depth agreement band as a fraction of the point's depth. Only used "
                              "when --agreement-fraction is 0; prefer that one")
-    parser.add_argument("--agreement-fraction", type=float, default=0.005,
-                        help="Agreement band as a fraction of the PLANT's own extent. A fraction "
-                             "of the distance to the camera, which --fuse-tolerance is, means "
-                             "something different on every capture and on every backend -- this "
-                             "is the same band VGGT-Omega uses, so the two are comparable. "
-                             "0 falls back to --fuse-tolerance")
+    parser.add_argument("--agreement-band", default="auto",
+                        help="How wide two views may disagree and still corroborate each other. "
+                             "'auto' (default) measures it from this capture's own depth noise, "
+                             "the same rule VGGT-Omega uses, so the two stay comparable without "
+                             "being held to the same number on differently-scaled scenes; a "
+                             "number is a fraction of the plant's extent; 'depth' falls back to "
+                             "--fuse-tolerance. A fixed 0.005 of extent was 4.6x tighter than "
+                             "the old default here and cost 94% of the points")
     parser.add_argument("--points-from", default="depth", choices=["depth", "pointmap"],
                         help="depth: unproject depth_z through the intrinsics and pose that are "
                              "written to the model, so points reproject where they came from. "
@@ -224,6 +226,38 @@ def rebuild_points_from_depth(outputs) -> int:
     return rebuilt
 
 
+def resolve_band(setting, extent, outputs, min_views):
+    """--agreement-band as a band in scene units, or None for depth-relative."""
+    if setting == "depth":
+        return None
+    if setting == "auto":
+        depths, intrinsics, extrinsics, masks, points = _fusion_arrays(outputs)
+        band = mv_fusion.auto_agreement_band(points, depths, intrinsics, extrinsics,
+                                             masks, min_views)
+        return band or None
+    try:
+        fraction = float(setting)
+    except ValueError:
+        raise SystemExit(f"--agreement-band must be 'auto', 'depth' or a number -- got {setting!r}")
+    return fraction * extent if fraction > 0 else None
+
+
+def _fusion_arrays(outputs):
+    """The per-view stacks the fusion and the band measurement both need."""
+    depths, intrinsics, extrinsics, masks, points = [], [], [], [], []
+    for prediction in outputs:
+        depth = prediction["depth_z"][0].squeeze(-1).float().cpu().numpy()
+        mask = prediction["mask"][0].squeeze(-1).cpu().numpy().astype(bool)
+        cam_to_world = prediction["camera_poses"][0].float().cpu().numpy()
+        depths.append(np.where(mask & (depth > 0), depth, np.nan))
+        masks.append(mask)
+        intrinsics.append(prediction["intrinsics"][0].float().cpu().numpy())
+        extrinsics.append(np.linalg.inv(cam_to_world)[:3, :4])
+        points.append(prediction["pts3d"][0].float().cpu().numpy())
+    return (np.stack(depths), np.stack(intrinsics), np.stack(extrinsics),
+            np.stack(masks), np.stack(points))
+
+
 def mapanything_plant_extent(outputs) -> float:
     """The subject's size in scene units, from the masked pixels of every view.
 
@@ -272,19 +306,7 @@ def fuse_masks_by_consistency(outputs, min_views: int, tolerance: float,
     """
     import torch
 
-    depths, intrinsics, extrinsics, masks, points = [], [], [], [], []
-    for prediction in outputs:
-        depth = prediction["depth_z"][0].squeeze(-1).float().cpu().numpy()
-        mask = prediction["mask"][0].squeeze(-1).cpu().numpy().astype(bool)
-        cam_to_world = prediction["camera_poses"][0].float().cpu().numpy()
-        world_to_cam = np.linalg.inv(cam_to_world)[:3, :4]
-        depths.append(np.where(mask & (depth > 0), depth, np.nan))
-        masks.append(mask)
-        intrinsics.append(prediction["intrinsics"][0].float().cpu().numpy())
-        extrinsics.append(world_to_cam)
-        points.append(prediction["pts3d"][0].float().cpu().numpy())
-    depths = np.stack(depths); masks = np.stack(masks)
-    intrinsics = np.stack(intrinsics); extrinsics = np.stack(extrinsics)
+    depths, intrinsics, extrinsics, masks, points = _fusion_arrays(outputs)
 
     before = int(masks.sum())
     kept = 0
@@ -444,10 +466,12 @@ def main():
     fuse_extent = fuse_absolute = None
     if args.fuse_views > 0:
         fuse_extent = mapanything_plant_extent(outputs)
-        if args.agreement_fraction > 0 and fuse_extent > 0:
-            fuse_absolute = args.agreement_fraction * fuse_extent
+        fuse_absolute = resolve_band(args.agreement_band, fuse_extent, outputs, args.fuse_views)
+        if fuse_absolute is not None:
             print(f"Plant extent {fuse_extent:.4f} scene units; agreement band "
-                  f"{fuse_absolute:.5f} ({args.agreement_fraction * 100:.2f}% of extent)")
+                  f"{fuse_absolute:.5f} "
+                  f"({fuse_absolute / max(fuse_extent, 1e-9) * 100:.2f}% of extent, "
+                  f"{args.agreement_band})")
         else:
             print(f"Agreement band {args.fuse_tolerance * 100:.2f}% of each point's depth")
         kept, before = fuse_masks_by_consistency(outputs, args.fuse_views, args.fuse_tolerance,
@@ -485,7 +509,7 @@ def main():
         "fuse_views": args.fuse_views,
         "fuse_tolerance": args.fuse_tolerance,
         "plant_extent": fuse_extent,
-        "agreement_fraction": args.agreement_fraction,
+        "agreement_band": args.agreement_band,
         "agreement_absolute": fuse_absolute,
         "flatness": flatness,
     }, indent=2))

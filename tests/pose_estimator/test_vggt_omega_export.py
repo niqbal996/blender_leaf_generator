@@ -196,3 +196,84 @@ def test_agreement_band_can_be_set_in_scene_units():
     # units that mean something about the plant.
     assert narrow[:, 1].sum() < 0.1 * wide[:, 1].sum(), (
         f"narrow band kept {narrow[:, 1].sum()} of {wide[:, 1].sum()}")
+
+
+def _noisy_plane_scene(noise, views=10, size=40, seed=0):
+    """One world plane, `views` cameras round it, independent per-view depth noise."""
+    rng = np.random.default_rng(seed)
+    K = np.array([[50.0, 0, size / 2], [0, 50.0, size / 2], [0, 0, 1]])
+    extrinsics = []
+    for angle in np.linspace(0, 2 * np.pi, views, endpoint=False):
+        centre = np.array([3 * np.cos(angle), 3 * np.sin(angle), 2.5])
+        forward = -centre / np.linalg.norm(centre)
+        right = np.cross(forward, [0, 0, 1.0])
+        right /= np.linalg.norm(right)
+        rotation = np.stack([right, np.cross(forward, right), forward])
+        extrinsics.append(np.hstack([rotation, (-rotation @ centre).reshape(3, 1)]))
+    extrinsics = np.stack(extrinsics)
+
+    rows, cols = np.mgrid[0:size, 0:size]
+    dirs = np.stack([(cols - K[0, 2]) / K[0, 0], (rows - K[1, 2]) / K[1, 1],
+                     np.ones_like(cols, float)], -1)
+    depths, masks, points = [], [], []
+    for extrinsic in extrinsics:
+        rotation, translation = extrinsic[:3, :3], extrinsic[:3, 3]
+        centre = -rotation.T @ translation
+        world_dirs = dirs @ rotation
+        scale = -centre[2] / world_dirs[..., 2]
+        hit = centre + world_dirs * scale[..., None]
+        ok = (np.isfinite(scale) & (scale > 0)
+              & (np.abs(hit[..., 0]) < 1.0) & (np.abs(hit[..., 1]) < 1.0))
+        depth = np.where(ok, scale + rng.normal(0, noise, scale.shape), np.nan)
+        camera = np.stack([(cols - K[0, 2]) / K[0, 0] * depth,
+                           (rows - K[1, 2]) / K[1, 1] * depth, depth], -1)
+        depths.append(depth)
+        masks.append(ok)
+        points.append((camera - translation) @ rotation)
+    return (np.stack(points), np.stack(depths), np.stack([K] * views),
+            extrinsics, np.stack(masks))
+
+
+def test_the_agreement_band_is_measured_rather_than_guessed():
+    """A fixed band has to be wrong for one backend to be right for another.
+
+    0.005 of the plant's extent was 3.5x tighter than VGGT-Omega's old setting
+    and 4.6x tighter than MapAnything's, and MapAnything's thistle3 export fell
+    from 188,586 points to 12,397 -- taking every root point with it, because
+    root tissue is gripped by the jaws and so corroborated by the fewest views.
+    Measured from the data, the band tracks whatever noise the backend has.
+    """
+    import sys
+    sys.path.insert(0, str(SCRIPT.parent))
+    import mv_fusion
+
+    bands = {}
+    for noise in (0.01, 0.04):
+        points, depths, intrinsics, extrinsics, masks = _noisy_plane_scene(noise)
+        bands[noise] = mv_fusion.auto_agreement_band(points, depths, intrinsics,
+                                                     extrinsics, masks, min_views=3)
+    assert bands[0.04] > bands[0.01] * 1.5, f"band must follow the noise: {bands}"
+    # ... and land near it rather than at an arbitrary multiple of it.
+    for noise, band in bands.items():
+        assert 0.5 * noise < band < 4.0 * noise, f"band {band} unrelated to noise {noise}"
+
+
+def test_a_noisy_backend_keeps_its_tissue_under_the_measured_band():
+    """The regression this exists to stop: a band chosen for a clean backend
+    silently discarding most of a noisier one's reconstruction."""
+    import sys
+    sys.path.insert(0, str(SCRIPT.parent))
+    import mv_fusion
+
+    points, depths, intrinsics, extrinsics, masks = _noisy_plane_scene(0.06)
+    extent = mv_fusion.plant_extent(points, masks, depths)
+    measured = mv_fusion.auto_agreement_band(points, depths, intrinsics, extrinsics,
+                                             masks, min_views=3)
+
+    common = dict(masks=masks, min_views=3, tolerance=0.01, max_points=100_000)
+    kept_auto, _ = exporter.fuse_by_consistency(points, depths, intrinsics, extrinsics,
+                                                absolute=measured, **common)
+    kept_fixed, _ = exporter.fuse_by_consistency(points, depths, intrinsics, extrinsics,
+                                                 absolute=0.005 * extent, **common)
+    assert len(kept_auto) > 3 * len(kept_fixed), (
+        f"measured band kept {len(kept_auto)}, fixed kept {len(kept_fixed)}")

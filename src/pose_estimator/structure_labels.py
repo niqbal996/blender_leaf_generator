@@ -1745,14 +1745,21 @@ def build_from_labels(
             # its curvature discarded. thistle3's steep leaves score 79%, 57%
             # and 50%, and those are the ones the chord is for.
             support = chord_station_support(leaf_points[member], base_point, tip)
-            heart = use_straight_chord(elevation, support, strict=strict_midribs)
+            # `heart_leaf`, not `heart`: `heart` is the anatomical point at the
+            # top of an upright plant's stem, set far above and returned on the
+            # structure. Naming this one the same overwrote it with a per-leaf
+            # boolean, and the last leaf's value was what reached
+            # stem_graph.json -- where Blender read "heart_xyz": true as a
+            # coordinate and died reshaping one element into three. Invisible
+            # until P5 found leaves at all, because the loop never ran before.
+            heart_leaf = use_straight_chord(elevation, support, strict=strict_midribs)
             midrib_support.append(
                 {"elevation_deg": round(float(elevation), 1),
                  "chord_support": round(float(support), 3),
-                 "source": "chord" if heart else "points"})
+                 "source": "chord" if heart_leaf else "points"})
             chorded = chord_midrib(leaf_points[member], base_point, tip,
                                    spare=leaf_points[instancing.owner < 0],
-                                   heart=heart)
+                                   heart=heart_leaf)
             # Always the chord construction now. Selecting between it and
             # the geodesic station chain was tried and is subtly wrong: the
             # chain is built from real points, so "which curve sits closer to

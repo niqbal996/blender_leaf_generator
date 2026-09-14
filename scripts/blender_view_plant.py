@@ -447,8 +447,104 @@ def clear_startup_scene():
         print("[plant] cleared startup objects: " + ", ".join(removed))
 
 
+def leaf_azimuths(graph):
+    """Every leaf's compass bearing about +z, with how far it reaches.
+
+    Returns (angles, reaches) in radians and scene units, both empty when the
+    branch has no leaves. Reach is horizontal distance from the crown to the
+    tip, which is the weight a leaf deserves in any fit: a near-vertical heart
+    leaf has its tip almost on the axis, so its bearing is decided by a
+    millimetre of noise, and a long lateral blade's is not.
+    """
+    leaves = graph.get("leaves") or []
+    if not leaves:
+        return np.zeros(0), np.zeros(0)
+    crown = graph.get("crown_xyz")
+    if crown is None:
+        stem = graph.get("stem_path_xyz") or []
+        crown = stem[0] if stem else [0.0, 0.0, 0.0]
+    crown = np.asarray(crown, float).reshape(3)
+
+    angles, reaches = [], []
+    for leaf in leaves:
+        tip = leaf.get("tip_xyz")
+        if tip is None:
+            axis = leaf.get("axis_xyz") or []
+            if not axis:
+                continue
+            tip = axis[-1]
+        offset = np.asarray(tip, float).reshape(3) - crown
+        angles.append(np.arctan2(offset[1], offset[0]))
+        reaches.append(float(np.hypot(offset[0], offset[1])))
+    return np.asarray(angles), np.asarray(reaches)
+
+
+def azimuth_turn(reference, branch, tolerance_deg=25.0):
+    """The rotation about +z that best lays `branch`'s leaves over `reference`'s.
+
+    The obvious rule -- point each branch's biggest leaf the same way -- is
+    wrong exactly when the comparison matters most. The branches do not agree
+    about how many leaves there are: thistle3 gives 8 on COLMAP, 5 on
+    VGGT-Omega and 3 on MapAnything, so "the biggest leaf" is not necessarily
+    the same physical leaf in two of them, and matching them then rotates the
+    plant to a bearing nothing else supports.
+
+    Every leaf votes instead. Each possible pairing of one leaf here with one
+    leaf there proposes the turn that would make those two coincide; each
+    proposal is then scored by how well it lines up *all* the other leaves,
+    weighting each by its reach. The turn most of the plant agrees on wins,
+    and a leaf the other branch never reconstructed simply fails to vote
+    rather than dragging the answer.
+
+    `tolerance_deg` is how close two leaves must come to count as the same
+    one. It is wide because it has to absorb genuine reconstruction
+    differences in where a tip ended up, and it can be: the leaves of a
+    rosette are far further apart than this, so a wrong pairing scores nothing
+    even at 25 degrees.
+
+    Returns radians, or None when either branch has no usable leaf.
+    """
+    ref_angles, ref_reach = leaf_azimuths(reference)
+    own_angles, own_reach = leaf_azimuths(branch)
+    if not len(ref_angles) or not len(own_angles):
+        return None
+
+    # Leaves too close to the axis have no meaningful bearing -- see
+    # `leaf_azimuths`. Measured against each branch's own longest reach, since
+    # the branches are not to a common scale at this point.
+    ref_keep = ref_reach > 0.1 * ref_reach.max()
+    own_keep = own_reach > 0.1 * own_reach.max()
+    ref_angles, ref_reach = ref_angles[ref_keep], ref_reach[ref_keep]
+    own_angles, own_reach = own_angles[own_keep], own_reach[own_keep]
+    if not len(ref_angles) or not len(own_angles):
+        return None
+
+    # Normalised, so a branch is not penalised for reconstructing a smaller
+    # plant -- only the *pattern* of bearings is being compared.
+    own_weight = own_reach / own_reach.max()
+    tolerance = np.radians(tolerance_deg)
+
+    best_turn, best_score = None, -1.0
+    for proposal in (ref_angles[:, None] - own_angles[None, :]).ravel():
+        turned = own_angles + proposal
+        # Circular distance from each turned leaf to its nearest reference leaf.
+        gap = np.abs(np.angle(np.exp(1j * (turned[:, None] - ref_angles[None, :]))))
+        closest = gap.min(axis=1)
+        closeness = np.clip(1.0 - closest / tolerance, 0.0, None)
+        # Weighted by the reach of the leaf being placed, and not also by the
+        # reach of whatever it lands on. Multiplying the two was tried and
+        # quietly reintroduces the bias this function exists to remove: a
+        # proposal that puts the two branches' longest leaves together outbids
+        # one that matches more leaves, which is the largest-leaf rule wearing
+        # a vote's clothing.
+        score = float(np.sum(closeness * own_weight))
+        if score > best_score:
+            best_turn, best_score = float(proposal), score
+    return best_turn
+
+
 def build(workdir, point_radius=None, stem_radius=None, frame=True,
-          backend="colmap", prefix="", place=None, clear=True):
+          backend="colmap", prefix="", place=None, clear=True, align_to=None):
     """Build one branch. `place` puts it somewhere other than where it sits.
 
     `place` is (target_extent, offset): the branch is scaled so its longest
@@ -459,6 +555,13 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True,
     COLMAP's and the comparison becomes one of scale rather than of shape.
     Left as None the branch is drawn exactly where it is, which is what a
     single-branch view has always done.
+
+    `align_to` is another branch's stem graph. This branch is spun about its
+    own vertical axis until its leaves lie over that one's, which is the other
+    half of making three reconstructions comparable: scale makes them the same
+    size, this makes them face the same way. See `azimuth_turn`. This branch's
+    own graph comes back as "graph", so the first branch built can serve as
+    the reference for the rest.
     """
     if clear:
         _PREPARED.clear()
@@ -489,12 +592,25 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True,
                            (low[1] + high[1]) / 2.0, low[2]])
         shift = np.asarray(offset, float)
 
+        # Spun about the vertical through its own centre, before the move, so
+        # the rotation cannot drag the plant off its place in the row.
+        spin = np.eye(3)
+        if align_to is not None:
+            turn = azimuth_turn(align_to, graph)
+            if turn is None:
+                print("[plant] no leaves to align by -- drawn at its own heading")
+            else:
+                cos, sin = np.cos(turn), np.sin(turn)
+                spin = np.array([[cos, -sin, 0.0], [sin, cos, 0.0], [0.0, 0.0, 1.0]])
+                print(f"[plant] turned {np.degrees(turn) % 360:.1f} deg to lay its leaves "
+                      f"over the reference branch's")
+
         def xform(points):                      # noqa: F811
             points = np.asarray(points, float)
             if not points.size:
                 return points
             flat = points.reshape(-1, 3)
-            return ((flat - centre) * scale + shift).reshape(points.shape)
+            return (((flat - centre) @ spin.T) * scale + shift).reshape(points.shape)
 
         xyz = xform(xyz)
         stem = xform(stem)
@@ -628,8 +744,17 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True,
     print(f"[plant] collections: {prefix}plant_cloud, {prefix}plant_root, "
           f"{prefix}plant_stem_cloud, {prefix}plant_stem, {prefix}plant_midribs, "
           f"{prefix}plant_tips")
+    # Bounds of what was actually drawn, not of what was loaded. `place` scales
+    # the branch and moves it along the row, so the raw bounds describe a plant
+    # that is no longer where this says it is -- and the comparison frames the
+    # camera on the union of these, so it was framing on the first branch's
+    # footprint and cropping the other two.
+    drawn = xyz if len(xyz) else stem
+    placed_low, placed_high = ((drawn.min(axis=0), drawn.max(axis=0))
+                               if len(drawn) else (low, high))
     return {"points": len(xyz), "leaves": len(leaves), "stem_nodes": len(stem),
-            "bounds": (low, high), "extent": extent}
+            "bounds": (placed_low, placed_high), "extent": extent,
+            "graph": graph}
 
 
 def branch_extent(workdir, backend):
@@ -663,16 +788,30 @@ def add_label(text, centre, size, into, name, rgba=(0.85, 0.85, 0.85, 1.0)):
     return obj
 
 
-def build_comparison(workdir, backends, gap=1.45, frame=True):
+def build_comparison(workdir, backends, gap=1.45, frame=True, align=True):
     """Draw several geometry branches side by side in one scene.
 
-    The branches are normalised to a common size before being placed. That is
-    a deliberate loss of information -- the backends' scales genuinely differ,
-    by a factor of four between COLMAP and VGGT-Omega on thistle3 -- but none
-    of those scales is metric, so drawing them in their own units compares
-    arbitrary constants instead of plants. The scale factor applied to each
-    branch is printed, and `scripts/compare_branches.py` prints the raw
-    extents, so the discarded information is one command away.
+    The branches are normalised to a common size *and* a common heading before
+    being placed, because two different things otherwise make the same plant
+    look like three.
+
+    Size: the backends' scales genuinely differ, by a factor of four between
+    COLMAP and VGGT-Omega on thistle3, and none of them is metric, so drawing
+    them in their own units compares arbitrary constants instead of plants.
+    The scale factor applied to each branch is printed, and
+    `scripts/compare_branches.py` prints the raw extents, so the discarded
+    information is one command away.
+
+    Heading: the orbit solve fixes the plant's axis but not where zero degrees
+    sits on it, so each branch comes out spun by an arbitrary amount and the
+    same leaf points three different ways. Measured on thistle3, VGGT-Omega sat
+    160 degrees off COLMAP and MapAnything 37. Each branch is turned about its
+    own vertical until its leaves lie over the first branch's -- see
+    `azimuth_turn`, which votes across every leaf rather than trusting the
+    largest one, because the branches disagree about how many leaves there are.
+    Only a rotation about the vertical, so nothing about the shape is altered:
+    a leaf that droops in one branch still droops. `align=False` draws each at
+    its own heading.
 
     Missing branches are reported and skipped rather than being fatal: a
     comparison of the two that ran is still worth looking at.
@@ -694,14 +833,24 @@ def build_comparison(workdir, backends, gap=1.45, frame=True):
     # to it, so a familiar branch still looks the size it always did.
     target = present[0][1]
     results = {}
+    reference_graph = None
     for index, (backend, extent) in enumerate(present):
         offset = (index * target * gap, 0.0, 0.0)
         print(f"\n[plant] --- {backend}: extent {extent:.3f} "
               f"-> x{target / extent:.3f}, placed at x={offset[0]:.3f} ---")
+        # The first branch present sets the direction the row faces and is
+        # itself left alone, the same way it already sets the row's size. So
+        # the branch you know stays exactly as you know it, and the others are
+        # turned to meet it.
         built = build(workdir, backend=backend, prefix=f"{backend}_",
-                      place=(target, offset), frame=False, clear=False)
+                      place=(target, offset), frame=False, clear=False,
+                      align_to=reference_graph if align else None)
         if built is None:
             continue
+        if align and reference_graph is None and (built["graph"].get("leaves") or []):
+            reference_graph = built["graph"]
+            print(f"[plant] {backend} sets the heading for the row "
+                  f"({len(reference_graph['leaves'])} leaves to match against)")
         results[backend] = built
         add_label(backend, (offset[0], 0.0, -target * 0.12), target * 0.09,
                   _collection("comparison_labels"), f"label_{backend}")
@@ -760,7 +909,8 @@ def resolve_branches(argv):
     backends = [b.strip() for b in compare.split(",") if b.strip()]
     single = _after(rest, "--geometry-backend",
                     os.environ.get("PLANT_GEOMETRY_BACKEND", "colmap"))
-    return backends, single
+    align = "--no-align" not in rest and os.environ.get("PLANT_NO_ALIGN", "") == ""
+    return backends, single, align
 
 
 def hide_splash():
@@ -788,10 +938,10 @@ def main():
         print("[plant] or launch as:")
         print("[plant]   blender --python blender_view_plant.py -- --workdir runs/plant_9")
         return
-    backends, single = resolve_branches(list(sys.argv))
+    backends, single, align = resolve_branches(list(sys.argv))
     try:
         if backends:
-            build_comparison(target, backends)
+            build_comparison(target, backends, align=align)
         else:
             build(target, backend=single,
                   prefix="" if single == "colmap" else f"{single}_")

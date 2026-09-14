@@ -290,8 +290,8 @@ def _write_outputs(p5_dir: Path, structure, stem_points: np.ndarray, frame, clam
         "stem_path_xyz": structure.stem_path.tolist(),
         # The two ends of an upright plant's stem line, named, so they can be
         # drawn and argued with rather than inferred from the polyline.
-        "crown_xyz": None if structure.crown is None else np.asarray(structure.crown).tolist(),
-        "heart_xyz": None if structure.heart is None else np.asarray(structure.heart).tolist(),
+        "crown_xyz": _point_or_none(structure.crown, "crown"),
+        "heart_xyz": _point_or_none(structure.heart, "heart"),
         "leaves": [
             {
                 "id": i,
@@ -390,6 +390,25 @@ def _stem_check(structure) -> dict:
         "pass": len(structure.stem_path) >= 3,
         "detail": f"{len(structure.stem_path)} stem centreline nodes",
     }
+
+
+def _point_or_none(value, name: str):
+    """A 3-vector for the graph, or None -- never anything else.
+
+    This file is read by Blender, which is a separate process with no way to
+    report a bad value except by stopping mid-scene. It once received
+    `"heart_xyz": true` -- a per-leaf boolean that had shadowed the anatomical
+    heart point -- and failed with "cannot reshape array of size 1 into shape
+    (3)", several steps and one process away from the line responsible.
+    Anything that is not a point is dropped here, and said out loud.
+    """
+    if value is None:
+        return None
+    array = np.asarray(value, dtype=object)
+    if array.shape != (3,):
+        print(f"  WARNING: {name} is {value!r}, not a 3D point -- omitted from stem_graph.json")
+        return None
+    return np.asarray(value, float).tolist()
 
 
 def _evaluate(structure, clamp, frame, voxel: float) -> dict:

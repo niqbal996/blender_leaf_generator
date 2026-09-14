@@ -72,3 +72,40 @@ def test_the_split_does_not_move_with_the_radius():
     counts = {r: int(root_by_connectivity(points, VOXEL, radius_voxels=r).sum())
               for r in (2.0, 3.0, 4.0, 6.0)}
     assert len(set(counts.values())) == 1, f"root size moved with the radius: {counts}"
+
+
+def test_the_heart_stays_a_point_after_midribs_are_fitted():
+    """A rosette has no heart, and must still report None rather than a flag.
+
+    `use_straight_chord` returns a per-leaf boolean and was assigned to a
+    variable called `heart`, which is also the name of the anatomical point at
+    the top of an upright plant's stem. The last leaf's boolean was what
+    reached stem_graph.json, so Blender read `"heart_xyz": true` as a
+    coordinate and stopped with `cannot reshape array of size 1 into shape
+    (3)`. It stayed hidden while P5 was finding no leaves: the loop that does
+    the overwriting never ran.
+    """
+    from pose_estimator.structure_labels import build_from_labels
+
+    # Four blades radiating from a crown, each a strip rather than a line so
+    # the foliage outweighs the root -- the largest component is taken as the
+    # plant, and a root bigger than the shoot would be read as the plant.
+    spacing = 0.01
+    blades = []
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        step = np.arange(1, 31) * spacing
+        for across in (-1, 0, 1):
+            shift = np.array([-dy, dx, 0]) * across * spacing
+            blades.append(np.stack([step * dx, step * dy, np.zeros_like(step)], 1) + shift)
+    leaf = np.vstack(blades)
+    root = body([0, 0, -0.30], (4, 4, 4), spacing)
+    points = np.vstack([leaf, root])
+    labels = np.array([0] * len(leaf) + [1] * len(root))
+    assert len(leaf) > len(root), "the shoot has to be the larger body"
+
+    structure = build_from_labels(points, labels, ["leaf", "root"], voxel=spacing,
+                                  min_leaf_points=5, architecture="rosette")
+
+    assert structure.num_leaves > 0, "fixture must actually fit some midribs"
+    assert structure.heart is None or np.asarray(structure.heart).shape == (3,), (
+        f"heart must be a point or None, got {structure.heart!r}")

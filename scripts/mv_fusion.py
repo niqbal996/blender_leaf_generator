@@ -227,3 +227,75 @@ def report_flatness(points: np.ndarray, extent: float, label: str = "") -> dict:
     print(f"    sheet thickness {stats['thickness'] / max(extent, 1e-12) * 100:.3f}% of extent "
           f"(P4b target <=0.25 flatness; 0.577 = isotropic)")
     return stats
+
+
+def auto_agreement_band(points: np.ndarray, depths: np.ndarray, intrinsics: np.ndarray,
+                        extrinsics: np.ndarray, masks: np.ndarray | None,
+                        min_views: int, sample: int = 1200,
+                        quantile: float = 0.9, seed: int = 0) -> float:
+    """The agreement band measured from the data, not chosen for it.
+
+    Every fixed default here has been wrong at least once. A fraction of camera
+    depth is not a property of the plant. A fraction of the plant's extent is,
+    but the right fraction depends on how noisy the backend's depth is, and
+    that differs per model: 0.005 of extent was 3.5x tighter than VGGT-Omega's
+    old setting and 4.6x tighter than MapAnything's, which cut MapAnything's
+    thistle3 export from 188,586 points to 12,397 and took the root with it --
+    root tissue is gripped by the jaws and so corroborated by the fewest views,
+    which makes it the first thing a too-tight band discards.
+
+    What can be measured instead: push each candidate into every other view and
+    record how far that view's depth map puts the surface from where the
+    candidate claims it is. For a real point the `min_views` smallest of those
+    disagreements is the backend's own depth noise. Take a high quantile across
+    candidates and the band admits the tissue this model can actually
+    reconstruct, whatever scale it reconstructed at.
+
+    Returns the band in scene units.
+    """
+    num_views, height, width = depths.shape
+    rng = np.random.default_rng(seed)
+    candidates = []
+    per_view = max(sample // max(num_views, 1), 1)
+    for index in range(num_views):
+        valid = np.isfinite(depths[index]) & (depths[index] > 0)
+        if masks is not None:
+            valid &= masks[index]
+        rows, cols = np.nonzero(valid)
+        if not len(rows):
+            continue
+        pick = rng.choice(len(rows), min(per_view, len(rows)), replace=False)
+        candidates.append(points[index][rows[pick], cols[pick]])
+    if not candidates:
+        return 0.0
+    candidates = np.concatenate(candidates)
+
+    gaps = np.full((len(candidates), num_views), np.inf)
+    for view in range(num_views):
+        rotation, translation = extrinsics[view][:3, :3], extrinsics[view][:3, 3]
+        camera_points = candidates @ rotation.T + translation
+        z = camera_points[:, 2]
+        in_front = z > 1e-6
+        safe = np.where(in_front, z, 1.0)
+        u = np.round(camera_points[:, 0] / safe * intrinsics[view][0, 0]
+                     + intrinsics[view][0, 2]).astype(np.int64)
+        v = np.round(camera_points[:, 1] / safe * intrinsics[view][1, 1]
+                     + intrinsics[view][1, 2]).astype(np.int64)
+        inside = in_front & (u >= 0) & (u < width) & (v >= 0) & (v < height)
+        u, v = np.clip(u, 0, width - 1), np.clip(v, 0, height - 1)
+        observed = depths[view][v, u]
+        if masks is not None:
+            inside &= masks[view][v, u]
+        usable = inside & np.isfinite(observed)
+        gaps[usable, view] = np.abs(observed - z)[usable]
+
+    # The min_views-th smallest disagreement per candidate: the level at which
+    # it would just survive. Candidates no view can corroborate carry inf and
+    # say nothing about the noise, so they are dropped rather than counted.
+    ranked = np.sort(gaps, axis=1)
+    column = min(min_views, num_views - 1)
+    kth = ranked[:, column]
+    kth = kth[np.isfinite(kth)]
+    if not len(kth):
+        return 0.0
+    return float(np.quantile(kth, quantile))

@@ -63,11 +63,15 @@ def parse_args():
                         help="Drop pixels below this depth-confidence percentile rank (0-1)")
     parser.add_argument("--consistency-views", type=int, default=3,
                         help="How many other views must agree about a point before it is kept")
-    parser.add_argument("--agreement-fraction", type=float, default=0.005,
-                        help="Agreement band as a fraction of the PLANT's own extent, which is "
-                             "what makes it mean the same thing at any capture distance and on "
-                             "either backend. 0.005 is about half a leaf thickness on thistle3. "
-                             "Set to 0 to fall back to --consistency-tolerance")
+    parser.add_argument("--agreement-band", default="auto",
+                        help="How wide two views may disagree and still corroborate each other. "
+                             "'auto' (default) measures it from this capture's own depth noise, "
+                             "which is the only one of these that adapts to the backend; a number "
+                             "is a fraction of the plant's extent; 'depth' falls back to "
+                             "--consistency-tolerance, a fraction of the distance to the camera. "
+                             "A fixed 0.005 of extent was 3.5x tighter than the old depth-relative "
+                             "default here and 4.6x tighter on MapAnything, which cost that "
+                             "backend 94% of its points and all of its root")
     parser.add_argument("--merge-fraction", type=float, default=0.003,
                         help="Corroborated copies of one surface point within this fraction of "
                              "the plant's extent are averaged into a single point. 0 keeps every "
@@ -163,6 +167,21 @@ def unproject(depth, intrinsic, extrinsic):
     rotation, translation = extrinsic[:3, :3], extrinsic[:3, 3]
     world = (camera_points.reshape(-1, 3) - translation) @ rotation
     return world.reshape(height, width, 3)
+
+
+def resolve_band(setting, extent, points, depths, intrinsics, extrinsics, masks, min_views):
+    """Turn --agreement-band into a band in scene units, or None for depth-relative."""
+    if setting == "depth":
+        return None
+    if setting == "auto":
+        band = mv_fusion.auto_agreement_band(points, depths, intrinsics, extrinsics,
+                                             masks, min_views)
+        return band or None
+    try:
+        fraction = float(setting)
+    except ValueError:
+        raise SystemExit(f"--agreement-band must be 'auto', 'depth' or a number -- got {setting!r}")
+    return fraction * extent if fraction > 0 else None
 
 
 def fuse_by_consistency(points, depths, intrinsics, extrinsics, masks,
@@ -317,11 +336,13 @@ def main():
     # distance to the camera, so they mean the same thing here as they do on
     # MapAnything's differently-scaled scene. See `mv_fusion.agreement_matrix`.
     extent = mv_fusion.plant_extent(points, masks, depth)
-    absolute = args.agreement_fraction * extent if args.agreement_fraction > 0 else None
+    absolute = resolve_band(args.agreement_band, extent, points, depth, intrinsics,
+                            extrinsics, masks, args.consistency_views)
     merge_radius = args.merge_fraction * extent if args.merge_fraction > 0 else None
     print(f"  plant extent {extent:.4f} scene units")
     if absolute is not None:
-        print(f"  agreement band {absolute:.5f} ({args.agreement_fraction * 100:.2f}% of extent)")
+        print(f"  agreement band {absolute:.5f} ({absolute / max(extent, 1e-9) * 100:.2f}% of "
+              f"extent, {args.agreement_band})")
     else:
         print(f"  agreement band {args.consistency_tolerance * 100:.2f}% of each point's depth")
 
@@ -362,7 +383,7 @@ def main():
         "points": int(len(xyz)), "consistency_views": args.consistency_views,
         "consistency_tolerance": args.consistency_tolerance,
         "plant_extent": extent,
-        "agreement_fraction": args.agreement_fraction,
+        "agreement_band": args.agreement_band,
         "agreement_absolute": absolute,
         "merge_fraction": args.merge_fraction,
         "merge_radius": merge_radius,
