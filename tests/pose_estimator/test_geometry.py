@@ -32,7 +32,7 @@ def test_stage_masked_images_retains_frame_names_and_removes_background(tmp_path
     cv2.imwrite(str(frames / "frame_0000.jpg"), image)
     cv2.imwrite(str(masks / "frame_0000.png"), mask)
 
-    staged = stage_masked_images(tmp_path, tmp_path / "out" / "images")
+    staged, crop = stage_masked_images(tmp_path, tmp_path / "out" / "images", crop=False)
     result = cv2.imread(str(staged[0]))
     assert staged[0].name == "frame_0000.jpg"
     assert result[0, 0].max() < 4

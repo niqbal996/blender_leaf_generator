@@ -14,6 +14,8 @@ thick noisy shell rather than a plant.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 
@@ -299,3 +301,52 @@ def auto_agreement_band(points: np.ndarray, depths: np.ndarray, intrinsics: np.n
     if not len(kth):
         return 0.0
     return float(np.quantile(kth, quantile))
+
+
+def read_crop(scene_dir) -> dict | None:
+    """The crop manifest P3 wrote beside the staged images, if there is one."""
+    import json
+    from pathlib import Path
+
+    path = Path(scene_dir) / "crop.json"
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def to_frame_pixels(crop: dict | None, staged_size, model_size, name: str | None = None):
+    """How to turn a model pixel into a full-frame pixel: (sx, sy, x0, y0).
+
+    Everything downstream of P3 -- the P2 masks P4a carves with, the class maps
+    P4c votes on -- lives in full-frame pixels, so a model that worked on a
+    crop has to say where its points land *in the frame*, not in the crop.
+    Without a crop this is the plain resize it always was.
+
+    With one, a model pixel (u, v) is at frame pixel
+    (x0 + u * sx, y0 + v * sy), where the scale carries that frame's crop width
+    in frame units -- not the staged file's width, which is a common size every
+    crop was resized to and says nothing about how big this frame's box was.
+    `name` picks the frame out of the manifest; without it the first box is
+    used, which is right only when every box is the same.
+
+    The principal point comes out where it went in. Each box is centred on it
+    (see `geometry.plant_crop_boxes`), so cx_model = model_w / 2 maps to
+    x0 + (model_w / 2) * (crop_w / model_w) = x0 + crop_w / 2, the frame centre
+    again -- whatever this frame's box happened to be. That identity is the
+    check that the two halves of this agree, and the crop tests assert it.
+    """
+    model_w, model_h = model_size
+    if crop is None:
+        staged_w, staged_h = staged_size
+        return staged_w / model_w, staged_h / model_h, 0.0, 0.0
+    boxes = crop["boxes_in_frame"]
+    if name is not None and name not in boxes:
+        name = Path(name).stem if hasattr(Path(name), "stem") else name
+    box = boxes.get(name) if name is not None else None
+    if box is None:
+        box = next(iter(boxes.values()))
+    x0, y0, crop_w, crop_h = box
+    return crop_w / model_w, crop_h / model_h, float(x0), float(y0)

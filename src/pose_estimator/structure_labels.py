@@ -783,8 +783,18 @@ def _largest_cluster(points: np.ndarray, radius: float) -> Optional[np.ndarray]:
     return points[label == int(np.argmax(np.bincount(label)))]
 
 
+# Below this share of a detached body carrying the root label, the body is not
+# the root and the labels are believed instead. The two signals are
+# independent -- one is P2's tracked mask seen through the multi-view vote, the
+# other is pure 3D connectivity -- so their agreement is real evidence.
+# Measured on thistle3: COLMAP 88.9%, MapAnything 66.9%, VGGT-Omega 1.5%. The
+# cut sits in the middle of a 42-point gap and touches nothing.
+ROOT_LABEL_AGREEMENT = 0.25
+
+
 def root_by_connectivity(points: np.ndarray, voxel: float,
-                         radius_voxels: float = 3.0, min_points: int = 50):
+                         radius_voxels: float = 3.0, min_points: int = 50,
+                         labelled_root: Optional[np.ndarray] = None):
     """The root as the body the clamp cut off, rather than as a label.
 
     The jaws grip exactly where the root meets the shoot and occlude a band
@@ -806,9 +816,20 @@ def root_by_connectivity(points: np.ndarray, voxel: float,
     of three, with the split moving by 36 points across the whole range. A
     threshold with a plateau that wide is not really a threshold.
 
-    Returns a boolean mask over `points`, or None when nothing is detached --
-    a specimen the jaws never fully hid, where the caller's labels are all
-    there is.
+    `labelled_root` is P4c's own answer, and the two have to agree before this
+    one is used. Detachment is only evidence when the cloud is whole: a
+    reconstruction that breaks the plant into floating pieces has detached
+    bodies everywhere, and the lowest of them is then called the root however
+    little it resembles one. Measured on thistle3's VGGT-Omega branch, which
+    reconstructs the plant 0.234 tall against COLMAP's 0.970 and never
+    recovered the root at all: the body found there was 4,197 points, 13.6% of
+    the whole cloud, and 1.5% of it carried the root label. COLMAP's was 88.9%
+    and MapAnything's 66.9%. Against 65 labelled root points, claiming 4,197 is
+    not a refinement of the labels but a contradiction of them.
+
+    Returns a boolean mask over `points`, or None when nothing is detached, or
+    when what is detached does not look like what P4c called root -- in both
+    cases the caller's labels are all there is.
     """
     if len(points) < min_points * 2:
         return None
@@ -838,7 +859,20 @@ def root_by_connectivity(points: np.ndarray, voxel: float,
         member = component == label
         if points[member][:, 2].max() < canopy_middle:
             root |= member
-    return root if root.any() else None
+    if not root.any():
+        return None
+
+    if labelled_root is not None and np.any(labelled_root):
+        agreement = float(np.sum(root & labelled_root) / max(root.sum(), 1))
+        if agreement < ROOT_LABEL_AGREEMENT:
+            print(f"  detached body below the plant holds {root.sum()} points but only "
+                  f"{agreement * 100:.1f}% of them are labelled root "
+                  f"({int(labelled_root.sum())} labelled in all) -- too little agreement "
+                  f"to trust it over the labels, so the labels stand.")
+            print("    A cloud this branch broke into floating pieces has detached bodies "
+                  "that are not roots; check p4c/labels_vis.ply and the P3 cloud's extent.")
+            return None
+    return root
 
 
 def crown_from_root(root_points, foliage_points, voxel: float,
@@ -1535,7 +1569,8 @@ def build_from_labels(
     # them. See `root_by_connectivity` for the measurement this comes from.
     if root_ids:
         labels = np.asarray(labels).copy()
-        detached = root_by_connectivity(points, voxel)
+        detached = root_by_connectivity(points, voxel,
+                                        labelled_root=np.isin(labels, root_ids))
         if detached is not None:
             was_root = np.isin(labels, root_ids)
             root_id = root_ids[0]

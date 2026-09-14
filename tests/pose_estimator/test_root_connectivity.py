@@ -109,3 +109,35 @@ def test_the_heart_stays_a_point_after_midribs_are_fitted():
     assert structure.num_leaves > 0, "fixture must actually fit some midribs"
     assert structure.heart is None or np.asarray(structure.heart).shape == (3,), (
         f"heart must be a point or None, got {structure.heart!r}")
+
+
+def test_a_detached_body_the_labels_disown_is_not_the_root():
+    """Detachment is only evidence when the cloud is whole.
+
+    A reconstruction that breaks the plant into floating pieces has detached
+    bodies everywhere, and the lowest of them gets called the root however
+    little it resembles one. Measured on thistle3's VGGT-Omega branch: 65
+    points carried the root label, and connectivity claimed 4,197 -- 13.6% of
+    the whole cloud, of which 1.5% was root-labelled. COLMAP's body scored
+    88.9% on the same test and MapAnything's 66.9%, so the two signals agree
+    where the cloud is sound and only disagree where it is not.
+    """
+    points, split = clamped_plant()
+    # The labels say the root is where it is: connectivity agrees, and is used.
+    labelled = np.zeros(len(points), bool)
+    labelled[split:] = True
+    assert root_by_connectivity(points, VOXEL, labelled_root=labelled) is not None
+
+    # The labels put the root somewhere else entirely: the detached body is
+    # then contradicting P4c rather than sharpening it, and must stand down.
+    elsewhere = np.zeros(len(points), bool)
+    elsewhere[:40] = True
+    assert root_by_connectivity(points, VOXEL, labelled_root=elsewhere) is None
+
+
+def test_no_labels_leaves_connectivity_in_charge():
+    """The cross-check needs something to check against. A capture with no root
+    label at all is the case connectivity was written for."""
+    points, split = clamped_plant()
+    found = root_by_connectivity(points, VOXEL, labelled_root=np.zeros(len(points), bool))
+    assert found is not None and found[split:].all()

@@ -363,23 +363,37 @@ def main():
         colours.append(rgb[view, v, u])
 
     # Intrinsics out of the model's working resolution and into frame pixels,
-    # which is the coordinate system every later phase assumes.
+    # which is the coordinate system every later phase assumes. When P3 staged
+    # a crop of the plant rather than the whole frame, that mapping carries the
+    # crop's offset too -- see `mv_fusion.to_frame_pixels`.
+    crop = mv_fusion.read_crop(scene)
+    if crop:
+        spans = [b[2] for b in crop["boxes_in_frame"].values()]
+        print(f"  staged images are per-frame crops of the plant, "
+              f"{min(spans):.0f}-{max(spans):.0f} px wide of a "
+              f"{crop['frame_size'][0]}x{crop['frame_size'][1]} frame")
+    mapping = [mv_fusion.to_frame_pixels(crop, size, (width, height),
+                                         name=Path(names[index]).stem)
+               for index, size in enumerate(frame_sizes)]
+    output_sizes = [tuple(crop["frame_size"]) for _ in frame_sizes] if crop else frame_sizes
+
     scaled = []
-    for index, (frame_width, frame_height) in enumerate(frame_sizes):
-        sx, sy = frame_width / width, frame_height / height
+    for index, (sx, sy, x0, y0) in enumerate(mapping):
         K = intrinsics[index].copy()
-        K[0, 0] *= sx; K[0, 2] *= sx
-        K[1, 1] *= sy; K[1, 2] *= sy
+        K[0, 0] *= sx; K[0, 2] = K[0, 2] * sx + x0
+        K[1, 1] *= sy; K[1, 2] = K[1, 2] * sy + y0
         scaled.append(K)
-    tracks_scaled = [[(view, u * frame_sizes[view][0] / width, v * frame_sizes[view][1] / height)
+    tracks_scaled = [[(view, u * mapping[view][0] + mapping[view][2],
+                       v * mapping[view][1] + mapping[view][3])
                       for view, u, v in track] for track in tracks]
 
     sparse = scene / "sparse"
-    write_colmap_text(sparse, names, frame_sizes, scaled, extrinsics, xyz, tracks_scaled, colours)
+    write_colmap_text(sparse, names, output_sizes, scaled, extrinsics, xyz, tracks_scaled, colours)
     print(f"  wrote {sparse}")
     (scene / "omega_export.json").write_text(json.dumps({
         "checkpoint": checkpoint, "image_resolution": args.image_resolution,
         "mode": args.mode, "processed_hw": [height, width], "frame_size": list(frame_sizes[0]),
+        "crop": crop,
         "points": int(len(xyz)), "consistency_views": args.consistency_views,
         "consistency_tolerance": args.consistency_tolerance,
         "plant_extent": extent,

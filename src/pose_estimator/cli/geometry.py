@@ -45,6 +45,7 @@ def run(
     no_plant_masks: bool = False,
     intrinsics_from: Optional[str] = None,
     poses_from: Optional[str] = None,
+    no_crop: bool = False,
 ) -> dict:
     require_sparse_model(workdir, "colmap")
     selected = list(dict.fromkeys(backends))
@@ -69,7 +70,8 @@ def run(
                                      checkpoint=omega_checkpoint if backend == "vggt_omega" else None,
                                      use_plant_masks=not no_plant_masks,
                                      intrinsics_from=intrinsics_from,
-                                     poses_from=poses_from)
+                                     poses_from=poses_from,
+                                     crop_to_plant=not no_crop)
         if dry_run:
             print("  would run: " + " ".join(report["command"]))
         else:
@@ -138,6 +140,13 @@ def main(argv: Optional[list] = None) -> None:
                              "anything, so COLMAP's is used as-is; only the relative geometry is "
                              "taken, since a COLMAP world is scale-free. This makes the result "
                              "a COLMAP-conditioned reconstruction, not an independent one")
+    parser.add_argument("--no-crop", action="store_true",
+                        help="Feed the models whole frames instead of a crop of the plant. The "
+                             "crop exists because these models work at a few hundred pixels "
+                             "square: on thistle3 the plant spans 303 px for VGGT-Omega and 251 "
+                             "for MapAnything against COLMAP's 931, so most of the gap between "
+                             "the branches is framing rather than the models. Use this to measure "
+                             "that gap rather than to close it")
     parser.add_argument("--no-plant-masks", action="store_true",
                         help="Do not tell the exporters which pixels P2 called plant")
     parser.add_argument("--mapanything-python",
@@ -171,7 +180,7 @@ def main(argv: Optional[list] = None) -> None:
         heartbeat_seconds=args.heartbeat_seconds, skip_env_check=args.skip_env_check,
         image_resolution=args.image_resolution, omega_checkpoint=args.omega_checkpoint,
         no_plant_masks=args.no_plant_masks, intrinsics_from=args.intrinsics_from,
-        poses_from=args.poses_from)
+        poses_from=args.poses_from, no_crop=args.no_crop)
 
 
 if __name__ == "__main__":

@@ -78,12 +78,143 @@ def require_sparse_model(workdir: Path, backend: str = "colmap") -> Path:
     return path
 
 
-def stage_masked_images(workdir: Path, destination: Path, max_images: int = 0) -> List[Path]:
+def plant_crop_boxes(workdir: Path, frames: Sequence[Path], margin: float = 0.08):
+    """A crop box per frame, each square and centred on the principal point.
+
+    The learned backends see the plant at a fraction of the resolution COLMAP
+    does, and almost all of the difference is framing. Measured on thistle3,
+    whose plant fills 6.8% of the frame: COLMAP's SIFT runs at 1920 and the
+    plant spans 931 px; VGGT-Omega works at 624x416 and the plant spans 303;
+    MapAnything at 518x336 and it spans 251. Over 90% of those models' token
+    budget goes on black background.
+
+    **Centred on the principal point, and that is not a preference.**
+    VGGT-Omega's camera head predicts a field of view and nothing else -- its
+    decoder writes `intrinsics[0, 2] = W / 2` literally -- so the model cannot
+    represent a principal point anywhere but the middle of what it is given.
+    Crop off-centre and the true principal point moves while the model's
+    assumption does not, which bends every depth and pose it returns.
+
+    **Per frame, not one box for the whole orbit.** A single box has to hold
+    the plant wherever the turntable put it, and on thistle3 the plant swings
+    far enough that the union box is 1458 px wide -- 76% of the frame, so
+    barely a crop at all, and the plant still only fills 64% of it. Each
+    frame's own box is 1130 px and the plant fills 82%. At a 512 px model
+    input that is 422 px of plant against 327, or 248 with no crop.
+
+    Each axis is sized on its own. Two tidier shapes were tried and both cost
+    more than they save. A **square** box cannot be wider than the frame is
+    tall, so on 1920x1280 it caps at 1280 and clipped the plant on 10 of
+    thistle3's 27 frames. A box with the **frame's own 3:2 shape** clips
+    nothing, but a roughly square plant then wastes the width: the median box
+    came out 1695 px and the plant filled 55% of it, against 1130 px and 80%
+    here. Sized per axis, the box only ever stops at the frame's own edge --
+    where the plant was already cut off before any of this.
+
+    That leaves each frame a different aspect ratio, which the staging
+    resolves by letterboxing rather than stretching. See `stage_masked_images`.
+
+    Returns {frame stem: (x0, y0, width, height)}, or None when there is
+    nothing to gain -- the caller then stages whole frames, as before.
+    """
+    mask_dir = workdir / "p2" / "masks" / "plant"
+    if not mask_dir.is_dir():
+        return None
+
+    boxes = {}
+    for frame in frames:
+        mask = cv2.imread(str(mask_dir / f"{frame.stem}.png"), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            continue
+        ys, xs = np.nonzero(mask > 127)
+        if not len(xs):
+            continue
+        height, width = mask.shape
+        centre_x, centre_y = width / 2.0, height / 2.0
+        reach_x = max(abs(xs.min() - centre_x), abs(xs.max() - centre_x)) * (1 + margin)
+        reach_y = max(abs(ys.min() - centre_y), abs(ys.max() - centre_y)) * (1 + margin)
+        half_x, half_y = min(reach_x, centre_x), min(reach_y, centre_y)
+        boxes[frame.stem] = (int(round(centre_x - half_x)), int(round(centre_y - half_y)),
+                             int(round(2 * half_x)), int(round(2 * half_y)))
+    if not boxes:
+        return None
+    if all(box[2] >= width and box[3] >= height for box in boxes.values()):
+        return None                     # the plant already fills every frame
+    return boxes
+
+
+def _source_photograph(workdir: Path, frame: Path):
+    """The original photograph a P1 frame came from, if it can be found here.
+
+    P1 caps its frames at 1920 on the long edge, which throws away most of a
+    24 MP capture before any model sees it -- thistle3's plant spans 2909 px
+    in the photograph and 931 in the frame. Cropping is worth much more when
+    the pixels come from the original, so the crop is filled from there when
+    the file is reachable and from the frame when it is not.
+
+    The manifest records the directory P1 read, which is often a path on
+    another machine, so the basename is also looked for beside the dataset.
+    """
+    manifest_path = workdir / "p1" / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        with open(manifest_path) as handle:
+            manifest = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    entry = next((e for e in manifest if e.get("frame") == frame.stem), None)
+    if entry is None or not entry.get("source_file"):
+        return None
+
+    name = entry["source_file"]
+    recorded = Path(entry.get("source_dir", "")) if entry.get("source_dir") else None
+    dataset = workdir.parent
+    candidates = [recorded / name] if recorded else []
+    # P1 records the directory it read, which is often a path on another
+    # machine -- thistle3's says /netscratch/... and the files are on /mnt/e
+    # here. The pass directory's own name survives the move, so it is tried
+    # against this dataset before falling back to a wider look.
+    if recorded is not None:
+        candidates += [dataset / recorded.name / name, dataset.parent / recorded.name / name]
+    candidates += [dataset / name, dataset.parent / name]
+    candidates += sorted(dataset.glob(f"*/{name}"))
+    candidates += sorted(dataset.parent.glob(f"*/{name}"))
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _letterbox(image, drawn, canvas, pad, interpolation):
+    """`image` scaled to `drawn` and placed at `pad` on a black `canvas`."""
+    drawn_w, drawn_h = drawn
+    canvas_w, canvas_h = canvas
+    pad_x, pad_y = pad
+    resized = cv2.resize(image, (drawn_w, drawn_h), interpolation=interpolation)
+    shape = (canvas_h, canvas_w, 3) if resized.ndim == 3 else (canvas_h, canvas_w)
+    out = np.zeros(shape, resized.dtype)
+    out[pad_y:pad_y + drawn_h, pad_x:pad_x + drawn_w] = resized
+    return out
+
+
+def stage_masked_images(workdir: Path, destination: Path, max_images: int = 0,
+                        crop: bool = True) -> Tuple[List[Path], Optional[dict]]:
     """Write RGB frames with non-plant pixels blacked out for learned models.
 
     Unlike COLMAP's feature masks, the model sees pixels, so masking is
     applied to RGB.  The original frame names are retained: COLMAP exporters
     use those names in ``images.bin``, which lets P4 re-use the P2 masks.
+
+    With `crop`, the plant is cut out of the frame first and filled from the
+    original photograph where that file can be found -- see `plant_crop_box`
+    for why, and why the box is centred on the principal point. Returns
+    (staged paths, crop manifest); the manifest is None when nothing was
+    cropped, and is what tells the exporter how to put its intrinsics back
+    into full-frame pixels.
     """
     frames = sorted((workdir / "p1" / "frames").glob("frame_*.jpg"))
     if not frames:
@@ -93,8 +224,22 @@ def stage_masked_images(workdir: Path, destination: Path, max_images: int = 0) -
         raise FileNotFoundError("no P2 plant masks -- run pose-segment first")
     selected = uniformly_sample(frames, max_images)
     destination.mkdir(parents=True, exist_ok=True)
+
+    boxes = plant_crop_boxes(workdir, selected) if crop else None
+    manifest = None
+    from_source = 0
     staged = []
     from tqdm import tqdm
+
+    # One canvas size for every frame, because a model batch wants uniform
+    # images while each frame's box is its own shape. Each crop is scaled to
+    # fit and centred, with black either side -- the background is already
+    # black, so the padding is invisible to the model. Centred and not
+    # top-left: that is what keeps the principal point in the middle of the
+    # canvas, which is the one thing VGGT-Omega's camera head assumes.
+    canvas_w = max((b[2] for b in boxes.values()), default=0) if boxes else 0
+    canvas_h = max((b[3] for b in boxes.values()), default=0) if boxes else 0
+    effective = {}
 
     for frame in tqdm(selected, desc="  masking model inputs", unit="frame", dynamic_ncols=True):
         mask = cv2.imread(str(mask_dir / f"{frame.stem}.png"), cv2.IMREAD_GRAYSCALE)
@@ -103,6 +248,41 @@ def stage_masked_images(workdir: Path, destination: Path, max_images: int = 0) -
             raise FileNotFoundError(f"need readable frame and plant mask for {frame.name}")
         if mask.shape != image.shape[:2]:
             raise ValueError(f"P2 mask shape differs from its frame: {frame.name}")
+
+        box = boxes.get(frame.stem) if boxes else None
+        if box is not None:
+            x0, y0, crop_w, crop_h = box
+            frame_h, frame_w = image.shape[:2]
+            original = _source_photograph(workdir, frame)
+            source = cv2.imread(str(original), cv2.IMREAD_COLOR) if original else None
+            if source is not None and source.shape[1] > frame_w:
+                # The same box, in the photograph's own pixels. Only the scale
+                # differs: P1 resizes without cropping, so the two images share
+                # a centre and an aspect ratio.
+                scale = source.shape[1] / frame_w
+                image = source[int(round(y0 * scale)):int(round((y0 + crop_h) * scale)),
+                               int(round(x0 * scale)):int(round((x0 + crop_w) * scale))]
+                from_source += 1
+            else:
+                image = image[y0:y0 + crop_h, x0:x0 + crop_w]
+            mask = mask[y0:y0 + crop_h, x0:x0 + crop_w]
+
+            fit = min(canvas_w / crop_w, canvas_h / crop_h)
+            drawn_w, drawn_h = int(round(crop_w * fit)), int(round(crop_h * fit))
+            pad_x, pad_y = (canvas_w - drawn_w) // 2, (canvas_h - drawn_h) // 2
+            image = _letterbox(image, (drawn_w, drawn_h), (canvas_w, canvas_h),
+                               (pad_x, pad_y), cv2.INTER_AREA)
+            mask = _letterbox(mask, (drawn_w, drawn_h), (canvas_w, canvas_h),
+                              (pad_x, pad_y), cv2.INTER_NEAREST)
+
+            # What the *canvas* covers in frame pixels, padding included. Stored
+            # instead of the box itself so the exporter needs no knowledge of
+            # letterboxing: it is still one scale and one offset. Centred on
+            # the principal point, because the padding is symmetric.
+            span_w, span_h = canvas_w / fit, canvas_h / fit
+            effective[frame.stem] = [frame_w / 2 - span_w / 2, frame_h / 2 - span_h / 2,
+                                     span_w, span_h]
+
         # A small feather avoids a high-contrast hard edge becoming a feature
         # track.  This is still restricted to the P2 silhouette and therefore
         # cannot reintroduce the fixed backdrop.
@@ -112,7 +292,24 @@ def stage_masked_images(workdir: Path, destination: Path, max_images: int = 0) -
         if not cv2.imwrite(str(out), masked, [cv2.IMWRITE_JPEG_QUALITY, 95]):
             raise OSError(f"could not write {out}")
         staged.append(out)
-    return staged
+
+    if boxes:
+        first = cv2.imread(str(mask_dir / f"{selected[0].stem}.png"), cv2.IMREAD_GRAYSCALE)
+        widths = [b[2] for b in boxes.values()]
+        manifest = {
+            "boxes_in_frame": effective,
+            "crop_boxes": {stem: list(b) for stem, b in boxes.items()},
+            "frame_size": [int(first.shape[1]), int(first.shape[0])],
+            "staged_size": [canvas_w, canvas_h],
+            "filled_from_original": from_source,
+            "images": len(staged),
+        }
+        print(f"  cropped to the plant, per frame and centred on the principal point: "
+              f"{min(widths)}-{max(widths)} px wide of a "
+              f"{first.shape[1]}x{first.shape[0]} frame, letterboxed onto {canvas_w}x{canvas_h}")
+        print(f"    {from_source}/{len(staged)} filled from the original photographs"
+              + ("" if from_source else " -- none found, so the crop came from the P1 frames"))
+    return staged, manifest
 
 
 def uniformly_sample(items: Sequence[Path], maximum: int = 0) -> List[Path]:
@@ -128,6 +325,7 @@ def run_learned_backend(
     backend: str,
     repo_root: Optional[Path] = None,
     max_images: int = 0,
+    crop_to_plant: bool = True,
     bundle_adjust: bool = False,
     device: Optional[str] = None,
     model_python: Optional[str] = None,
@@ -185,9 +383,16 @@ def run_learned_backend(
         shutil.rmtree(input_images)
     if runner.exists():
         shutil.rmtree(runner)
-    staged = stage_masked_images(workdir, input_images, max_images=max_images)
+    staged, crop_manifest = stage_masked_images(workdir, input_images, max_images=max_images,
+                                                crop=crop_to_plant)
     runner_images = runner / "images"
     _copy_images(staged, runner_images)
+    # Beside the images, so the exporter finds it without being passed a path:
+    # it is what turns model pixels back into full-frame pixels, which is the
+    # coordinate system P4 and P4c read every later artifact in.
+    if crop_manifest is not None:
+        runner.mkdir(parents=True, exist_ok=True)
+        (runner / "crop.json").write_text(json.dumps(crop_manifest, indent=2))
 
     # The P2 silhouettes are known here, so the exporters this project owns are
     # told which pixels are the plant rather than reconstructing a background
@@ -285,7 +490,7 @@ def run_learned_backend(
     shutil.copytree(source, standardized)
     frame_size = frame_resolution(workdir)
     if frame_size:
-        rescaled = rescale_model_to_frames(standardized, frame_size)
+        rescaled = rescale_model_to_frames(standardized, frame_size, crop=crop_manifest)
         if rescaled and "skipped" in rescaled:
             print(f"  WARNING: {backend} model is not at frame resolution and {rescaled['skipped']}")
         elif rescaled:
@@ -294,6 +499,7 @@ def run_learned_backend(
                   f"(scale {rescaled['scale']}, focal {rescaled['focal_in_frame_pixels']})")
     report = score_sparse_model(workdir, backend, len(staged))
     report.update({"backend": backend, "input": "P2 plant-masked RGB", "num_staged_images": len(staged),
+                   "crop": crop_manifest,
                    "official_exporter": str(script), "bundle_adjust": bundle_adjust})
     (experiment / "poses.json").write_text(json.dumps(report, indent=2))
     return report
@@ -1045,7 +1251,8 @@ def frame_resolution(workdir: Path) -> Optional[Tuple[int, int]]:
     return int(image.shape[1]), int(image.shape[0])
 
 
-def rescale_model_to_frames(model_dir: Path, frame_size: Tuple[int, int]) -> Optional[Dict]:
+def rescale_model_to_frames(model_dir: Path, frame_size: Tuple[int, int],
+                            crop: Optional[Dict] = None) -> Optional[Dict]:
     """Express an exported model's cameras in original-frame pixels.
 
     Every consumer downstream -- silhouette carving, organ-label fusion,
@@ -1061,10 +1268,23 @@ def rescale_model_to_frames(model_dir: Path, frame_size: Tuple[int, int]) -> Opt
     Both projects reach that resolution the same way: scale by the larger of
     the two ratios, then centre-crop to the target.  Inverting that is exact,
     so nothing here is fitted.  Returns None when the model already matches.
+
+    `crop` is P3's crop manifest, when the images staged for the model were a
+    crop of the plant rather than whole frames. The inversion then runs in two
+    steps that compose: back to the crop's own pixels first, by the same exact
+    rule, and then out to the frame by adding where the crop sat. Keeping it in
+    that order means the arithmetic above is untouched -- only what it counts
+    as "the image" changes, from the frame to the crop.
     """
     import pycolmap
 
     width, height = frame_size
+    offset_x = offset_y = 0.0
+    if crop:
+        box = next(iter(crop["boxes_in_frame"].values()))
+        offset_x, offset_y = float(box[0]), float(box[1])
+        width, height = int(round(box[2])), int(round(box[3]))
+
     reconstruction = pycolmap.Reconstruction(str(model_dir))
     cameras = list(reconstruction.cameras.values())
     if not cameras or all(int(c.width) == width and int(c.height) == height for c in cameras):
@@ -1090,9 +1310,15 @@ def rescale_model_to_frames(model_dir: Path, frame_size: Tuple[int, int]) -> Opt
             params[2] = (params[2] + crop_y) / scale
         else:
             return {"skipped": f"camera model with {len(params)} params left unscaled"}
+        # Out of the crop and into the frame. Only the principal point moves:
+        # a crop translates the image, it does not rescale it.
+        if crop:
+            params[-2] += offset_x
+            params[-1] += offset_y
         camera.params = params
-        camera.width, camera.height = width, height
+        camera.width, camera.height = frame_size
         changed = {"scale": round(scale, 5), "crop_px": [crop_x, crop_y],
+                   "crop_offset": [offset_x, offset_y] if crop else None,
                    "focal_in_frame_pixels": round(float(params[0]), 1)}
     reconstruction.write(str(model_dir))
     return changed
