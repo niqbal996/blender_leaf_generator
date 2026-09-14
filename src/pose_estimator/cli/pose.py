@@ -31,6 +31,7 @@ from pose_estimator.pose import (
     write_scene_3d_plot,
 )
 from pose_estimator.reconstruction import build_sparse_reconstruction, get_registered_camera_poses
+from pose_estimator.cli.report import print_checks
 
 
 def run(
@@ -164,9 +165,7 @@ def run(
     with open(p3_dir / "poses.json", "w") as f:
         json.dump(report, f, indent=2)
 
-    print(f"\n  P3 checks ({'ALL PASSED' if report['all_passed'] else 'FAILURES PRESENT'}):")
-    for name, check in report["checks"].items():
-        print(f"    [{'PASS' if check['pass'] else 'FAIL'}] {name}: {check['detail']}")
+    print_checks("P3", report)
     print(f"\n  {report['num_points3D']} sparse 3D points")
     print(f"  artifacts + diagnostics in {p3_dir}")
 

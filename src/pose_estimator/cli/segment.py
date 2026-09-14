@@ -44,6 +44,7 @@ from pose_estimator.frames import (
 )
 from pose_estimator.segmentation import Prompts, segment_sequence
 from pose_estimator.segmentation_qc import run_qc, write_area_plot, write_overlays
+from pose_estimator.cli.report import print_checks
 
 
 def _parse_point(text: Optional[str]) -> Optional[Tuple[int, int]]:
@@ -275,9 +276,7 @@ def run(
     write_overlays(frames_dir, p2_dir, crop_boxes=all_boxes)
     write_area_plot(p2_dir, report)
 
-    print(f"\n  P2 checks ({'ALL PASSED' if report['all_passed'] else 'FAILURES PRESENT'}):")
-    for name, check in report["checks"].items():
-        print(f"    [{'PASS' if check['pass'] else 'FAIL'}] {name}: {check['detail']}")
+    print_checks("P2", report)
     print(f"\n  median plant mask area: {report['plant_area_px']['median']:.0f} px")
     print(f"  artifacts + diagnostics in {p2_dir}")
 

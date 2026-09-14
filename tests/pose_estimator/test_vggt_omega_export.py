@@ -137,3 +137,62 @@ def test_written_model_is_readable_and_in_frame_pixels(tmp_path):
     assert np.isclose(camera.params[2], 160.0) and np.isclose(camera.params[3], 120.0)
     assert {image.name for image in reconstruction.images.values()} == {
         "frame_0000.jpg", "frame_0001.jpg"}
+
+
+def test_corroborated_copies_collapse_into_one_point():
+    """Every view that vouches for a point used to write its own copy of it.
+
+    Corroboration is the whole test the fusion applies, so the better a point
+    was the more times it appeared: on thistle3, 357,352 points with a mean
+    track length of 10.3, collapsing to 35,261 at half a percent of the plant's
+    extent -- 10.1x redundancy, which is the track length. The copies landed
+    wherever each view's own depth put them, anywhere inside the agreement
+    band, so the "dense" cloud was a slab rather than a surface: local flatness
+    0.726 against 0.390 for the COLMAP baseline, past the 0.577 an isotropic
+    ball of points would score.
+    """
+    depths, intrinsics, extrinsics = _two_view_scene()
+    points = np.stack([exporter.unproject(depths[i], intrinsics[i], extrinsics[i])
+                       for i in range(2)])
+    common = dict(masks=None, min_views=1, tolerance=0.05, max_points=10_000)
+
+    kept, _ = exporter.fuse_by_consistency(points, depths, intrinsics, extrinsics, **common)
+    extent = float(np.linalg.norm(kept.max(axis=0) - kept.min(axis=0)))
+    merged, tracks = exporter.fuse_by_consistency(
+        points, depths, intrinsics, extrinsics, merge_radius=0.01 * extent, **common)
+
+    assert len(merged) < len(kept), "the copies must collapse, not merely be reordered"
+    # No two survivors may still be describing the same bit of surface.
+    from scipy.spatial import cKDTree
+    nearest = cKDTree(merged).query(merged, k=2)[0][:, 1]
+    assert nearest.min() > 0.0
+    # A merged point keeps every view that saw it, so BA still has tracks.
+    assert max(len(track) for track in tracks) >= 2
+
+
+def test_agreement_band_can_be_set_in_scene_units():
+    """`tolerance` is a fraction of the distance to the camera, which is a
+    property of where the tripod stood and not of the plant. The two exporters
+    defaulted to 0.01 and 0.02 on scenes whose extents differed by 4x, so they
+    were holding their backends to different standards. `absolute` is the band
+    that means the same thing on both."""
+    import sys
+    sys.path.insert(0, str(SCRIPT.parent))
+    import mv_fusion
+
+    depths, intrinsics, extrinsics = _two_view_scene(offset=0.4)
+    points = np.stack([exporter.unproject(depths[i], intrinsics[i], extrinsics[i])
+                       for i in range(2)])
+    candidates = points[0].reshape(-1, 3)
+
+    wide = mv_fusion.agreement_matrix(candidates, depths, intrinsics, extrinsics,
+                                      None, 0.0, absolute=1.0)
+    narrow = mv_fusion.agreement_matrix(candidates, depths, intrinsics, extrinsics,
+                                        None, 0.0, absolute=0.01)
+    # Not zero: the second view is rotated, so a 0.4 shift in its depth map is
+    # not a 0.4 disagreement everywhere in the image -- points near the edge
+    # sit at grazing geometry and move much less. The claim is that the band
+    # dominates the outcome, which is the whole reason it has to be set in
+    # units that mean something about the plant.
+    assert narrow[:, 1].sum() < 0.1 * wide[:, 1].sum(), (
+        f"narrow band kept {narrow[:, 1].sum()} of {wide[:, 1].sum()}")

@@ -206,6 +206,7 @@ def classify_frame(
     seed_labels: Sequence[str],
     class_order: Sequence[str],
     pad: int = 60,
+    root_mask: Optional[np.ndarray] = None,
 ) -> Optional[np.ndarray]:
     """Per-pixel class map over a full frame; -1 outside the plant.
 
@@ -213,13 +214,34 @@ def classify_frame(
     threshold here would be a per-plant knob, and the point of this stage is
     to remove those; a patch's evidence is instead carried forward as the
     multi-view vote count.
+
+    `root_mask` is P2's tracked root object for this frame, and when given it
+    decides the root class outright: inside it the pixel is root, outside it
+    nothing may be. Appearance is a poor way to find a root and a good way to
+    find everything else -- a root and a shadowed leaf underside are both dark
+    and strap-shaped, and on thistle3 that put root labels right through the
+    canopy (median height 0.376 against the leaves' 0.453, 89% of them above
+    the leaves' 25th percentile). Where the root *is* has a much better answer
+    already on disk: SAM2 tracked it from a click below the jaws, as the one
+    connected blob the clamp cut off from the rest of the plant.
     """
     view, crop_plant, box = crop_to_plant(bgr, plant, pad)
     if view is None:
         return None
 
     features = backbone.features(view)
-    nearest = (features @ seed_vectors).argmax(axis=1)
+    scores = features @ seed_vectors
+    root_id = class_order.index("root") if "root" in class_order else None
+
+    if root_mask is not None and root_id is not None:
+        # Appearance no longer gets a say in root, in either direction: the
+        # seeds for it are suppressed here and the mask is stamped on below.
+        root_seeds = [i for i, name in enumerate(seed_labels) if name == "root"]
+        if root_seeds and len(root_seeds) < scores.shape[1]:
+            scores = scores.copy()
+            scores[:, root_seeds] = -np.inf
+
+    nearest = scores.argmax(axis=1)
     class_ids = np.array([class_order.index(seed_labels[i]) for i in nearest], np.int8)
     grid_map = class_ids.reshape(backbone.grid, backbone.grid)
 
@@ -230,6 +252,12 @@ def classify_frame(
     full = np.full(bgr.shape[:2], -1, np.int8)
     y0, y1, x0, x1 = box
     full[y0:y1, x0:x1] = resized
+
+    if root_mask is not None and root_id is not None:
+        # Only where the plant mask already is: the root object is unioned into
+        # the plant mask at P2 time, so the two agree, and anything outside it
+        # is background that must stay -1.
+        full[(root_mask > 0) & (full >= 0)] = root_id
     return full
 
 

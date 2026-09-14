@@ -63,6 +63,22 @@ def parse_args():
                         help="Drop pixels below this depth-confidence percentile rank (0-1)")
     parser.add_argument("--consistency-views", type=int, default=3,
                         help="How many other views must agree about a point before it is kept")
+    parser.add_argument("--agreement-fraction", type=float, default=0.005,
+                        help="Agreement band as a fraction of the PLANT's own extent, which is "
+                             "what makes it mean the same thing at any capture distance and on "
+                             "either backend. 0.005 is about half a leaf thickness on thistle3. "
+                             "Set to 0 to fall back to --consistency-tolerance")
+    parser.add_argument("--merge-fraction", type=float, default=0.003,
+                        help="Corroborated copies of one surface point within this fraction of "
+                             "the plant's extent are averaged into a single point. 0 keeps every "
+                             "copy, which is the old behaviour and thickens every leaf. This has "
+                             "to span what is left of the spread after the consensus average or "
+                             "the slab merely gets sparser: on thistle3's unaveraged cloud 0.002 "
+                             "removed 1.6x, 0.003 removed 3.2x and 0.005 removed 10.1x. It is "
+                             "also the finest detail that can survive -- a COLMAP leaf measures "
+                             "0.195% of extent thick, so past about 0.005 two leaves lying "
+                             "against each other start to merge into one. The flatness line "
+                             "printed at the end is how to tell which way to move it")
     parser.add_argument("--consistency-tolerance", type=float, default=0.01,
                         help="Relative depth agreement, as a fraction of the point's depth")
     parser.add_argument("--max-points-per-view", type=int, default=20000,
@@ -150,7 +166,8 @@ def unproject(depth, intrinsic, extrinsic):
 
 
 def fuse_by_consistency(points, depths, intrinsics, extrinsics, masks,
-                        min_views, tolerance, max_points):
+                        min_views, tolerance, max_points,
+                        absolute=None, merge_radius=None):
     """Keep points several views independently agree about, with their tracks.
 
     The test is the standard multi-view geometric one: push a candidate point
@@ -158,6 +175,15 @@ def fuse_by_consistency(points, depths, intrinsics, extrinsics, masks,
     surface at the same distance. A point that only one view believes in is
     exactly what produced the duplicate-plant artifact, and it is dropped
     here rather than written out.
+
+    Agreeing views are then *averaged into one point* rather than each writing
+    its own copy. Corroboration was always the test; keeping every corroborated
+    copy meant the better a point was, the more times it appeared -- 10.1 copies
+    each on thistle3, which is where the "dense but thick" leaves came from.
+    See `mv_fusion.merge_duplicates`. Two steps, because they fix different
+    halves of it: the average below pulls each view's estimate onto the
+    consensus surface, and the merge afterwards collapses what is left of the
+    copies into single points.
     """
     num_views, height, width = depths.shape
     kept_xyz, kept_tracks = [], []
@@ -174,21 +200,34 @@ def fuse_by_consistency(points, depths, intrinsics, extrinsics, masks,
         candidates = points[index][rows, cols]
 
         agrees = mv_fusion.agreement_matrix(candidates, depths, intrinsics, extrinsics,
-                                            masks, tolerance)
+                                            masks, tolerance, absolute=absolute)
         agrees[:, index] = False              # a view cannot corroborate itself
         survivors = np.nonzero(agrees.sum(axis=1) >= min_views)[0]
         for position in survivors:
             track = [(index, int(cols[position]), int(rows[position]))]
+            # Every corroborating view's own unprojection of this surface, so
+            # the point written is their consensus rather than this view's
+            # guess. The spread between them *is* the per-view depth noise.
+            estimates = [candidates[position]]
             for other in np.nonzero(agrees[position])[0]:
                 u, v, _ = mv_fusion.reprojected_pixels(
                     candidates[position][None], intrinsics[other], extrinsics[other],
                     (height, width))
                 track.append((int(other), int(u[0]), int(v[0])))
-            kept_xyz.append(candidates[position])
+                estimate = points[other][int(v[0]), int(u[0])]
+                if np.isfinite(estimate).all():
+                    estimates.append(estimate)
+            kept_xyz.append(np.mean(estimates, axis=0))
             kept_tracks.append(track)
     if not kept_xyz:
         return np.zeros((0, 3)), []
-    return np.asarray(kept_xyz), kept_tracks
+    xyz, tracks = np.asarray(kept_xyz), kept_tracks
+    if merge_radius:
+        before = len(xyz)
+        xyz, tracks = mv_fusion.merge_duplicates(xyz, tracks, merge_radius)
+        print(f"  merged {before} corroborated copies into {len(xyz)} points "
+              f"({before / max(len(xyz), 1):.1f}x redundancy removed)")
+    return xyz, tracks
 
 
 def write_colmap_text(out_dir, names, sizes, intrinsics, extrinsics, xyz, tracks, colors):
@@ -273,12 +312,27 @@ def main():
 
     masks = load_plant_masks(args.masks_dir, names, (height, width))
     points = np.stack([unproject(depth[i], intrinsics[i], extrinsics[i]) for i in range(len(paths))])
+
+    # Both bands are set from the plant's own size rather than from the
+    # distance to the camera, so they mean the same thing here as they do on
+    # MapAnything's differently-scaled scene. See `mv_fusion.agreement_matrix`.
+    extent = mv_fusion.plant_extent(points, masks, depth)
+    absolute = args.agreement_fraction * extent if args.agreement_fraction > 0 else None
+    merge_radius = args.merge_fraction * extent if args.merge_fraction > 0 else None
+    print(f"  plant extent {extent:.4f} scene units")
+    if absolute is not None:
+        print(f"  agreement band {absolute:.5f} ({args.agreement_fraction * 100:.2f}% of extent)")
+    else:
+        print(f"  agreement band {args.consistency_tolerance * 100:.2f}% of each point's depth")
+
     xyz, tracks = fuse_by_consistency(points, depth, intrinsics, extrinsics, masks,
                                       args.consistency_views, args.consistency_tolerance,
-                                      args.max_points_per_view)
+                                      args.max_points_per_view,
+                                      absolute=absolute, merge_radius=merge_radius)
     print(f"  fused {len(xyz)} points agreed by >= {args.consistency_views} other views")
     if len(xyz) == 0:
         raise SystemExit("no point survived multi-view consistency -- the views disagree entirely")
+    flatness = mv_fusion.report_flatness(xyz, extent)
 
     colours = []
     rgb = (predictions["images"].squeeze(0).float().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
@@ -307,6 +361,12 @@ def main():
         "mode": args.mode, "processed_hw": [height, width], "frame_size": list(frame_sizes[0]),
         "points": int(len(xyz)), "consistency_views": args.consistency_views,
         "consistency_tolerance": args.consistency_tolerance,
+        "plant_extent": extent,
+        "agreement_fraction": args.agreement_fraction,
+        "agreement_absolute": absolute,
+        "merge_fraction": args.merge_fraction,
+        "merge_radius": merge_radius,
+        "flatness": flatness,
         "mean_track_length": float(np.mean([len(t) for t in tracks])),
     }, indent=2))
 

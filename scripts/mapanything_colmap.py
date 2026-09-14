@@ -75,7 +75,14 @@ def parse_args():
                              "depth maps. 0 exports every masked pixel, which is upstream's "
                              "behaviour and leaves the per-view shells superimposed")
     parser.add_argument("--fuse-tolerance", type=float, default=0.02,
-                        help="Depth agreement band, as a fraction of the point's depth")
+                        help="Depth agreement band as a fraction of the point's depth. Only used "
+                             "when --agreement-fraction is 0; prefer that one")
+    parser.add_argument("--agreement-fraction", type=float, default=0.005,
+                        help="Agreement band as a fraction of the PLANT's own extent. A fraction "
+                             "of the distance to the camera, which --fuse-tolerance is, means "
+                             "something different on every capture and on every backend -- this "
+                             "is the same band VGGT-Omega uses, so the two are comparable. "
+                             "0 falls back to --fuse-tolerance")
     parser.add_argument("--points-from", default="depth", choices=["depth", "pointmap"],
                         help="depth: unproject depth_z through the intrinsics and pose that are "
                              "written to the model, so points reproject where they came from. "
@@ -217,8 +224,27 @@ def rebuild_points_from_depth(outputs) -> int:
     return rebuilt
 
 
-def fuse_masks_by_consistency(outputs, min_views: int, tolerance: float):
-    """Drop masked pixels no other view's depth map corroborates.
+def mapanything_plant_extent(outputs) -> float:
+    """The subject's size in scene units, from the masked pixels of every view.
+
+    MapAnything and VGGT-Omega reconstruct at unrelated scales -- thistle3 came
+    out 2.24 units across on one and 0.53 on the other -- so a tolerance in raw
+    scene units cannot be shared between them and a tolerance in camera depth
+    is not a property of the plant at all. This is the length both express
+    themselves as a fraction of.
+    """
+    points, masks = [], []
+    for prediction in outputs:
+        points.append(prediction["pts3d"][0].float().cpu().numpy())
+        masks.append(prediction["mask"][0].squeeze(-1).cpu().numpy().astype(bool))
+    if not points:
+        return 0.0
+    return mv_fusion.plant_extent(np.stack(points), np.stack(masks))
+
+
+def fuse_masks_by_consistency(outputs, min_views: int, tolerance: float,
+                              absolute: float | None = None):
+    """Corroborate masked pixels across views, and snap them onto the consensus.
 
     A depth error slides a point along the ray it was seen on, so it stays put
     in its own view's image and is only visible to the others. Upstream's
@@ -227,8 +253,22 @@ def fuse_masks_by_consistency(outputs, min_views: int, tolerance: float):
     thistle3 the median point was inside the silhouette in 16 of 27 views,
     against 25 for an export that fuses.
 
-    Implemented as a mask shrink so upstream's own exporter still does the
-    writing: it builds points from `pts3d[mask]`.
+    Two things happen here, and dropping pixels is only the first. Rejecting
+    what no other view believes leaves the *surviving* shells exactly where
+    they were, each view's copy sitting wherever its own depth put it inside
+    the agreement band. Upstream's voxel downsample does not fix that: it
+    thins a slab into a sparser slab, because the thickness is set by the band
+    and not by the voxel. Measured on thistle3 at a 0.2% voxel -- 1.08 points
+    per voxel, so barely any duplicates left, and local flatness still 0.721
+    against 0.390 for the COLMAP baseline.
+
+    So each surviving pixel is also moved to the mean of what every
+    corroborating view thinks is there. That is the step that turns the band
+    into a surface, and it costs nothing extra: the reprojections are already
+    computed to test agreement.
+
+    Implemented as a mask shrink plus a `pts3d` rewrite, so upstream's own
+    exporter still does the writing: it builds points from `pts3d[mask]`.
     """
     import torch
 
@@ -248,21 +288,54 @@ def fuse_masks_by_consistency(outputs, min_views: int, tolerance: float):
 
     before = int(masks.sum())
     kept = 0
+    shifted = []
     for index, prediction in enumerate(outputs):
         rows, cols = np.nonzero(masks[index])
         if len(rows) == 0:
             continue
         candidates = points[index][rows, cols]
         agrees = mv_fusion.agreement_matrix(candidates, depths, intrinsics, extrinsics,
-                                            masks, tolerance)
+                                            masks, tolerance, absolute=absolute)
         agrees[:, index] = False                 # a view cannot corroborate itself
         survives = agrees.sum(axis=1) >= min_views
         fused = np.zeros_like(masks[index])
         fused[rows[survives], cols[survives]] = True
         kept += int(fused.sum())
+
+        # Move every survivor onto the consensus of the views that vouched for
+        # it. Summed rather than collected per point: one pass over the views
+        # keeps this vectorised over all candidates at once.
+        total = candidates.astype(np.float64).copy()
+        count = np.ones(len(candidates))
+        shape_hw = depths.shape[1:]
+        for other in range(len(outputs)):
+            voting = agrees[:, other]
+            if not voting.any():
+                continue
+            u, v, inside = mv_fusion.reprojected_pixels(
+                candidates[voting], intrinsics[other], extrinsics[other], shape_hw)
+            estimate = points[other][v, u]
+            usable = inside & np.isfinite(estimate).all(axis=1)
+            rank = np.nonzero(voting)[0][usable]
+            total[rank] += estimate[usable]
+            count[rank] += 1
+        consensus = total / count[:, None]
+
+        updated = points[index].copy()
+        updated[rows[survives], cols[survives]] = consensus[survives]
+        moved = np.linalg.norm(consensus[survives] - candidates[survives], axis=1)
+        shifted.append(moved)
+
         current = prediction["mask"]
         keep_t = torch.from_numpy(fused).to(current.device)[None, ..., None]
         prediction["mask"] = current & keep_t
+        prediction["pts3d"] = torch.from_numpy(updated).to(
+            prediction["pts3d"].device, prediction["pts3d"].dtype)[None]
+    if shifted:
+        moved = np.concatenate(shifted)
+        if len(moved):
+            print(f"  snapped to consensus: median move {np.median(moved):.5f}, "
+                  f"95th percentile {np.percentile(moved, 95):.5f} scene units")
     return kept, before
 
 
@@ -368,10 +441,29 @@ def main():
             dropped += before - int(prediction["mask"].sum())
         print(f"P2 plant masks applied: kept {kept} pixels, dropped {dropped} outside the plant")
 
+    fuse_extent = fuse_absolute = None
     if args.fuse_views > 0:
-        kept, before = fuse_masks_by_consistency(outputs, args.fuse_views, args.fuse_tolerance)
+        fuse_extent = mapanything_plant_extent(outputs)
+        if args.agreement_fraction > 0 and fuse_extent > 0:
+            fuse_absolute = args.agreement_fraction * fuse_extent
+            print(f"Plant extent {fuse_extent:.4f} scene units; agreement band "
+                  f"{fuse_absolute:.5f} ({args.agreement_fraction * 100:.2f}% of extent)")
+        else:
+            print(f"Agreement band {args.fuse_tolerance * 100:.2f}% of each point's depth")
+        kept, before = fuse_masks_by_consistency(outputs, args.fuse_views, args.fuse_tolerance,
+                                                 absolute=fuse_absolute)
         print(f"Multi-view fusion: kept {kept} of {before} masked pixels "
               f"({kept / max(before, 1):.1%}) corroborated by >= {args.fuse_views} other views")
+
+    # The same measurement VGGT-Omega prints, on the points that are about to
+    # be written, so the two branches can be compared on it directly.
+    flatness = None
+    if fuse_extent:
+        exported = np.concatenate([
+            prediction["pts3d"][0].float().cpu().numpy()[
+                prediction["mask"][0].squeeze(-1).cpu().numpy().astype(bool)]
+            for prediction in outputs]) if outputs else np.zeros((0, 3))
+        flatness = mv_fusion.report_flatness(exported, fuse_extent)
 
     from mapanything.utils.colmap_export import export_predictions_to_colmap
 
@@ -392,6 +484,10 @@ def main():
         "pose_scale_used": args.use_pose_scale,
         "fuse_views": args.fuse_views,
         "fuse_tolerance": args.fuse_tolerance,
+        "plant_extent": fuse_extent,
+        "agreement_fraction": args.agreement_fraction,
+        "agreement_absolute": fuse_absolute,
+        "flatness": flatness,
     }, indent=2))
     print(f"Wrote {args.output_dir}")
 

@@ -29,6 +29,7 @@ from pose_estimator.surfels import (
     render_surface_points,
     train,
 )
+from pose_estimator.cli.report import print_checks
 
 
 def run(
@@ -110,9 +111,7 @@ def run(
 
     _write_surface_3d_plot(p4b / "diag" / "surface_3d.png", points, normals, hull)
 
-    print(f"\n  P4b checks ({'ALL PASSED' if report['all_passed'] else 'FAILURES PRESENT'}):")
-    for name, check in report["checks"].items():
-        print(f"    [{'PASS' if check['pass'] else 'FAIL'}] {name}: {check['detail']}")
+    print_checks("P4b", report)
     print(f"\n  artifacts + diagnostics in {p4b}")
     return report
 

@@ -53,6 +53,20 @@ def extent_of(cloud_path: Path):
     return float((xyz.max(axis=0) - xyz.min(axis=0)).max()), len(xyz)
 
 
+def flatness_of(cloud_path: Path, extent: float):
+    """Sheet flatness of a branch's cloud -- see `mv_fusion.sheet_flatness`."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import mv_fusion
+    from pose_estimator.ply_io import read_ply_vertices
+    import numpy as np
+
+    if not cloud_path.exists() or not extent:
+        return None
+    fields = read_ply_vertices(cloud_path)
+    xyz = np.stack([fields["x"], fields["y"], fields["z"]], axis=1).astype(float)
+    return mv_fusion.sheet_flatness(xyz, radius=0.01 * extent)
+
+
 def failed_checks(report) -> list:
     if not report:
         return []
@@ -79,6 +93,13 @@ def collect(workdir: Path, backend: str) -> dict:
     if measured:
         row["extent"], row["points"] = measured
 
+    # Whether the cloud is made of surfaces at all, on the same points the
+    # table's other rows describe. This was measured by hand once and is the
+    # reason the learned branches' density turned out not to mean sharpness:
+    # dense and thick are independent, and only this row separates them.
+    if row["ran"] and row.get("extent"):
+        row["flatness"] = flatness_of(structure, row["extent"])
+
     row["p5"] = read_json(p5_dir / "p5.json")
     row["p6"] = read_json(p6_dir / "p6.json")
     row["leaves"] = read_json(p6_dir / "leaves.json")
@@ -104,6 +125,8 @@ def table(rows: list) -> str:
     lines = [
         ("cloud points", lambda r: r.get("points")),
         ("cloud extent (own units)", lambda r: r.get("extent")),
+        ("flatness (0 sheet .58 fog)", lambda r: value(r, "flatness", "flatness")),
+        ("thickness / extent", lambda r: relative(r, value(r, "flatness", "thickness"))),
         ("P5 leaf instances", lambda r: value(r, "p5", "num_leaves")),
         ("P6 midribs fitted", lambda r: value(r, "p6", "num_leaves")),
         ("mean arclength / extent", lambda r: relative(r, value(r, "p6", "arclength", "mean"))),
@@ -155,6 +178,12 @@ def main() -> int:
     print()
     print(table(rows))
     print("""
+Flatness is sigma_min/sigma_max over a ball of 1% of the branch's own extent:
+0 is a perfect sheet, 0.25 is P4b's thinness target, and 0.577 means the
+neighbourhood is a ball -- no surface there at all, only points. A branch can
+lead on point count and still lose on this, which is exactly what "dense but
+thick" is.
+
 Lengths are divided by each branch's own cloud extent, because the backends
 reconstruct at unrelated and non-metric scales -- the raw extent row is what
 those scales actually are. Leaf counts, angles and check failures need no

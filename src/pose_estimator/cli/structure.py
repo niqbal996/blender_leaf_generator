@@ -36,6 +36,7 @@ from pose_estimator.structure_viz import (
     write_reprojected_skeleton,
     write_structure_3d_plot,
 )
+from pose_estimator.cli.report import print_checks
 
 STEM_RGB = (160, 60, 200)
 # A rosette has no stem. P4c still labels its crown "stem" -- the crown is
@@ -187,9 +188,7 @@ def run(
     with open(p5_dir / "p5.json", "w") as f:
         json.dump(report, f, indent=2)
 
-    print(f"\n  P5 checks ({'ALL PASSED' if report['all_passed'] else 'FAILURES PRESENT'}):")
-    for name, check in report["checks"].items():
-        print(f"    [{'PASS' if check['pass'] else 'FAIL'}] {name}: {check['detail']}")
+    print_checks("P5", report)
     print(f"\n  artifacts + diagnostics in {p5_dir}")
     return report
 
@@ -429,9 +428,13 @@ def _evaluate(structure, clamp, frame, voxel: float) -> dict:
         # If a tip falls short, the cloud visibly carries on past the marker --
         # which is what a tip sitting on a blade edge looks like in Blender.
         "tips_reach_the_end_of_their_leaf": {
-            "pass": worst <= 3.0,
-            "detail": f"worst tip falls {worst:.1f} voxels short of its own leaf's "
-                      f"furthest point (limit 3)",
+            # `worst` is a max over the leaves, so with no leaves it is 0.0 and
+            # the check passes on a structure that contains nothing. On
+            # thistle3's empty run that put a [PASS] in the middle of the
+            # failures and made the block read as a partial success.
+            "pass": bool(lengths) and worst <= 3.0,
+            "detail": (f"worst tip falls {worst:.1f} voxels short of its own leaf's "
+                       f"furthest point (limit 3)" if lengths else "no leaves"),
         },
         "origin_is_the_clamp_line": {
             "pass": clamp is not None,

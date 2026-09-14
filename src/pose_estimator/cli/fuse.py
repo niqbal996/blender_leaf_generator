@@ -42,6 +42,7 @@ from pose_estimator.semantic import (
     render_points,
     view_weights,
 )
+from pose_estimator.cli.report import print_checks
 
 CLASS_COLORS = {
     "leaf": (220, 40, 40),        # RGB
@@ -157,9 +158,7 @@ def run(
     with open(p4c / "qc.json", "w") as f:
         json.dump(report, f, indent=2)
 
-    print(f"\n  P4c checks ({'ALL PASSED' if report['all_passed'] else 'FAILURES PRESENT'}):")
-    for name, check in report["checks"].items():
-        print(f"    [{'PASS' if check['pass'] else 'FAIL'}] {name}: {check['detail']}")
+    print_checks("P4c", report)
     print("\n  per-class point counts:")
     for name, count in report["class_counts"].items():
         print(f"    {name:<12} {count:>8}  ({100 * count / max(len(points), 1):.1f}%)")

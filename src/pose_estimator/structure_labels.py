@@ -660,6 +660,26 @@ def instance_by_tips(
         # start at the top of it -- seeding an along-the-stem plant from the
         # heart makes its lower leaves look shallow and merges them away.
         depth, contact = depth_from_stem(leaf_points, stem_points, graph, contact_radius)
+        if not len(contact):
+            # Nothing seeds the depth field, so every step after this one is
+            # vacuous: no maxima, no tips, no leaves -- and the run finishes
+            # "successfully" with an empty structure.ply that draws nothing in
+            # Blender. Measured on thistle3, which is a rosette that reached
+            # here because --architecture was never set: P5 reported 0 leaves
+            # on all three geometry branches while two of its six checks still
+            # passed, so the QC block read as a bad solve rather than as a
+            # mis-set flag. Say which flag, and stop.
+            raise ValueError(
+                f"--architecture {architecture}, but no leaf tissue touches any stem: "
+                f"{len(stem_points)} stem point(s) within {contact_radius:.4g} of "
+                f"{len(leaf_points)} leaf point(s). That leaves the depth field "
+                "unseeded, so this run can only produce 0 tips and 0 leaves.\n"
+                "  A plant whose leaves radiate from a crown at ground level -- a "
+                "thistle, a sugar beet, any rosette -- has no stem to seed from and "
+                "needs --architecture rosette, which locates the crown geometrically "
+                "instead.\n"
+                "  If this really is a stemmed plant, the stem class is missing from "
+                "the P4c labels: check p4c/labels_vis.ply and the seeds.")
 
     records = tip_persistence(graph, depth)
     candidates, tips = select_tips(records, min_tip_depth, min_persistence_ratio)
@@ -761,6 +781,64 @@ def _largest_cluster(points: np.ndarray, radius: float) -> Optional[np.ndarray]:
     if count <= 1:
         return points
     return points[label == int(np.argmax(np.bincount(label)))]
+
+
+def root_by_connectivity(points: np.ndarray, voxel: float,
+                         radius_voxels: float = 3.0, min_points: int = 50):
+    """The root as the body the clamp cut off, rather than as a label.
+
+    The jaws grip exactly where the root meets the shoot and occlude a band
+    all the way round, so the carve leaves a gap there and the root below it
+    is a *separate connected component*. That is a much stronger statement
+    than anything appearance can make: a root and a shadowed leaf underside
+    are both dark and strap-shaped, but only one of them is a disconnected
+    body sitting below the plant.
+
+    Measured on thistle3's P4b surface, where P4c had labelled 10,601 points
+    root: exactly one component of any size sits off the main body -- 713
+    points at z 0.071..0.271 against a main body spanning 0.000..1.051 -- and
+    it holds only 571 of those labels. The other 10,030 were foliage, in the
+    middle of the canopy, and they dragged the crown up to 42% of the plant's
+    height. This finds the 713.
+
+    The radius is not delicate, which is the point of using this rather than a
+    label: the same two components come back at 2, 3, 4 and 6 voxels, a factor
+    of three, with the split moving by 36 points across the whole range. A
+    threshold with a plateau that wide is not really a threshold.
+
+    Returns a boolean mask over `points`, or None when nothing is detached --
+    a specimen the jaws never fully hid, where the caller's labels are all
+    there is.
+    """
+    if len(points) < min_points * 2:
+        return None
+    pairs = cKDTree(points).query_pairs(voxel * radius_voxels, output_type="ndarray")
+    if not len(pairs):
+        return None
+    graph = csr_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])),
+                       shape=(len(points), len(points)))
+    count, component = connected_components(graph, directed=False)
+    if count < 2:
+        return None
+
+    sizes = np.bincount(component)
+    main = int(np.argmax(sizes))
+    canopy_middle = float(np.median(points[component == main][:, 2]))
+
+    # Detached *and* below. Detachment alone would also collect a leaf tip that
+    # the carve happened to sever, and those sit up in the canopy; the root is
+    # the only thing the rig puts underneath it. Compared against the main
+    # body's median rather than its lowest point, because a rosette's outer
+    # leaves droop well below the crown -- thistle3's foliage reaches z=0.000
+    # while its root sits at 0.071..0.271.
+    root = np.zeros(len(points), bool)
+    for label in range(count):
+        if label == main or sizes[label] < min_points:
+            continue
+        member = component == label
+        if points[member][:, 2].max() < canopy_middle:
+            root |= member
+    return root if root.any() else None
 
 
 def crown_from_root(root_points, foliage_points, voxel: float,
@@ -1449,6 +1527,35 @@ def build_from_labels(
     leaf_ids_in_order = [i for i, n in enumerate(class_order) if "leaf" in n]
     stem_ids = [i for i, n in enumerate(class_order) if n in ("stem", "petiole", "branch")]
     root_ids = [i for i, n in enumerate(class_order) if n == "root"]
+
+    # Where the root is, geometry answers better than the labels do, and the
+    # crown -- hence the whole skeleton -- is measured from the root. So the
+    # root label is re-derived from the detached body below the plant whenever
+    # there is one, and the labels are corrected to match before anything reads
+    # them. See `root_by_connectivity` for the measurement this comes from.
+    if root_ids:
+        labels = np.asarray(labels).copy()
+        detached = root_by_connectivity(points, voxel)
+        if detached is not None:
+            was_root = np.isin(labels, root_ids)
+            root_id = root_ids[0]
+            # Foliage that was called root is foliage: it is attached to the
+            # plant, above the clamp, and excluding it would leave a hole in
+            # the tissue the crown is located from. Leaf rather than stem
+            # because stem has a job in `_crown_base` that this tissue has not
+            # earned -- it was never identified as anything, only mislabelled.
+            leaf_id = leaf_ids_in_order[0] if leaf_ids_in_order else root_id
+            labels[was_root & ~detached] = leaf_id
+            labels[detached] = root_id
+            moved = int((was_root & ~detached).sum())
+            gained = int((detached & ~was_root).sum())
+            print(f"  root re-derived from connectivity: {int(detached.sum())} points in the "
+                  f"detached body below the plant")
+            print(f"    {moved} point(s) the labels called root were attached foliage -> leaf; "
+                  f"{gained} unlabelled-as-root point(s) joined the root")
+        else:
+            print("  nothing detached below the plant -- the root stays as P4c labelled it "
+                  "(the jaws never fully hid the junction on this specimen)")
 
     leaf_points = points[np.isin(labels, leaf_ids_in_order)]
     stem_points = points[np.isin(labels, stem_ids)]

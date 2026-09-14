@@ -19,6 +19,7 @@ import numpy as np
 from pose_estimator import cloud_source
 from pose_estimator.leaf import fit_leaf, frame_continuity_degrees, resolve_leaf_base
 from pose_estimator.ply_io import write_ply_vertices
+from pose_estimator.cli.report import print_checks
 
 
 def run(workdir: Path, num_samples: int = 20,
@@ -90,9 +91,7 @@ def run(workdir: Path, num_samples: int = 20,
     with open(p6_dir / "p6.json", "w") as f:
         json.dump(report, f, indent=2)
 
-    print(f"\n  P6 checks ({'ALL PASSED' if report['all_passed'] else 'FAILURES PRESENT'}):")
-    for name, check in report["checks"].items():
-        print(f"    [{'PASS' if check['pass'] else 'FAIL'}] {name}: {check['detail']}")
+    print_checks("P6", report)
     print(f"\n  artifacts + diagnostics in {p6_dir}")
     return report
 

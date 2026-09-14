@@ -221,8 +221,19 @@ def run(
 
     print(f"  classes: {classifier.class_order}")
     print(f"Classifying {len(frame_stems)} frames with the {backend} backend...")
+    # P2's tracked root object, when it exists, settles the root class instead
+    # of appearance -- see `dino.classify_frame`. Absent (an older P2 run, or a
+    # capture with no root prompt) this is None and nothing changes.
+    root_mask_dir = Path(mask_dir).parent / "root"
+    if not (root_mask_dir.is_dir() and any(root_mask_dir.glob("*.png"))):
+        root_mask_dir = None
+        if "root" in classifier.class_order:
+            print("  no p2/masks/root -- the root class falls back to appearance, which is"
+                  "\n  the weakest thing DINO is asked to do here. Re-run P2 with a root"
+                  "\n  prompt (pose-pick-prompts, [3] = root) to have it tracked instead.")
     stats = classify_sequence(classifier, frames_dir, mask_dir,
-                              p4c / "class_maps", frame_stems)
+                              p4c / "class_maps", frame_stems,
+                              root_mask_dir=root_mask_dir)
 
     write_manifest(p4c, backend, classifier.class_order, {**settings, **stats})
 

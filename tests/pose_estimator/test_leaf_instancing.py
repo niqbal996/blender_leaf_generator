@@ -168,18 +168,20 @@ def test_midrib_runs_base_to_tip_and_follows_a_bend():
     assert np.min(np.linalg.norm(curve - corner, axis=1)) < SPACING * 3
 
 
-def test_caulescent_needs_a_stem():
-    """Asked for the stem path explicitly, no stem still means no leaves.
+def test_caulescent_without_a_stem_says_so():
+    """No stem on the stem path is a mis-set flag, and has to be raised as one.
 
-    This used to be the behaviour in every case, which is what made a rosette
-    unprocessable: a thistle has no stem tissue to seed the depth field from,
-    so it returned zero leaves and no amount of clicking could fix it.
+    This returned an empty instancing quietly until thistle3 ran that way for a
+    whole comparison: a rosette reached the caulescent path because
+    --architecture was never set, and P5 reported 0 leaves on all three
+    geometry branches with nothing naming the cause. The depth field is
+    unseeded, so every step after it is vacuous -- there is no useful result to
+    carry on towards, and the message is the only thing worth producing.
     """
     leaf = blade([0, 0, 0], [1, 0, 0], 10)
-    inst = instance_by_tips(leaf, np.zeros((0, 3)), CONTACT, min_points=2,
-                            architecture="caulescent")
-    assert len(inst.contact_index) == 0
-    assert not np.isfinite(inst.depth).any()
+    with pytest.raises(ValueError, match="architecture rosette"):
+        instance_by_tips(leaf, np.zeros((0, 3)), CONTACT, min_points=2,
+                         architecture="caulescent")
 
 
 def test_rosette_finds_a_crown_without_any_stem():

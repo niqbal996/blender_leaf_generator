@@ -256,6 +256,24 @@ CARVE_CHECK=0; INTRINSICS_FROM=""; POSES_FROM=""; REUSE_CLASS_MAPS=0; COMPARE=""
 declare -A BRANCH_FLAGS=()
 DATASET=""; DRY_RUN=0; CONF_FILES=()
 
+# Colour is a reading aid only: every line says the same thing without it, and
+# NO_COLOR=1 turns it off. The escapes are stripped on their way into
+# pipeline.log (see the tee below), so the log stays greppable.
+#   red    a phase or check failed
+#   green  it passed
+#   orange it ran, but on weaker evidence than it wanted -- a fallback taken,
+#          an input missing, a phase skipped. None of these stop a run, which
+#          is why they need a colour of their own to be noticed at all.
+if [[ -n "${NO_COLOR:-}" ]]; then
+    C_RED=""; C_GREEN=""; C_ORANGE=""; C_BOLD=""; C_OFF=""
+else
+    C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_ORANGE=$'\033[33m'
+    C_BOLD=$'\033[1m'; C_OFF=$'\033[0m'
+fi
+export NO_COLOR      # the Python phases read the same variable
+warn()  { printf '%s%s%s\n' "$C_ORANGE" "$1" "$C_OFF" >&2; }
+fatal() { printf '%s%s%s\n' "$C_RED" "$1" "$C_OFF" >&2; }
+
 # Which settings the command line set explicitly. A config file fills in only
 # what is missing, so a flag always beats a file and there is no precedence
 # question to remember.
@@ -726,7 +744,7 @@ run_comparison() {
     echo "  ./scripts/view_in_blender.sh $WORKDIR --geometry-backend ${ordered[-1]}"
     if [[ ${#failed[@]} -gt 0 ]]; then
         echo ""
-        echo "  branches that failed: ${failed[*]}   (see $WORKDIR/pipeline.log)" >&2
+        fatal "  branches that failed: ${failed[*]}   (see $WORKDIR/pipeline.log)"
     fi
     return $status
 }
@@ -892,14 +910,14 @@ if p4b_possible; then
     NVCC_MAJOR=""
     [[ -n "$NVCC_BIN" ]] && NVCC_MAJOR="$("$NVCC_BIN" --version | sed -n 's/.*release \([0-9]*\)\..*/\1/p' | head -1)"
     if [[ -z "$NVCC_BIN" ]]; then
-        echo "WARNING: no nvcc on PATH -- P4b (gsplat) will fail when it tries to compile." >&2
-        echo "  Fix:  ./setup_env.sh          (installs a matching nvcc into the env)" >&2
-        echo "  Or skip that phase:  --skip-p4b" >&2
+        warn "WARNING: no nvcc on PATH -- P4b (gsplat) will fail when it tries to compile."
+        warn "  Fix:  ./setup_env.sh          (installs a matching nvcc into the env)"
+        warn "  Or skip that phase:  --skip-p4b"
     elif [[ -n "$NVCC_MAJOR" && "$NVCC_MAJOR" -lt 12 ]]; then
-        echo "WARNING: nvcc is $("$NVCC_BIN" --version | sed -n 's/.*release \(.*\), .*/\1/p') at $NVCC_BIN," >&2
-        echo "  but gsplat compiles with -std=c++20, which needs nvcc 12.0 or newer. P4b will fail." >&2
-        echo "  Fix:  ./setup_env.sh          (installs a matching nvcc into the env)" >&2
-        echo "  Or skip that phase:  --skip-p4b" >&2
+        warn "WARNING: nvcc is $("$NVCC_BIN" --version | sed -n 's/.*release \(.*\), .*/\1/p') at $NVCC_BIN,"
+        warn "  but gsplat compiles with -std=c++20, which needs nvcc 12.0 or newer. P4b will fail."
+        warn "  Fix:  ./setup_env.sh          (installs a matching nvcc into the env)"
+        warn "  Or skip that phase:  --skip-p4b"
     fi
 fi
 
@@ -931,7 +949,9 @@ source "$REPO_ROOT/scripts/sam_checkpoints.sh"
 mkdir -p "$WORKDIR"
 LOG="$WORKDIR/pipeline.log"
 # Everything below is tee'd, so a finished run leaves a readable record.
-exec > >(tee -a "$LOG") 2>&1
+# Colour reaches the terminal; the log gets the same text with the escapes
+# stripped, so grep and a later read of pipeline.log are unaffected by it.
+exec > >(tee >(sed -u 's/\x1b\[[0-9;]*m//g' >> "$LOG")) 2>&1
 echo "=== run started $(date '+%Y-%m-%d %H:%M:%S') ==="
 
 # Phases run in order; --skip-to jumps in partway on an existing workdir and
@@ -949,7 +969,13 @@ should_run() {
     return 0
 }
 
-phase() { printf '\n\033[1m=== %s ===\033[0m\n' "$1"; }
+# A phase heading. SKIPPED headings go orange: a skip is a hole in the result
+# and should not read like a step that ran.
+phase() {
+    local colour="$C_BOLD"
+    [[ "$1" == *SKIPPED* ]] && colour="$C_BOLD$C_ORANGE"
+    printf '\n%s=== %s ===%s\n' "$colour" "$1" "$C_OFF"
+}
 
 # Where this branch's later phases read and write. The baseline keeps the
 # historical paths; a learned backend gets a sibling under experiments/.
@@ -976,10 +1002,10 @@ gate() {  # gate <phase> <qc-json>
         return 0
     fi
     echo "" >&2
-    echo "  FATAL QC after $1 -- the failures below poison every later phase:" >&2
-    while IFS= read -r line; do echo "    $line" >&2; done <<< "$why"
+    fatal "  FATAL QC after $1 -- the failures below poison every later phase:"
+    while IFS= read -r line; do fatal "    $line"; done <<< "$why"
     if [[ "$KEEP_GOING" == 1 ]]; then
-        echo "    --keep-going given -- continuing anyway." >&2
+        warn "    --keep-going given -- continuing anyway."
         return 0
     fi
     echo "    Fix this phase, then resume with --skip-to <next phase>" >&2
@@ -1037,7 +1063,7 @@ if should_run p1p2; then
     elif [[ -f "$WORKDIR/p2/prompts_clicked.json" ]]; then
         echo "  plant/holder prompts: clicked, $WORKDIR/p2/prompts_clicked.json"
     else
-        echo "  WARNING: no plant/holder prompts -- falling back to the COLOUR RULE." >&2
+        warn "  WARNING: no plant/holder prompts -- falling back to the COLOUR RULE."
         echo "    That rule picks the largest green-dominant blob, and an orange or" >&2
         echo "    amber plier grip is green-dominant in RGB. It has seeded on the tool" >&2
         echo "    on more than one capture here. Check p2/qc.json before P3." >&2

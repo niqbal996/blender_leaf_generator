@@ -46,11 +46,25 @@ HOLDER_ID = 2
 # silhouette agreement P4a needs, so the carve deleted it anyway. A root
 # with its own memory is tracked as the single connected region it is.
 #
-# It is a tracking aid, not a class: the root *is* plant, so its mask is
-# unioned into masks/plant at write time and ROOT_ID never appears in the
-# output. (Which parts of the plant are leaf/stem/root is P4c's question.)
+# The root *is* plant, so its mask is unioned into masks/plant and the carve
+# and the solve see one subject, as before. It is also written out on its own,
+# to masks/root: P4c has to decide which tissue is root, and a SAM2 object
+# tracked from a click below the jaws is a far better answer than appearance
+# similarity. Measured on thistle3, where P4c had only DINO to go on: the
+# points it labelled root ran from z=0.071 to z=0.560 in the plant frame
+# against foliage from 0.000 to 1.051 -- a median root height of 0.376 against
+# 0.453 for the leaves, so "root" tissue sat in the middle of the canopy. 89%
+# of it was above the leaves' own 25th percentile. That wrecks P5, which
+# locates a rosette's crown as the foliage nearest the top of the root.
+#
+# A dark leaf underside and a root look alike to a feature matcher; "the blob
+# below the jaws that the clamp cut off from everything else" does not look
+# like anything else at all, and SAM2 already tracks it as exactly that.
 ROOT_ID = 3
 CLASS_NAMES = {PLANT_ID: "plant", HOLDER_ID: "holder"}
+# Written alongside the classes above, but not one of them: nothing upstream
+# of P4c should treat root as separate from plant.
+ROOT_MASK_DIR = "root"
 
 
 # --------------------------------------------------------------------------
@@ -721,6 +735,13 @@ def segment_sequence(
             stats[f"{name}_area_px"] = int((binary > 0).sum())
 
             if obj_id == PLANT_ID:
+                # The root on its own, for P4c. Written from the same binary
+                # that was just unioned in above, so the two cannot drift.
+                root_out = out_dir / "masks" / ROOT_MASK_DIR
+                if root_binary is not None:
+                    root_out.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(root_out / f"{path.stem}.png"),
+                                _paste(root_binary, box, full_h, full_w).astype(np.uint8) * 255)
                 soft_crop = _sigmoid(crop_logit)
                 if root_binary is not None:
                     soft_crop = np.maximum(soft_crop, np.where(root_binary, _sigmoid(root_logit), 0.0))

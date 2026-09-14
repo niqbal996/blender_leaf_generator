@@ -117,11 +117,12 @@ class DinoClassifier:
     def grid(self) -> int:
         return self.backbone.grid
 
-    def classify(self, bgr: np.ndarray, plant_mask: np.ndarray) -> Optional[np.ndarray]:
+    def classify(self, bgr: np.ndarray, plant_mask: np.ndarray,
+                 root_mask: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
         from .dino import classify_frame
 
         return classify_frame(self.backbone, bgr, plant_mask, self.seed_vectors,
-                              self.seed_labels, self.class_order)
+                              self.seed_labels, self.class_order, root_mask=root_mask)
 
 
 class SamClassifier:
@@ -234,23 +235,39 @@ def classify_sequence(
     out_dir: Union[str, Path],
     frame_stems: Sequence[str],
     progress_every: int = 12,
+    root_mask_dir: Optional[Union[str, Path]] = None,
 ) -> dict:
     """Run a classifier over every frame and write the class maps.
 
     Returns per-class pixel totals, which are the cheapest early warning that
     something is off -- a seedling whose 'stem' outweighs its 'leaf' is telling
     you so here, before three more phases build on it.
+
+    `root_mask_dir` is P2's tracked root object, and settles the root class
+    where it exists -- see `dino.classify_frame`. Frames missing a root mask
+    fall back to appearance for that frame alone, so a root that SAM2 lost for
+    a stretch degrades to the old behaviour rather than vanishing.
     """
     frames_dir, mask_dir, out_dir = Path(frames_dir), Path(mask_dir), Path(out_dir)
+    root_mask_dir = Path(root_mask_dir) if root_mask_dir else None
     totals = np.zeros(len(classifier.class_order), np.int64)
     written = 0
+    root_frames = 0
 
     for n, stem in enumerate(frame_stems):
         bgr = cv2.imread(str(frames_dir / f"{stem}.jpg"))
         plant = cv2.imread(str(mask_dir / f"{stem}.png"), cv2.IMREAD_GRAYSCALE)
         if bgr is None or plant is None:
             continue
-        class_map = classifier.classify(bgr, plant > 127)
+        root = None
+        if root_mask_dir is not None:
+            root = cv2.imread(str(root_mask_dir / f"{stem}.png"), cv2.IMREAD_GRAYSCALE)
+            if root is not None and root.any():
+                root_frames += 1
+            else:
+                root = None
+        class_map = (classifier.classify(bgr, plant > 127, root_mask=root)
+                     if root is not None else classifier.classify(bgr, plant > 127))
         if class_map is None:
             continue
         save_class_map(out_dir, stem, class_map)
@@ -260,7 +277,10 @@ def classify_sequence(
         if (n + 1) % progress_every == 0:
             print(f"    {n + 1}/{len(frame_stems)} frames")
 
+    if root_mask_dir is not None:
+        print(f"    P2 root masks decided the root class in {root_frames}/{written} frames")
     return {
         "frames_written": written,
         "pixels_per_class": {name: int(totals[i]) for i, name in enumerate(classifier.class_order)},
+        "root_from_p2_masks": root_frames,
     }
