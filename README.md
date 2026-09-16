@@ -255,12 +255,14 @@ Two options worth knowing about:
   network is not recoverable from a farinose upper leaf surface, and the two
   capture changes that would make it recoverable are named there.
 
-Which end of a leaf is the tip is decided by four independent votes -- the
-stalk's width profile, how thin each end is, the base's paler colour, and the
-asymmetry of the **margin teeth**, which point toward the apex. The last is
-what works on a leaf whose petiole was never attached when it was laid out;
-it was validated 8/8 against the leaves whose stalk settles the question on
-its own, and it cut the leaves needing review from eight to two.
+Which end of a leaf is the tip is decided by three independent votes -- the
+stalk's width profile, how thin each end is, and the base's paler colour.
+Against every leaf whose stalk settles the question on its own, those three
+score 15/15 on an entire-margined species and 8/8 on a toothed one. A leaf
+with no petiole at all is reported with low confidence rather than guessed at;
+`docs/leaf-pose.md` records a fourth cue (margin-tooth asymmetry) that was
+tried, validated 8/8 on one species, and removed after it inverted six leaves
+on another -- worth reading before adding a cue of your own.
 
 This is a sibling of the pose pipeline below, not a replacement: that one
 measures a plant that is still assembled and pays for it with a multi-view

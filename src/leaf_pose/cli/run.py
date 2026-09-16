@@ -218,11 +218,7 @@ def run(
             say(f"  leaf {instance.index}: no midrib -- skipped")
             continue
         oriented, points = keypoint.locate(
-            fitted,
-            greenness=detect.greenness_map(crop) * instance.mask,
-            # The contour is stored in frame coordinates; the midrib is
-            # crop-local, and the tooth statistic compares the two.
-            contour=instance.contour - np.array(instance.offset, dtype=float))
+            fitted, greenness=detect.greenness_map(crop) * instance.mask)
 
         found_veins = []
         if want_veins:

@@ -28,11 +28,34 @@ reading a quarter of the tip's excess green on the largest.
 
 All three degrade together on the leaf that has no petiole at all -- cut off,
 or never attached when the leaf was laid out -- because two of them describe
-the stalk and the third describes the tissue beside it. The fourth vote is
-for exactly that leaf, and it reads the **margin teeth**: see
-`tooth_direction`.
+the stalk and the third describes the tissue beside it. That leaf is reported
+with a low `confidence` and is genuinely ambiguous to this code.
 
-A leaf with none of the four signals is genuinely ambiguous, and `confidence`
+**A fourth vote was tried here and removed.** A leaf's marginal teeth point
+toward its apex, so the asymmetry of the margin profile -- slow rise along
+each tooth's long proximal flank, sharp fall down its short distal one --
+looks like a direction cue that needs no petiole at all. It validated 8/8 on
+gaensefuss_31's unambiguous leaves and was shipped.
+
+It is wrong, and the way it is wrong is instructive. What the statistic
+actually measures on most leaves is the **step where the blade narrows into
+the petiole**: one large asymmetric slope event, which dominates a cubed
+moment and always points the "tip" at the stalk. On gaensefuss that error
+happened to agree with the real teeth. On vogelmeere_1 -- Stellaria, an
+entire margin with no teeth to read -- it was right on 3 of 15 leaves, which
+is worse than abstaining, and it overturned six stalks that were
+unmistakable. Its magnitude gave no warning either: a median of 1.74 on the
+untoothed species against 2.81 on the toothed one, so no threshold separates
+"reading teeth" from "reading the petiole step". Trimming the petiole out
+first made it 0/15; a quartile-based statistic immune to the single step
+event dropped the toothed case to 1/8.
+
+Against the leaves where the stalk settles the answer independently, the
+three votes below score 15/15 on vogelmeere and 8/8 on gaensefuss; adding the
+teeth made that 9/15 and 8/8. The cue was contributing nothing where the
+answer was already known and inverting it where it was not.
+
+A leaf with none of the three signals is genuinely ambiguous, and `confidence`
 says so rather than the answer being presented as certain -- which is the
 same contract `leaf_generator.keypoints` reports under, for the same reason.
 """
@@ -40,11 +63,9 @@ same contract `leaf_generator.keypoints` reports under, for the same reason.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
-
-from pose_estimator.leaf import resample_by_arclength
 
 from .midrib import Midrib
 
@@ -59,17 +80,6 @@ END_FRACTION = 0.12
 # it cannot overturn a clear stalk -- which is the more direct evidence, and
 # which a red-petioled or a variegated leaf would otherwise lose to colour.
 COLOUR_WEIGHT = 0.5
-# The tooth vote's weight, and the skew magnitude at which it saturates. The
-# cap matters: measured skews run from about 0.3 on a nearly entire margin to
-# 11 on a strongly toothed one, and uncapped, one emphatic leaf would make
-# this vote unanswerable by any amount of contrary evidence.
-TOOTH_WEIGHT = 0.35
-TOOTH_SATURATION = 4.0
-# Resolution the margin is sampled at, and the window separating a tooth from
-# the blade's own outline. Both in bins along the midrib; the answer was the
-# same for every window from 9 to 61.
-TOOTH_BINS = 300
-TOOTH_ENVELOPE = 21
 
 
 @dataclass
@@ -89,10 +99,6 @@ class Keypoints:
     petiole_angle_deg: float    # petiole direction against the blade's chord
     confidence: float           # 0 ambiguous .. 1 unmistakable
     flipped: bool               # whether the input path had to be reversed
-    # Margin-tooth asymmetry, reported in the *final* orientation, so a
-    # negative value always means "the teeth agree that the tip is at the far
-    # end". Near zero means an entire margin with no teeth to read.
-    tooth_skew: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -106,7 +112,6 @@ class Keypoints:
             "petiole_angle_deg": round(float(self.petiole_angle_deg), 2),
             "confidence": round(float(self.confidence), 4),
             "flipped": bool(self.flipped),
-            "tooth_skew": round(float(self.tooth_skew), 3),
         }
 
 
@@ -152,113 +157,6 @@ def end_score(width: np.ndarray, greenness: Optional[np.ndarray] = None) -> floa
     return score
 
 
-def margin_profiles(
-    contour: np.ndarray, midrib: np.ndarray, bins: int = TOOTH_BINS,
-) -> List[np.ndarray]:
-    """How far the margin lies from the midrib, per side, along the leaf.
-
-    Each contour point is assigned to its nearest point on a densely
-    resampled midrib, which gives it a position *along* the leaf and a
-    distance *across* it, and the side it is on comes from the sign of the
-    cross product with the local tangent. Binning the across-distance by the
-    along-position turns each margin into a 1-D signal that teeth appear in
-    as bumps.
-
-    Parameterising by the midrib rather than by the contour's own arclength
-    is what makes the two sides comparable: teeth point toward the apex on
-    both margins, but walking the contour traverses one side base-to-tip and
-    the other tip-to-base, so a contour-order statistic would see them as
-    opposite and cancel them out.
-
-    The midrib is resampled to 1500 points first. Using it as stored -- 48
-    stations -- gives every contour point one of 48 positions, so 300 bins
-    have 48 filled and the profile is thrown away as too sparse to use. The
-    symptom was a tooth statistic of exactly 0.000 for every leaf.
-    """
-    dense, length = resample_by_arclength(midrib, 1500)
-    if length <= 0:
-        return []
-    along = np.linspace(0.0, length, len(dense))
-
-    tangents = np.gradient(dense, axis=0)
-    tangents /= np.maximum(np.linalg.norm(tangents, axis=1, keepdims=True), 1e-9)
-
-    nearest = np.linalg.norm(contour[:, None, :] - dense[None, :, :],
-                             axis=2).argmin(axis=1)
-    offset = contour - dense[nearest]
-    across = np.linalg.norm(offset, axis=1)
-    side = (tangents[nearest, 0] * offset[:, 1]
-            - tangents[nearest, 1] * offset[:, 0])
-    position = along[nearest]
-
-    edges = np.linspace(0.0, length, bins + 1)
-    out = []
-    for sign in (+1.0, -1.0):
-        keep = np.sign(side) == sign
-        if keep.sum() < 60:
-            continue
-        index = np.clip(np.digitize(position[keep], edges) - 1, 0, bins - 1)
-        profile = np.full(bins, np.nan)
-        distances = across[keep]
-        for b in range(bins):
-            members = index == b
-            if members.any():
-                profile[b] = distances[members].max()
-        filled = ~np.isnan(profile)
-        if filled.sum() < bins * 0.5:
-            continue
-        out.append(np.interp(np.arange(bins), np.flatnonzero(filled),
-                             profile[filled]))
-    return out
-
-
-def tooth_direction(contour: np.ndarray, midrib: np.ndarray) -> float:
-    """Which way the margin teeth point. Negative means "toward the end".
-
-    A leaf's marginal teeth point toward its apex. Walk a toothed margin from
-    base to tip and the distance from the midrib therefore rises slowly along
-    each tooth's long proximal edge and drops sharply down its short distal
-    edge into the sinus -- a sawtooth with a slow rise and a fast fall. Walk
-    it the other way and the asymmetry reverses.
-
-    That asymmetry is exactly what the **skewness of the slope** measures:
-    many small positive steps and a few large negative ones cube out to a
-    negative skew. So a negative value means the midrib's own direction, base
-    index to last index, points at the tip.
-
-    The blade's outline is removed first -- subtracting a smoothed version of
-    the profile leaves only what is finer than the leaf's own silhouette --
-    because the leaf widening and then narrowing is a far larger signal than
-    any tooth and is not what this is asking about.
-
-    Two properties make it safe to add to the other votes without special
-    cases. It is exactly antisymmetric: reversing the leaf negates the
-    statistic, so it cannot favour an orientation by construction. And a leaf
-    with an entire margin has nothing to be skewed, so it returns ~0 and
-    abstains rather than voting on noise.
-
-    Measured on gaensefuss_31 against the eight leaves whose petiole is long
-    enough to settle the question independently: 8/8, with skews from -0.6 to
-    -9.3. The control that matters is that re-running it with the petiole
-    excluded from the profile *strengthened* every one of those eight
-    (-1.3 to -10.8), which is what rules out its having simply re-detected
-    the stalk -- a large asymmetric feature at one end that would have
-    produced the same 8/8 for the wrong reason.
-    """
-    from scipy.ndimage import uniform_filter1d
-    from scipy.stats import skew
-
-    values = []
-    for profile in margin_profiles(contour, midrib):
-        residual = profile - uniform_filter1d(profile, size=TOOTH_ENVELOPE,
-                                              mode="nearest")
-        slope = np.diff(residual)
-        if slope.std() < 1e-9:
-            continue
-        values.append(float(skew(slope)))
-    return float(np.mean(values)) if values else 0.0
-
-
 def sample_along(path: np.ndarray, field: np.ndarray) -> np.ndarray:
     """A 2D map read off at each station of a polyline."""
     rows = np.clip(np.round(path[:, 1]).astype(int), 0, field.shape[0] - 1)
@@ -266,14 +164,13 @@ def sample_along(path: np.ndarray, field: np.ndarray) -> np.ndarray:
     return field[rows, cols]
 
 
-def locate(midrib: Midrib, greenness: Optional[np.ndarray] = None,
-           contour: Optional[np.ndarray] = None) -> Tuple[Midrib, Keypoints]:
+def locate(midrib: Midrib, greenness: Optional[np.ndarray] = None
+           ) -> Tuple[Midrib, Keypoints]:
     """Orient the midrib base-to-tip and measure the leaf's pose.
 
     `greenness` is the leaf crop's colour index, the same array shape as the
-    mask, read along the midrib for the colour vote. `contour` is the leaf's
-    outline in the same crop-local coordinates as `midrib.path`, for the
-    tooth vote. Both may be left out; each vote simply does not happen.
+    mask, read along the midrib for the colour vote; it may be left out, and
+    then that vote simply does not happen.
 
     Returns the midrib as it should be read from now on -- station 0 at the
     petiole's cut end -- together with the keypoints.
@@ -283,16 +180,6 @@ def locate(midrib: Midrib, greenness: Optional[np.ndarray] = None,
     forward = end_score(midrib.width, profile)
     backward = end_score(midrib.width[::-1],
                          None if profile is None else profile[::-1])
-
-    # The tooth statistic is antisymmetric under reversal, so one evaluation
-    # settles both orientations: it is added to one score and subtracted from
-    # the other. Saturated first, so an emphatically toothed leaf contributes
-    # a bounded amount rather than an overwhelming one.
-    tooth = 0.0 if contour is None else tooth_direction(contour, midrib.path)
-    vote = TOOTH_WEIGHT * float(np.clip(-tooth / TOOTH_SATURATION, -1.0, 1.0))
-    forward += vote
-    backward -= vote
-
     flipped = backward > forward
 
     path = midrib.path[::-1].copy() if flipped else midrib.path.copy()
@@ -332,7 +219,6 @@ def locate(midrib: Midrib, greenness: Optional[np.ndarray] = None,
         petiole_angle = float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
 
     return oriented, Keypoints(
-        tooth_skew=-tooth if flipped else tooth,
         petiole_origin=petiole_origin,
         blade_base=blade_base,
         tip=tip,

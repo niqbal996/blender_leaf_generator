@@ -212,51 +212,48 @@ are near-tied.
 
 **All three fail together on the leaf with no petiole at all** — cut off, or
 never attached when the leaf was laid out. Two of them describe the stalk and
-the third describes the tissue beside it, so when there is no stalk there is
-nothing to read. On `gaensefuss_31` that is most of the small leaves, and it
-is why eight of twenty-seven came back uncertain.
+the third describes the tissue beside it, so with no stalk there is nothing to
+read. Those leaves come back with a low `confidence`, the run names them, and
+the diagram is where you settle them by eye. That is the honest state: this
+code cannot orient a petiole-less, entire-margined leaf on its own.
 
-The fourth vote is for exactly that leaf, and it reads the **margin teeth**.
+### A fourth vote was tried and removed — read this before adding another
 
-### Reading the teeth
+A leaf's marginal teeth point toward its apex, so the asymmetry of the margin
+profile looks like a direction cue that needs no petiole at all. It validated
+**8/8** against gaensefuss's unambiguous leaves, survived a control that
+excluded the petiole, and was shipped. It was wrong, and the way it was wrong
+is worth recording because the next plausible cue will fail the same way.
 
-A leaf's marginal teeth point toward its apex. Walk a toothed margin from base
-to tip and the distance from the midrib therefore rises slowly along each
-tooth's long proximal edge, then drops sharply down its short distal edge into
-the sinus — a sawtooth with a **slow rise and a fast fall**. Walk it the other
-way and the asymmetry reverses.
+What the statistic actually measures on most leaves is the **step where the
+blade narrows into the petiole**. That is one large asymmetric slope event; it
+dominates a cubed moment, and it always points the "tip" at the stalk. On a
+toothed leaf that error happens to agree with the real teeth, so the
+validation passed.
 
-That is measurable as the **skewness of the slope** of the margin profile:
-many small positive steps and a few large negative ones cube out to a negative
-skew, and the sign says which way the tip lies. The blade's own outline is
-subtracted off first, because a leaf widening and then narrowing is a far
-larger signal than any tooth and is not the question being asked.
+On `vogelmeere_1` — *Stellaria*, entire margins, no teeth anywhere — it was
+right on **3 of 15** leaves, worse than abstaining, and it overturned six
+stalks that were unmistakable (one leaf had 48% of its midrib in a thin run at
+one end and 8% at the other).
 
-Three properties make it safe:
+Nothing about the number warned of this. Its median magnitude was **1.74 on
+the untoothed species against 2.81 on the toothed one**, so no threshold
+separates "reading teeth" from "reading the petiole step". Two repairs were
+tried and measured: trimming the petiole out of the profile first made it
+**0/15**, and a quartile-based statistic immune to a single step event dropped
+the toothed case to **1/8**.
 
-- **It is exactly antisymmetric.** Reversing the leaf negates the statistic,
-  so it cannot prefer an orientation by construction.
-- **An entire margin abstains.** No teeth means nothing to be skewed, so the
-  statistic goes to ~0 and the vote simply does not happen. No special case.
-- **It was validated against something independent.** On the eight leaves
-  whose petiole is long enough to settle the question on its own, the teeth
-  agreed **8/8**, with skews from −0.6 to −9.3.
+Scored against every leaf where the stalk settles the answer independently:
 
-The control that matters is the second one: re-running with the petiole
-*excluded* from the profile **strengthened** all eight (−1.3 to −10.8). That
-is what rules out its having simply re-detected the stalk — a large asymmetric
-feature at one end, which would have produced the same 8/8 for the wrong
-reason and then been useless on the leaves that have no stalk.
+| | vogelmeere (entire) | gaensefuss (toothed) |
+|---|---|---|
+| three votes | **15/15** | **8/8** |
+| + margin teeth | 9/15 | 8/8 |
 
-Measured effect on `gaensefuss_31` at full resolution: leaves needing review
-fell from **eight to two**, and the two left are the tiny fragment and the
-inflorescence, neither of which is a leaf with teeth to read. Two orientations
-changed, both on leaves that had been near a coin toss, and every leaf with a
-real petiole kept the answer its stalk already gave.
-
-A leaf with none of the four signals is genuinely ambiguous. `confidence` says
-so, the run prints which leaves it was unsure about, and the diagram is where
-you check them. Nothing is presented as certain that is not.
+The cue contributed nothing where the answer was already known, and inverted
+it where it was not. The lesson generalises: **validate a direction cue on a
+species whose margin cannot supply it**, or the petiole step will validate it
+for you.
 
 ## The diagram
 
@@ -362,6 +359,9 @@ carries a `units` field, so nothing has to be inferred from context.
   integrates them into a height field.
 - **It does not recover a venation network.** See above for why, and for the
   two capture changes that would fix it.
+- **It cannot orient a petiole-less leaf with an entire margin.** Every cue it
+  has is about the stalk or the tissue beside it. Such leaves are flagged, not
+  guessed at; see the removed tooth vote above for what happens when they are.
 - **It has been measured on one capture.** `gaensefuss_31`, 2026-09-15: 24
   frames, 61 MP, 27 leaves on black felt. Every threshold quoted above was
   fitted to it. Another backing, another species or another rig may well move

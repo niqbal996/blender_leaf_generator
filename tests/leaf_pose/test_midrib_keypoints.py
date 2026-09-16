@@ -118,96 +118,47 @@ def test_stalk_run_is_zero_when_the_profile_starts_thick():
     assert keypoints.stalk_run(np.array([1.0, 1.0, 10.0, 10.0])) == 0.5
 
 
-LONG_FLANK, SHORT_FLANK = 26.0, 9.0
+def ovate_with_petiole(height=420, width=200, petiole_rows=(250, 400),
+                       petiole_half=3):
+    """An entire-margined ovate blade on a long thin petiole.
 
-
-def serrated_blade(height=400, width=200, teeth=9, depth=14, apex_toward_high_row=True):
-    """An elliptical blade with teeth pointing toward one end. No petiole.
-
-    Built by carving triangular sinuses out of the margin rather than by
-    adding triangles to it, so the blade stays one simple region. The sign
-    convention is the easy thing to get backwards, so it is spelled out:
-
-    A tooth points toward the apex means that, walking that way, the margin
-    climbs slowly along the tooth's long proximal flank and then drops
-    sharply down its short distal flank into the next sinus. The margin is
-    `base - reach`, so `reach` must do the opposite: fall slowly away from a
-    sinus in the direction the teeth point, and rise sharply back into the
-    next one. That puts the sinus's **long** taper on the side the teeth
-    point toward.
+    Stellaria, roughly: no teeth anywhere, an acute apex, and a stalk that is
+    a small fraction of the blade's width. This is the shape a margin-asymmetry
+    statistic gets wrong, because the only strong asymmetry on it is the step
+    where the blade narrows into the stalk.
     """
     mask = np.zeros((height, width), bool)
     ys, xs = np.mgrid[0:height, 0:width]
-    mask |= ((xs - 100) ** 2 / 55.0 ** 2 + (ys - 200) ** 2 / 185.0 ** 2) < 1
-
-    for centre in np.linspace(60, 340, teeth):
-        for row in range(int(centre) - 30, int(centre) + 30):
-            if not 0 <= row < height:
-                continue
-            delta = row - centre
-            toward = (delta >= 0) if apex_toward_high_row else (delta < 0)
-            reach = depth * max(0.0, 1.0 - abs(delta)
-                                / (LONG_FLANK if toward else SHORT_FLANK))
-            if reach <= 0:
-                continue
-            columns = np.flatnonzero(mask[row])
-            if len(columns) < 4:
-                continue
-            mask[row, columns[0]:columns[0] + int(reach)] = False
-            mask[row, columns[-1] - int(reach):columns[-1] + 1] = False
+    mask |= ((xs - 100) ** 2 / 62.0 ** 2 + (ys - 150) ** 2 / 120.0 ** 2) < 1
+    mask[petiole_rows[0]:petiole_rows[1],
+         100 - petiole_half:100 + petiole_half] = True
     return mask
 
 
-def keypoints_contour(mask):
-    from leaf_pose.instances import subpixel_contour
-    return subpixel_contour(mask.astype(np.float32))
+def test_an_entire_margined_leaf_on_a_long_petiole_is_read_from_its_stalk():
+    """The vogelmeere regression.
 
-
-def test_tooth_direction_reads_which_way_the_teeth_point():
-    high = serrated_blade(apex_toward_high_row=True)
-    low = serrated_blade(apex_toward_high_row=False)
-
-    high_fit = midrib.fit_midrib(high, num_samples=48)
-    low_fit = midrib.fit_midrib(low, num_samples=48)
-
-    first = keypoints.tooth_direction(keypoints_contour(high), high_fit.path)
-    second = keypoints.tooth_direction(keypoints_contour(low), low_fit.path)
-    assert np.sign(first) == -np.sign(second)
-    assert abs(first) > 0.3 and abs(second) > 0.3
-
-
-def test_tooth_direction_is_antisymmetric_under_reversal():
-    """Reversing the leaf must negate the statistic exactly, or the vote
-    would favour one orientation by construction rather than by evidence."""
-    mask = serrated_blade()
+    A margin-teeth vote was added here and removed: on a leaf with no teeth
+    it reads the blade-to-petiole step instead, and that always points the
+    "tip" at the stalk. It inverted six of fifteen Stellaria leaves whose
+    petioles were unmistakable. The stalk must win on this shape, every time.
+    """
+    mask = ovate_with_petiole()
     fitted = midrib.fit_midrib(mask, num_samples=48)
-    contour = keypoints_contour(mask)
+    oriented, found = keypoints.locate(fitted)
 
-    forward = keypoints.tooth_direction(contour, fitted.path)
-    backward = keypoints.tooth_direction(contour, fitted.path[::-1])
-    assert forward == pytest.approx(-backward, abs=0.05)
-
-
-def test_an_entire_margin_abstains_rather_than_voting_on_noise():
-    mask = np.zeros((400, 200), bool)
-    ys, xs = np.mgrid[0:400, 0:200]
-    mask |= ((xs - 100) ** 2 / 55.0 ** 2 + (ys - 200) ** 2 / 185.0 ** 2) < 1
-
-    fitted = midrib.fit_midrib(mask, num_samples=48)
-    assert abs(keypoints.tooth_direction(keypoints_contour(mask), fitted.path)) < 0.5
+    # The stalk runs to high rows, so the petiole origin belongs there.
+    assert found.petiole_origin[1] > found.tip[1]
+    assert found.petiole_origin[1] > 380
+    assert found.petiole_length > 100
+    assert found.confidence > 0.2
+    assert oriented.width[0] < oriented.width.max() * keypoints.STALK_WIDTH_FRACTION
 
 
-def test_teeth_decide_a_leaf_with_no_petiole_at_all():
-    """The case this vote exists for: nothing else has anything to read."""
-    mask = serrated_blade(apex_toward_high_row=True)
-    fitted = midrib.fit_midrib(mask, num_samples=48)
-    contour = keypoints_contour(mask)
+def test_locate_takes_no_margin_argument():
+    """The tooth cue is gone, not merely disabled. A caller still passing a
+    contour would otherwise silently get the old, wrong behaviour back."""
+    import inspect
 
-    _, blind = keypoints.locate(fitted)
-    _, told = keypoints.locate(fitted, contour=contour)
-
-    assert blind.confidence < 0.12          # no stalk, no colour: a coin toss
-    assert told.confidence > blind.confidence
-    # Teeth point toward increasing row here, so the tip is the high-row end.
-    assert told.tip[1] > told.petiole_origin[1]
-    assert told.tooth_skew < 0              # reported in the final orientation
+    assert "contour" not in inspect.signature(keypoints.locate).parameters
+    assert not hasattr(keypoints, "tooth_direction")
