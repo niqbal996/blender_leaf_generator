@@ -148,14 +148,22 @@ def smooth_polyline(points: np.ndarray, iterations: int = 6, strength: float = 0
 
 
 def resample_by_arclength(points: np.ndarray, count: int) -> Tuple[np.ndarray, float]:
-    """Evenly re-space a polyline along its own arclength."""
+    """Evenly re-space a polyline along its own arclength.
+
+    Dimension-agnostic: `leaf_pose` fits midribs in the image plane and
+    resamples them with this same function, so the column count is read from
+    the array rather than fixed at three.
+    """
     segments = np.linalg.norm(np.diff(points, axis=0), axis=1)
     cumulative = np.concatenate([[0.0], np.cumsum(segments)])
     total = float(cumulative[-1])
     if total <= 0:
         return points, 0.0
     target = np.linspace(0.0, total, count)
-    resampled = np.stack([np.interp(target, cumulative, points[:, i]) for i in range(3)], axis=1)
+    resampled = np.stack(
+        [np.interp(target, cumulative, points[:, i]) for i in range(points.shape[1])],
+        axis=1,
+    )
     return resampled, total
 
 

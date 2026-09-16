@@ -26,6 +26,13 @@ laid out in a row, each with an estimated stem-attachment keypoint.
   - `alignment.py` -- solves a real-world similarity transform from two
     points whose separation you measured. Not yet wired into P1-P6; kept
     because metric scale is the pipeline's largest outstanding gap.
+- `src/leaf_pose/` -- the flat-lay leaf-measurement package (`bpy`-free).
+  One capture of a *dissected* plant -- leaves detached and laid out on a dark
+  backing, petioles attached, shot from above under 12 polarised lights -- in,
+  per-leaf mask, sub-pixel contour, midrib, tip and petiole origin out. No
+  solver and no GPU: the plant has been taken apart, so the geometry is
+  already in one plane. `docs/leaf-pose.md` is the mechanism;
+  `docs/leaf-pose-install.md` is the one-command install.
 - `blender_pipeline.py` -- thin entry-point script, run inside Blender, for
   the leaf-assembly pipeline above.
 - `plant_pose_pipeline_PLAN.md` -- the target spec for the pose pipeline
@@ -46,6 +53,8 @@ laid out in a row, each with an estimated stem-attachment keypoint.
 
 ```bash
 pip install -e ".[dev]"
+# only if you also measure flat-lay leaf scans (leaf_pose) -- no torch needed:
+pip install -e ".[leaf-pose]"
 # only if you also run the capture pipeline (get_mask.py / Uni-MS-PS):
 pip install -e ".[capture]"
 # only if you also run the plant pose pipeline:
@@ -214,6 +223,52 @@ already (the original script relied on this too).
   login), go through the WSL UNC path instead:
   `\\wsl.localhost\<distro>\mnt\e\...` (find `<distro>` via `echo
   $WSL_DISTRO_NAME` in a WSL shell).
+
+## Flat-lay leaf measurement (leaf_pose)
+
+For a plant you are willing to take apart. Detach the leaves, lay them out on
+a dark backing with the petioles still attached, photograph them from above,
+and measure every leaf at once:
+
+```bash
+./setup_env.sh --leaf-pose && conda activate leafpose     # one command
+leaf-pose --input /mnt/d/PBR_Scans/2026-09-15-Naeem/gaensefuss_31 \
+          --workdir runs/gaensefuss_31 --marker-mm 20 --visualize
+```
+
+Per leaf: a mask whose boundary was decided at the frame's own resolution, a
+sub-pixel contour, the midrib, the tip, and the petiole origin -- the cut end
+that was joined to the stem. `--visualize` puts the whole result in one
+diagram. Measured on a 24-frame, 61 MP capture of 27 leaves.
+
+Two options worth knowing about:
+
+- `--photometric` solves surface normals from the 12 individual lights and
+  places the midrib by the crease in them rather than by brightness. Also
+  writes a measured `NORMAL_GL`-convention map per leaf, which is the map
+  format `leaf_generator` already builds Blender leaves from.
+- `--instances sam` swaps the colour grouping for SAM2, for captures where
+  leaves touch or overlap. Not the default, and not what decides the edges --
+  `docs/leaf-pose.md` explains why at 61 MP that is the wrong job for it.
+- `--veins` finds the large basal veins, and only those. Read the vein
+  section of `docs/leaf-pose.md` before relying on it: a full venation
+  network is not recoverable from a farinose upper leaf surface, and the two
+  capture changes that would make it recoverable are named there.
+
+Which end of a leaf is the tip is decided by four independent votes -- the
+stalk's width profile, how thin each end is, the base's paler colour, and the
+asymmetry of the **margin teeth**, which point toward the apex. The last is
+what works on a leaf whose petiole was never attached when it was laid out;
+it was validated 8/8 against the leaves whose stalk settles the question on
+its own, and it cut the leaves needing review from eight to two.
+
+This is a sibling of the pose pipeline below, not a replacement: that one
+measures a plant that is still assembled and pays for it with a multi-view
+solve. If you can dissect the specimen, this is both cheaper and more
+accurate.
+
+Full write-up: [docs/leaf-pose.md](docs/leaf-pose.md).
+Install, module by module: [docs/leaf-pose-install.md](docs/leaf-pose-install.md).
 
 ## Plant pose pipeline (P1-P6)
 

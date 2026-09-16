@@ -63,6 +63,9 @@ def test_every_qc_check_exists():
     # The exporters in scripts/ are this project's code too, and the P3 docs
     # name their flags.
     sources += list((REPO / "scripts").glob("*.py"))
+    # docs/ is scanned whole, so a document about leaf_pose is held to this
+    # same standard and needs leaf_pose's own names to count as written.
+    sources += list((REPO / "src" / "leaf_pose").rglob("*.py"))
     for path in sources:
         text = path.read_text()
         written |= set(re.findall(r'checks\["([a-z_]+)"\]', text))

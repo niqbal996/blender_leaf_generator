@@ -9,6 +9,8 @@
 #   ./setup_env.sh --check         # detect and report only, install nothing
 #   ./setup_env.sh --checkpoint-only  # just fetch the SAM2 weights
 #   ./setup_env.sh --with-sam3     # also install SAM3 (experimental, see below)
+#   ./setup_env.sh --leaf-pose     # ONLY leaf_pose: a small env, no torch at all
+#   ./setup_env.sh --leaf-pose --with-sam   # ...plus SAM2, for --instances sam
 #   ./setup_env.sh --checkpoint-dir /big/disk/checkpoints   # weights off this disk
 #                                  # (or export SAM_CHECKPOINT_DIR, which run_pipeline.sh
 #                                  #  reads too -- a repo under a disk quota has no room
@@ -34,6 +36,8 @@ MODE="gpu"
 CHECK_ONLY=0
 CKPT_ONLY=0
 WITH_SAM3=0
+LEAF_POSE_ONLY=0
+WITH_SAM=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --name)  ENV_NAME="$2"; shift 2 ;;
@@ -43,12 +47,22 @@ while [[ $# -gt 0 ]]; do
         --checkpoint-only) CKPT_ONLY=1; shift ;;
         --checkpoint-dir) SAM_CHECKPOINT_DIR="$2"; export SAM_CHECKPOINT_DIR; shift 2 ;;
         --with-sam3) WITH_SAM3=1; shift ;;
+        --leaf-pose) LEAF_POSE_ONLY=1; shift ;;
+        --with-sam)  WITH_SAM=1; shift ;;
         # 2..the last comment line, so adding to the header above cannot
         # silently truncate --help the way a fixed range did.
         -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
+
+# A separate default env, because the point of --leaf-pose is to *not* be the
+# pipeline env: installing it into "pose" would gain nothing (everything it
+# needs is already there) and would risk pip resolving a dependency against
+# the CUDA-pinned torch that env is built around. --name still wins.
+if [[ "$LEAF_POSE_ONLY" -eq 1 && "$ENV_NAME" == "pose" ]]; then
+    ENV_NAME="leafpose"
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
@@ -211,6 +225,74 @@ PY="$CONDA_PREFIX/bin/python"
 [[ -x "$PY" ]] || die "no python at $PY"
 echo "    interpreter:      $PY"
 "$PY" -m pip install --upgrade pip -q
+
+# ------------------------------------------------------------- leaf_pose
+# Stops here on purpose. leaf_pose measures leaves in one image plane, so it
+# needs no solver, no CUDA toolchain and no torch -- which is the whole
+# difference between a two-minute install and the twenty-minute one below.
+# Everything past this point exists for the multi-view pipeline.
+if [[ "$LEAF_POSE_ONLY" -eq 1 ]]; then
+    say "Installing leaf_pose only (no torch, no pycolmap, no gsplat)"
+    "$PY" -m pip install -e ".[dev,leaf-pose]"
+
+    if [[ "$WITH_SAM" -eq 1 ]]; then
+        say "Adding SAM2, for --instances sam"
+        if [[ "$MODE" == "gpu" ]]; then
+            "$PY" -m pip install torch torchvision \
+                --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
+        else
+            "$PY" -m pip install torch torchvision \
+                --index-url "https://download.pytorch.org/whl/cpu"
+        fi
+        # From facebookresearch's git: the `sam2` name on PyPI is an
+        # unrelated third-party upload. Same clone the pipeline uses.
+        if [[ ! -d third_party/sam2/.git ]]; then
+            mkdir -p third_party
+            git clone --depth 1 https://github.com/facebookresearch/sam2.git \
+                third_party/sam2
+        fi
+        "$PY" -m pip install -e third_party/sam2
+        fetch_checkpoint
+    fi
+
+    say "Verifying"
+    "$PY" - <<'PYCODE'
+import importlib
+missing = []
+for module, why in (("cv2", "masking, markers, guided filter"),
+                    ("skimage", "ridge filter, medial axis, routing"),
+                    ("rawpy", "ARW/NEF decoding"),
+                    ("matplotlib", "the diagram"),
+                    ("leaf_pose", "this repo")):
+    try:
+        loaded = importlib.import_module(module)
+        print(f"    [ok]   {module:12} {getattr(loaded, '__version__', '')}")
+    except Exception as error:
+        missing.append(module)
+        print(f"    [FAIL] {module:12} {type(error).__name__}: {error}  ({why})")
+
+# opencv-contrib, not plain opencv: the base wheel imports as cv2 all the
+# same, so the two are told apart by whether the pieces this uses are there.
+try:
+    import cv2
+    for attribute, why in (("aruco", "fiducial markers -> millimetres"),
+                           ("ximgproc", "guided filter -> sharp edges")):
+        if hasattr(cv2, attribute):
+            print(f"    [ok]   cv2.{attribute:8} {why}")
+        else:
+            print(f"    [warn] cv2.{attribute:8} missing -- "
+                  f"pip install opencv-contrib-python ({why})")
+except Exception:
+    pass
+
+raise SystemExit(1 if missing else 0)
+PYCODE
+
+    say "Done. Try it with:"
+    echo "    conda activate $ENV_NAME"
+    echo "    leaf-pose --input <capture folder> --workdir runs/leaf1 --visualize"
+    exit 0
+fi
 
 # ---------------------------------------------------------------- nvcc
 # gsplat ships no prebuilt wheels for any torch/CUDA combination, so it JIT-

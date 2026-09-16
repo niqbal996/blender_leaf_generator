@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "leaf-generator"
 version = "0.1.0"
-description = "Two packages: leaf_generator (assemble procedural leaf assets for Blender from PBR map sets) and pose_estimator (recover plant 3D structure -- point cloud, skeleton, leaf pose -- from a turntable capture)."
+description = "Three packages: leaf_generator (assemble procedural leaf assets for Blender from PBR map sets), pose_estimator (recover plant 3D structure -- point cloud, skeleton, leaf pose -- from a turntable capture) and leaf_pose (per-leaf mask, midrib, tip and petiole origin from a flat-lay polarised light scan)."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
@@ -178,6 +178,33 @@ vggt-omega = [
     # unlike the vggt extra this is not pinned to the 3.10 API.
     "pycolmap",
 ]
+# leaf-pose -- per-leaf shape and pose from a flat-lay polarised light scan.
+# Every dependency it has by default is already in the base install (rawpy,
+# opencv-contrib, scikit-image, matplotlib), so `pip install -e .` is enough
+# and this extra exists to name that fact rather than to add to it. It is
+# listed anyway because the set is not obvious from the outside and because
+# a future dependency belongs here rather than in the base list.
+#
+# opencv-*contrib* specifically, twice over: cv2.aruco reads the fiducial
+# markers that give millimetres, and cv2.ximgproc.guidedFilter is what snaps
+# the mask edge to the photograph. The package degrades rather than breaks
+# without the second (a bilateral filter stands in), but the edge is softer.
+leaf-pose = [
+    "numpy",
+    "opencv-contrib-python",
+    "scikit-image",
+    "scipy",
+    "matplotlib",
+    "rawpy",
+]
+# leaf-pose --instances sam, for captures where leaves touch or overlap and
+# colour cannot separate them. SAM2 itself is installed from facebookresearch's
+# git, not PyPI -- see the "segment" extra above, and docs/leaf-pose-install.md.
+leaf-pose-sam = [
+    "leaf-generator[leaf-pose]",
+    "torch",
+    "torchvision",
+]
 # Everything the P1-P6 pipeline needs, in one name, for a machine that will
 # run the whole thing. Uses the GPU pycolmap build; swap to "skeleton" for
 # the CPU one (they are mutually exclusive -- same `pycolmap` module).
@@ -211,7 +238,13 @@ pose-structure = "pose_estimator.cli.structure:main"  # P5
 pose-leaf = "pose_estimator.cli.leaf_model:main"      # P6
 pose-view-structure = "pose_estimator.cli.view_structure:main"  # inspect P5 in 3D
 
-# Finds both top-level packages under src/: leaf_generator and pose_estimator.
+# leaf_pose's single entry point. One command rather than a phase per stage:
+# the run is dominated by decoding the RAW frames, so there is nothing a
+# resumable stage boundary would save.
+leaf-pose = "leaf_pose.cli.run:main"
+
+# Finds the three top-level packages under src/: leaf_generator,
+# pose_estimator and leaf_pose.
 [tool.setuptools.packages.find]
 where = ["src"]
 
