@@ -253,6 +253,7 @@ def classify_sequence(
     totals = np.zeros(len(classifier.class_order), np.int64)
     written = 0
     root_frames = 0
+    without_root: List[str] = []
 
     for n, stem in enumerate(frame_stems):
         bgr = cv2.imread(str(frames_dir / f"{stem}.jpg"))
@@ -261,11 +262,19 @@ def classify_sequence(
             continue
         root = None
         if root_mask_dir is not None:
-            root = cv2.imread(str(root_mask_dir / f"{stem}.png"), cv2.IMREAD_GRAYSCALE)
+            # Asked for only when it is there. cv2.imread on a missing path
+            # prints a findDecoder warning from its C++ layer that no Python
+            # try/except can suppress, and a capture whose second pass was
+            # seeded without a root prompt produced one per frame -- nine
+            # lines of red that looked like a failure and were not.
+            root_path = root_mask_dir / f"{stem}.png"
+            if root_path.exists():
+                root = cv2.imread(str(root_path), cv2.IMREAD_GRAYSCALE)
             if root is not None and root.any():
                 root_frames += 1
             else:
                 root = None
+                without_root.append(stem)
         class_map = (classifier.classify(bgr, plant > 127, root_mask=root)
                      if root is not None else classifier.classify(bgr, plant > 127))
         if class_map is None:
@@ -279,6 +288,13 @@ def classify_sequence(
 
     if root_mask_dir is not None:
         print(f"    P2 root masks decided the root class in {root_frames}/{written} frames")
+        if without_root:
+            shown = ", ".join(without_root[:4]) + (" ..." if len(without_root) > 4 else "")
+            print(f"    {len(without_root)} frame(s) had no root mask and fell back to "
+                  f"appearance for the root class: {shown}")
+            print("      Usually one capture pass was seeded without a root prompt -- P2 tracks "
+                  "each pass separately, so a root clicked on pass 0 is not carried into pass 1.")
+            print("      Re-run pose-pick-prompts and click the root on every pass.")
     return {
         "frames_written": written,
         "pixels_per_class": {name: int(totals[i]) for i, name in enumerate(classifier.class_order)},

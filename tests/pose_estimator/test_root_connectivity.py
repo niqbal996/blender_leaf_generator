@@ -141,3 +141,29 @@ def test_no_labels_leaves_connectivity_in_charge():
     points, split = clamped_plant()
     found = root_by_connectivity(points, VOXEL, labelled_root=np.zeros(len(points), bool))
     assert found is not None and found[split:].all()
+
+
+def test_a_root_clicked_on_one_pass_only_is_reported():
+    """P2 runs each capture pass as its own SAM2 session, so a root prompt on
+    pass 0 buys nothing on pass 1. Nothing fails -- the plant mask is complete
+    either way, because the root is unioned into it -- so the only symptom on
+    thistle3 was nine OpenCV findDecoder warnings in P4c naming missing files
+    and not the reason. Half the root evidence was gone, and P5 locates a
+    rosette's crown from the root."""
+    from pose_estimator.cli.segment import _warn_about_uneven_root_prompts
+    import io
+    import contextlib
+
+    def report(clicked):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            _warn_about_uneven_root_prompts(clicked, {0: [], 1: []})
+        return buffer.getvalue()
+
+    uneven = report({0: {"root": [[10, 20]]}, 1: {"root": []}})
+    assert "pass [1] was not" in uneven
+    assert "pose-pick-prompts" in uneven, "the message has to say what to do about it"
+
+    assert report({0: {"root": [[1, 2]]}, 1: {"root": [[3, 4]]}}) == ""
+    assert report({0: {"root": []}, 1: {"root": []}}) == "", (
+        "no root anywhere is a choice, not an inconsistency")

@@ -206,6 +206,7 @@ def run(
                 f"{prompts_file} does not match this workdir: it has "
                 f"{sorted(clicked)} but the frames have passes {sorted(per_pass)}. "
                 "Re-run pose-pick-prompts.")
+        _warn_about_uneven_root_prompts(clicked, per_pass)
 
     # A prompt bank locates the plant and the holder by appearance, so one set
     # of clicks serves every later capture -- pixel coordinates only ever
@@ -282,6 +283,32 @@ def run(
 
     return report
 
+
+
+def _warn_about_uneven_root_prompts(clicked, per_pass) -> None:
+    """Say so when some passes were seeded with a root prompt and others not.
+
+    P2 runs each pass as its own SAM2 session, so a root clicked on pass 0 is
+    not carried into pass 1 -- that pass simply has no root object and writes
+    no root mask. Nothing fails: the plant mask is complete either way, because
+    the root is unioned into it. What quietly halves is the evidence P4c uses
+    to place the root class, and P5 locates a rosette's crown from the root, so
+    the cost lands three phases later on the origin of the whole skeleton.
+
+    Measured on thistle3: pass 0 carried four root clicks and pass 1 none, so
+    14 of 27 frames had a root mask. The only symptom was nine OpenCV
+    findDecoder warnings in P4c, which name a missing file and not the reason.
+    """
+    with_root = sorted(index for index, prompts in clicked.items()
+                       if (prompts.get("root") if isinstance(prompts, dict) else None))
+    without = sorted(set(per_pass) - set(with_root))
+    if not with_root or not without:
+        return
+    print(f"  WARNING: pass {with_root} was seeded with a root prompt and pass {without} was not.")
+    print(f"    P2 tracks each pass separately, so passes {without} will produce no root mask")
+    print("    and P4c will fall back to appearance for the root class there -- which is the")
+    print("    weakest thing it is asked to do, and what P5 locates a rosette's crown from.")
+    print("    Re-run pose-pick-prompts and click the root ([3]) on every pass.")
 
 
 def _check_prompts_are_covered(report, clicked, fallback, per_pass, p2_dir) -> None:
