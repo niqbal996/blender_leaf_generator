@@ -59,7 +59,11 @@ measures which word won a competition rather than what either word finds, and
 every extra concept costs GPU memory on a sequence this long.
 
 Writes into --out:
-    frame_XXXX.jpg     photo | SAM3, one colour per phrase | P2 reference
+    frame_XXXX.jpg     three titled panels side by side, each with its own
+                       colour key: 1. the crop SAM3 was given, 2. what SAM3
+                       returned (one colour per prompt, xN = instances, and
+                       prompts that matched nothing listed greyed), 3. the
+                       existing P2 masks, when --p2 is given
     lab.json           every metric below, per phrase and per combination
     localize.json      the full-frame localisation check (--localize)
     run.log
@@ -206,43 +210,156 @@ def crop_from_sam3(processor, model, torch, frame_paths, phrase: str, stride: in
                         frame_width=full_w, frame_height=full_h)
 
 
+# The reference classes, in the order they are drawn and listed. Chosen to be
+# distinct from PHRASE_COLORS at a glance, so a green in column 3 is never
+# confused with a green in column 2 -- they mean different things. BGR.
+REFERENCE_COLORS = {"plant": (90, 210, 100), "holder": (200, 60, 200),
+                    "root": (40, 140, 240)}
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+BAND_BG = (38, 38, 38)
+SEPARATOR = (90, 90, 90)
+
+
+def _text_scale(width: int) -> float:
+    """Legible on a 600px column and not enormous on a 1600px one."""
+    return float(np.clip(width / 1500.0, 0.48, 0.95))
+
+
+def _draw_header(width: int, title: str, entries: Sequence, scale: float) -> np.ndarray:
+    """A titled band with a swatch-and-label legend, for one column.
+
+    The legend is the point of this function. Three panels of coloured blobs
+    with the phrase list printed once across the top is not readable: it does
+    not say which colour is which phrase, nor which panel is which, nor
+    whether a phrase is missing because it found nothing or because it was
+    never asked for. Each entry here is (label, colour, present) and an absent
+    one is still listed, greyed, so "nothing matched" is visible as a fact
+    rather than as an absence.
+    """
+    pad = int(12 * scale / 0.7)
+    line_h = int(30 * scale / 0.7)
+    swatch = int(18 * scale / 0.7)
+
+    # Lay the entries out in rows, wrapping on the column width.
+    widths = [cv2.getTextSize(e[0], FONT, scale, 1)[0][0] + swatch + 3 * pad
+              for e in entries]
+    rows, current, used = [], [], 0
+    for entry, w in zip(entries, widths):
+        if current and used + w > width - 2 * pad:
+            rows.append(current)
+            current, used = [], 0
+        current.append((entry, w))
+        used += w
+    if current:
+        rows.append(current)
+
+    height = pad + line_h + (len(rows) * line_h if rows else 0) + pad
+    band = np.full((height, width, 3), BAND_BG, np.uint8)
+    cv2.putText(band, title, (pad, pad + int(line_h * 0.75)), FONT,
+                scale * 1.05, (255, 255, 255), 2, cv2.LINE_AA)
+
+    y = pad + line_h
+    for row in rows:
+        x = pad
+        for (label, colour, present) in (e for e, _ in row):
+            top = y + int(line_h * 0.28)
+            if colour is not None:
+                # A greyed-out entry gets a greyed-out swatch: at full
+                # strength it advertises a colour that is nowhere in the
+                # image, and the eye goes looking for it.
+                shown = (tuple(int(c) for c in colour) if present else
+                         tuple(int(0.35 * c + 0.65 * b) for c, b in zip(colour, BAND_BG)))
+                cv2.rectangle(band, (x, top), (x + swatch, top + swatch), shown, -1)
+                # An outline, so a dark swatch is still a swatch on this band.
+                cv2.rectangle(band, (x, top), (x + swatch, top + swatch),
+                              (200, 200, 200) if present else (110, 110, 110), 1)
+            text_colour = (235, 235, 235) if present else (130, 130, 130)
+            cv2.putText(band, label, (x + swatch + pad // 2, y + int(line_h * 0.75)),
+                        FONT, scale, text_colour, 1, cv2.LINE_AA)
+            x += cv2.getTextSize(label, FONT, scale, 1)[0][0] + swatch + 3 * pad // 2
+        y += line_h
+    return band
+
+
+def _stack(columns: Sequence, scale: float) -> np.ndarray:
+    """Header over image, per column, joined by a visible separator."""
+    bands = [_draw_header(img.shape[1], title, entries, scale)
+             for title, img, entries in columns]
+    band_h = max(b.shape[0] for b in bands)
+    built = []
+    for band, (_, img, _) in zip(bands, columns):
+        if band.shape[0] < band_h:
+            band = np.vstack([band, np.full((band_h - band.shape[0], band.shape[1], 3),
+                                            BAND_BG, np.uint8)])
+        built.append(np.vstack([band, img]))
+
+    gap = np.full((built[0].shape[0], 3, 3), SEPARATOR, np.uint8)
+    out = built[0]
+    for column in built[1:]:
+        out = np.hstack([out, gap, column])
+    return out
+
+
 def draw_panel(view_bgr, by_phrase: Dict[str, np.ndarray], phrases: Sequence[str],
-               reference: Optional[Dict[str, np.ndarray]], label: str):
-    """photo | SAM3 coloured by phrase | P2's plant and holder, for the eye.
+               reference: Optional[Dict[str, np.ndarray]], frame_name: str,
+               counts: Optional[Dict[str, int]] = None,
+               crop_note: str = ""):
+    """photo | SAM3 coloured by phrase | P2's masks, each titled and keyed.
 
     The numbers cannot distinguish "SAM3 disagreed with P2" from "SAM3 was
-    right and P2 was wrong", and on this capture P2 is known to be wrong
-    somewhere. That judgement is made here.
+    right and P2 was wrong", and on these captures P2 is known to be wrong in
+    places. That judgement is made by eye, here, which only works if it is
+    obvious which panel and which colour is which.
     """
-    sam3 = view_bgr.copy()
-    for index, phrase in enumerate(phrases):
-        mask = by_phrase.get(phrase)
-        if mask is None or not mask.any():
-            continue
-        colour = np.array(PHRASE_COLORS[index % len(PHRASE_COLORS)])
-        sam3[mask] = (0.45 * sam3[mask] + 0.55 * colour).astype(np.uint8)
-        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(sam3, contours, -1, colour.tolist(), 2)
+    counts = counts or {}
+    scale = _text_scale(view_bgr.shape[1])
 
-    columns = [view_bgr, sam3]
-    lines = [label, "  ".join(f"[{p}]" for p in phrases)]
+    sam3 = view_bgr.copy()
+    legend = []
+    for index, phrase in enumerate(phrases):
+        colour = PHRASE_COLORS[index % len(PHRASE_COLORS)]
+        mask = by_phrase.get(phrase)
+        present = mask is not None and mask.any()
+        if present:
+            painted = np.array(colour)
+            sam3[mask] = (0.45 * sam3[mask] + 0.55 * painted).astype(np.uint8)
+            contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(sam3, contours, -1, [int(c) for c in colour], 2)
+            n = counts.get(phrase, 0)
+            label = f"{phrase} x{n}" if n else phrase
+        else:
+            label = f"{phrase} - no match"
+        legend.append((label, colour, present))
+
+    # The phrases overlap -- `plant` covers most of what `leaf` covers -- and
+    # the later one is painted on top. Without saying so, a phrase that is
+    # working looks like it found nothing because a broader phrase painted
+    # over it. The legend's xN counts are unaffected and are the honest
+    # measure; only the picture has an order.
+    if sum(1 for _, _, present in legend if present) > 1:
+        legend.append(("(overlaps: later prompts paint over earlier ones)", None, False))
+
+    columns = [
+        (f"1. PHOTO   {frame_name}" + (f"   {crop_note}" if crop_note else ""),
+         view_bgr,
+         [("the pixels SAM3 was given, nothing drawn on them", None, True)]),
+        ("2. SAM3   one colour per prompt, xN = instances found", sam3, legend),
+    ]
     if reference is not None:
         ref = view_bgr.copy()
-        for name, colour in (("plant", (90, 210, 100)), ("holder", (200, 60, 200)),
-                             ("root", (40, 140, 240))):
+        ref_legend = []
+        for name, colour in REFERENCE_COLORS.items():
             mask = reference[name]
-            if mask.any():
+            present = bool(mask.any())
+            if present:
                 ref[mask] = (0.45 * ref[mask] + 0.55 * np.array(colour)).astype(np.uint8)
-        columns.append(ref)
-        lines.append("reference: P2 plant/holder/root")
+            ref_legend.append((name if present else f"{name} - absent", colour, present))
+        columns.append(
+            ("3. REFERENCE   the existing P2 (SAM2) masks on disk", ref, ref_legend))
 
-    panel = np.hstack(columns)
-    for row, text in enumerate(lines):
-        for colour, thick in (((0, 0, 0), 4), ((255, 255, 255), 1)):
-            cv2.putText(panel, text, (14, 30 + 28 * row), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7, colour, thick)
-    return panel
+    return _stack(columns, scale)
 
 
 def score(per_frame: List[dict], n_frames: int) -> dict:
@@ -611,13 +728,14 @@ def main() -> None:
                 d = out_dir / "masks" / f"reference_{name}"
                 d.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(d / f"{path.stem}.png"), mask.astype(np.uint8) * 255)
+    crop_note = (f"crop {crop.width}x{crop.height} of "
+                 f"{crop.frame_width}x{crop.frame_height}" if crop else "full frame")
     for i, path in enumerate(frame_paths):
         view = cv2.cvtColor(video[i], cv2.COLOR_RGB2BGR)
-        label = f"{path.stem}   " + "  ".join(
-            f"{p}:{all_counts[i][p]}" for p in ordered if all_counts[i][p])
         cv2.imwrite(str(out_dir / f"frame_{i:04d}.jpg"),
                     draw_panel(view, all_masks[i], ordered,
-                               references[i] if scored else None, label),
+                               references[i] if scored else None,
+                               path.stem, all_counts[i], crop_note),
                     [cv2.IMWRITE_JPEG_QUALITY, 88])
 
     payload = {"frames": len(video),
