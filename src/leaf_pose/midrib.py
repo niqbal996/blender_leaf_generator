@@ -31,6 +31,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
+import cv2
 import numpy as np
 
 from pose_estimator.leaf import resample_by_arclength, smooth_polyline
@@ -39,6 +40,12 @@ from pose_estimator.leaf import resample_by_arclength, smooth_polyline
 # infinite cost makes the whole array non-finite for the router, while a
 # large one simply means no path ever takes that step.
 OUTSIDE_COST = 1e6
+# The largest sigma the ridge filter is ever run at, in pixels of whatever
+# image it is handed. Above this the crop is downsampled and the sigmas scaled
+# to match: `sato` costs pixels x sigma, and a high-resolution flat-lay drives
+# both up at once. 32 keeps the filter kernel small while staying far above
+# the few-pixel scale where resampling would blur the rib itself.
+MAX_FILTER_SIGMA = 32.0
 
 
 @dataclass
@@ -98,7 +105,33 @@ def ridge_response(
 
     grey = flatten_background(image, mask)
     sigmas = [max(1.0, s * half_width) for s in scales]
-    response = sato(grey, sigmas=sigmas, black_ridges=False).astype(np.float32)
+
+    # Run the filter at a scale where the sigmas are small, not at whatever
+    # resolution the leaf happened to be photographed at.
+    #
+    # `sato` costs roughly pixels x sigma, and both grow with the capture:
+    # sigma is a fraction of the leaf's half-width, so a scan at 35 px/mm
+    # asks for sigma ~360 on a 8 MP crop, which measured ~5 minutes per call
+    # and is called twice per leaf. On a 61 MP flat-lay of seven leaves that
+    # is over an hour in a stage that looks like it has hung.
+    #
+    # Downsampling is not an approximation of the answer, it is the same
+    # answer computed sensibly: a ridge at sigma 360 is by construction a
+    # low-frequency feature, and filtering at sigma/k on a k-times smaller
+    # image is the same scale-space location. Only the upsampled response's
+    # edges are softer, and this response is used as a routing cost and a
+    # mean support value -- neither is sub-pixel.
+    factor = max(1, int(np.ceil(max(sigmas) / MAX_FILTER_SIGMA)))
+    if factor > 1:
+        height, width = grey.shape[:2]
+        small = cv2.resize(grey, (max(width // factor, 8), max(height // factor, 8)),
+                           interpolation=cv2.INTER_AREA)
+        small_sigmas = [max(1.0, s / factor) for s in sigmas]
+        small_response = sato(small, sigmas=small_sigmas, black_ridges=False)
+        response = cv2.resize(small_response.astype(np.float32), (width, height),
+                              interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    else:
+        response = sato(grey, sigmas=sigmas, black_ridges=False).astype(np.float32)
 
     # Normalised against its own distribution *inside the leaf*: the backing
     # carries ridge-like fibres, and including them sets the scale by

@@ -162,3 +162,63 @@ def test_locate_takes_no_margin_argument():
 
     assert "contour" not in inspect.signature(keypoints.locate).parameters
     assert not hasattr(keypoints, "tooth_direction")
+
+
+# --------------------------------------------------------------------------
+# The ridge filter must not cost more because the camera has more pixels.
+# --------------------------------------------------------------------------
+
+
+def _synthetic_leaf(height, width, rib_sigma=14.0):
+    yy, xx = np.mgrid[0:height, 0:width]
+    mask = (((yy - height / 2) / (height * 0.42)) ** 2
+            + ((xx - width / 2) / (width * 0.47)) ** 2) < 1.0
+    grey = np.where(mask, 60.0, 8.0)
+    grey = grey + 90.0 * np.exp(-((yy - height / 2) ** 2) / (2 * rib_sigma ** 2)) * mask
+    return mask, np.repeat(grey[:, :, None], 3, axis=2).astype(np.float32)
+
+
+def test_ridge_response_is_unchanged_by_the_downsampling():
+    """`sato` costs pixels x sigma, and sigma is a fraction of the leaf's
+    half-width -- so a high-resolution flat-lay drives both up at once and the
+    stage takes hours. Filtering at sigma/k on a k-times smaller image is the
+    same scale-space location, and this pins that it really is."""
+    from skimage.morphology import medial_axis
+
+    from leaf_pose import midrib as rib
+
+    mask, image = _synthetic_leaf(600, 900)
+    _, distance = medial_axis(mask, return_distance=True)
+    assert max(0.40 * distance.max(), 1.0) > rib.MAX_FILTER_SIGMA, \
+        "this leaf is too small to exercise the downsampling path"
+
+    fast = rib.ridge_response(image, distance, mask)
+
+    original = rib.MAX_FILTER_SIGMA
+    try:
+        rib.MAX_FILTER_SIGMA = 1e9          # force the full-resolution path
+        exact = rib.ridge_response(image, distance, mask)
+    finally:
+        rib.MAX_FILTER_SIGMA = original
+
+    correlation = np.corrcoef(fast[mask], exact[mask])[0, 1]
+    assert correlation > 0.98, f"downsampled response diverged (r={correlation:.3f})"
+    # And both must still put the ridge where the ridge actually is.
+    middle = image.shape[1] // 2
+    assert abs(int(fast[:, middle].argmax()) - image.shape[0] // 2) <= 8
+    assert abs(int(exact[:, middle].argmax()) - image.shape[0] // 2) <= 8
+
+
+def test_small_leaves_take_the_exact_path_unchanged():
+    """A leaf whose sigmas are already small must not be resampled at all."""
+    from skimage.morphology import medial_axis
+
+    from leaf_pose import midrib as rib
+
+    mask, image = _synthetic_leaf(90, 140, rib_sigma=3.0)
+    _, distance = medial_axis(mask, return_distance=True)
+    assert 0.40 * distance.max() <= rib.MAX_FILTER_SIGMA
+
+    response = rib.ridge_response(image, distance, mask)
+    assert response.shape == mask.shape
+    assert response.max() > 0

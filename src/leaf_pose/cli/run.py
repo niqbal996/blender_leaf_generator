@@ -207,9 +207,15 @@ def run(
     say("==> midribs and keypoints")
     mm_per_pixel = measured.mm_per_pixel
     records: List[LeafRecord] = []
-    for instance in found:
+    for number, instance in enumerate(found, start=1):
         x0, y0, x1, y1 = instance.bbox
         crop = field.flat[y0:y1, x0:x1]
+        # Said before the work, not after. This stage is the slowest in the
+        # run on a high-resolution flat-lay and it used to print only on
+        # failure, so a capture whose leaves are a few thousand pixels across
+        # looked indistinguishable from a hang for as long as it took.
+        say(f"  leaf {instance.index} ({number}/{len(found)}) "
+            f"{x1 - x0}x{y1 - y0} px")
         specular = field.specular[y0:y1, x0:x1] if field.specular is not None else None
 
         fitted = rib.fit_midrib(instance.mask, image=crop, specular=specular,
