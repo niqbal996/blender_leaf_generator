@@ -336,6 +336,16 @@ def run(
             "its own ids starting at zero, so those folders each hold several unrelated\n"
             "leaves merged together and cannot be projected. Re-run P2:\n"
             f"    pose-segment --workdir {workdir} --backend sam3 --reuse-frames")
+    # prefix -> the frame stems that pass captured. "pass2_" is capture pass 2
+    # in p1/sources.json, which is how a view is matched to the session whose
+    # ids describe it.
+    frames_of_pass: Dict[str, set] = {}
+    for prefix in by_pass:
+        if not prefix:
+            continue
+        index = int(prefix[len("pass"):].rstrip("_"))
+        frames_of_pass[prefix] = {stem for stem, p in sources.items() if p == index}
+
     print(f"  {len(leaf_dirs)} leaf instance(s) with >= {min_frames} frames "
           f"across {len(by_pass)} capture pass(es)"
           + (", stem residual" if stem_dir else ", NO stem masks")
@@ -389,8 +399,17 @@ def run(
         stem_class, root_class = len(dirs), len(dirs) + 1
         tally = accumulate_votes(len(points), len(dirs) + 2)
         seen_here = 0
+        # Only this pass's own frames. The stem and root masks exist for every
+        # frame in the workdir, so a frame from another pass still produces a
+        # label map -- one with no leaf ids on it, because this pass has none
+        # there. Letting those vote means a leaf that only pass 1 can see
+        # collects skeleton votes from passes 0 and 2, and the majority in
+        # `_combine_passes` then calls a leaf the stem.
+        mine = frames_of_pass.get(prefix)
         for image_id in image_ids:
             image = reconstruction.images[image_id]
+            if mine is not None and Path(image.name).stem not in mine:
+                continue
             camera = camera_from_colmap(image, reconstruction.cameras[image.camera_id])
             label_map = build_label_map(dirs, stem_dir, root_dir,
                                         Path(image.name).stem,
@@ -421,6 +440,7 @@ def run(
             "none of the registered views had a leaf-instance mask -- the frame names in "
             f"{sparse_model} do not match the mask filenames in {p2 / 'masks'}")
 
+    total_views = sum(len(frames_of_pass.get(prefix, image_ids)) for prefix in by_pass)
     merged = merge_across_passes(per_pass, leaf_counts, merge_overlap)
     if len(by_pass) > 1:
         n_groups = len(set(merged.values())) if merged else 0
@@ -432,7 +452,7 @@ def run(
     # A leaf that won only a handful of points is not a leaf in 3D whatever it
     # was in 2D; its points are more usefully skeleton than a spurious organ.
     dropped = 0
-    for index in range(n_leaves):
+    for index in sorted({int(v) for v in np.unique(assignment) if v >= 0}):
         mask = assignment == index
         if 0 < int(mask.sum()) < min_points:
             assignment[mask] = SKELETON
@@ -440,8 +460,7 @@ def run(
 
     surviving = sorted({int(v) for v in np.unique(assignment) if v >= 0})
     report = _write_outputs(p5x, points, assignment, surviving, leaf_dirs,
-                            photo_rgb, used, len(image_ids) * len(by_pass),
-                            dropped, min_points)
+                            photo_rgb, used, total_views, dropped, min_points)
 
     print_checks("P5x", report)
     print(f"\n  {len(surviving)} leaf instance(s) in 3D, "

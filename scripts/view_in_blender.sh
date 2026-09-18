@@ -112,7 +112,9 @@ main() {
 
     echo "blender : $BLENDER"
     echo "workdir : $WIN_WORKDIR"
-    [[ ${#SCRIPT_ARGS[@]} -eq 0 ]] || echo "branches: ${SCRIPT_ARGS[*]}"
+    # "options", not "branches": --p5x selects a different phase to draw, not
+    # a geometry branch, and labelling it one read as a backend named --p5x.
+    [[ ${#SCRIPT_ARGS[@]} -eq 0 ]] || echo "options : ${SCRIPT_ARGS[*]}"
     exec "$BLENDER" ${BLENDER_ARGS[@]+"${BLENDER_ARGS[@]}"} \
         --python "$WIN_REPO" \
         -- --workdir "$WIN_WORKDIR" ${SCRIPT_ARGS[@]+"${SCRIPT_ARGS[@]}"}
