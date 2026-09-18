@@ -337,6 +337,23 @@ def _run_sam3(workdir, frames_dir, p2_dir, sources, use_roi, roi_padding, device
     for path in all_frames:
         per_pass.setdefault(sources.get(path.stem, 0), []).append(path)
 
+    # Masks from an earlier run of this workdir are cleared, not written over.
+    # The per-frame classes would be overwritten anyway, but only for frames
+    # this run also produces -- a shorter re-ingest leaves the surplus behind.
+    # masks/leaf_instances is worse: its *folder names* are the object ids, so
+    # a re-run adds a second set beside the first rather than replacing it.
+    # Measured on gaensefuss_1, where a re-run left 53 folders from the old
+    # naming next to 133 new ones and P5x read both as one capture.
+    stale = [d for d in (p2_dir / "masks", p2_dir / "alpha") if d.exists()]
+    if stale:
+        import shutil
+
+        counts = []
+        for folder in stale:
+            counts.append(f"{sum(1 for _ in folder.rglob('*.png'))} in {folder.name}")
+            shutil.rmtree(folder)
+        print(f"  clearing masks from an earlier run ({', '.join(counts)})")
+
     # Loaded once for every pass: the weights are 3.3 GB and a two-elevation
     # capture would otherwise pay for them twice.
     print(f"Loading {model_name} ...")

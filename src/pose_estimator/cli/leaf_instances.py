@@ -464,20 +464,29 @@ def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
     for index in surviving:
         rgb[assignment == index] = palette[index % len(palette)]
 
-    def dump(path: Path, keep: np.ndarray, colours: np.ndarray) -> int:
+    def dump(path: Path, keep: np.ndarray, colours: np.ndarray,
+             with_label: bool = False) -> int:
         if not keep.any():
             return 0
-        write_ply_vertices(path, {
+        fields = {
             "x": points[keep, 0].astype(np.float32),
             "y": points[keep, 1].astype(np.float32),
             "z": points[keep, 2].astype(np.float32),
             "red": colours[keep, 0], "green": colours[keep, 1], "blue": colours[keep, 2],
-        })
+        }
+        if with_label:
+            # Carried in the file itself, not only in instances.npy, so a
+            # reader that has the PLY has the segmentation. The Blender
+            # viewer runs in Blender's bundled Python and splits the cloud
+            # into one object per leaf from this column; matching a colour
+            # back to a leaf would be guessing at what the palette did.
+            fields["label"] = assignment[keep].astype(np.int32)
+        write_ply_vertices(path, fields)
         return int(keep.sum())
 
-    n_leaf_points = dump(p5x / "leaves.ply", assignment >= 0, rgb)
+    n_leaf_points = dump(p5x / "leaves.ply", assignment >= 0, rgb, with_label=True)
     n_skeleton = dump(p5x / "skeleton.ply", assignment == SKELETON, rgb)
-    dump(p5x / "segmented.ply", assignment != UNSEEN, rgb)
+    dump(p5x / "segmented.ply", assignment != UNSEEN, rgb, with_label=True)
     np.save(p5x / "instances.npy", assignment)
 
     per_leaf = {str(i): int((assignment == i).sum()) for i in surviving}

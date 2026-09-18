@@ -14,6 +14,11 @@
 #
 #   ./scripts/view_in_blender.sh runs/plant_9 --geometry-backend mapanything
 #
+# The P5x alternative -- leaf instances projected from SAM3's 2D ids, one
+# Blender object per leaf, plus the skeleton points:
+#
+#   ./scripts/view_in_blender.sh runs/plant_9 --p5x
+#
 # Blender inside WSL is the awkward option here: Ubuntu 20.04 ships a
 # libwayland-client too old for recent Blender builds, and Mesa 21.2's d3d12
 # driver predates the OpenGL 4.3 that Blender needs, so the GUI falls back and
@@ -77,6 +82,11 @@ main() {
                 else SCRIPT_ARGS+=("$1" "colmap,vggt_omega,mapanything"); shift; fi ;;
             --geometry-backend)
                 SCRIPT_ARGS+=("$1" "${2:-colmap}"); shift 2 ;;
+            # A script flag, not a Blender one: handed to Blender it would be
+            # silently ignored and the P5 scene would open instead, which
+            # looks exactly like P5x not working.
+            --p5x)
+                SCRIPT_ARGS+=("$1"); shift ;;
             *) BLENDER_ARGS+=("$1"); shift ;;
         esac
     done

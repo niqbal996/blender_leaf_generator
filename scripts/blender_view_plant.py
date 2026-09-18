@@ -147,7 +147,11 @@ def read_ply(path):
         rgb = np.stack([data["red"], data["green"], data["blue"]], axis=1).astype(float) / 255.0
     else:
         rgb = np.full((len(xyz), 3), 0.7)
-    return xyz, rgb
+    # P5x writes a per-point `label` column naming the leaf each point belongs
+    # to. Returned when it is there so the cloud can be split into one object
+    # per leaf; None keeps every existing caller unchanged.
+    label = data["label"].astype(np.int64) if "label" in names else None
+    return xyz, rgb, label
 
 
 def branch_dirs(workdir, backend="colmap"):
@@ -179,7 +183,8 @@ def load(workdir, backend="colmap"):
         graph = json.load(f)
 
     cloud_path = p5 / "structure.ply"
-    xyz, rgb = read_ply(cloud_path) if cloud_path.exists() else (np.zeros((0, 3)), None)
+    xyz, rgb, _ = (read_ply(cloud_path) if cloud_path.exists()
+                   else (np.zeros((0, 3)), None, None))
 
     stem = np.array(graph.get("stem_path_xyz") or []).reshape(-1, 3)
     return xyz, rgb, stem, graph.get("leaves", []), graph, tip_evidence(workdir, backend)
@@ -202,7 +207,7 @@ def tip_evidence(workdir, backend="colmap"):
     p4c, p5 = branch_dirs(workdir, backend)
     voted = p4c / "tips3d.ply"
     if voted.exists():
-        xyz, rgb = read_ply(voted)
+        xyz, rgb, _ = read_ply(voted)
         # Green carries how well supported each tip is. Drawing every cluster
         # the same size made twelve noise votes look exactly like the seven
         # real tips -- the detection was right and the picture was not.
@@ -214,7 +219,7 @@ def tip_evidence(workdir, backend="colmap"):
         out["voted"] = xyz
     prior = p5 / "tip_class.ply"
     if prior.exists():
-        out["prior"], _ = read_ply(prior)
+        out["prior"], _, _ = read_ply(prior)
 
     # Per-leaf membership, so each instance can be shown, hidden or checked on
     # its own. One merged cloud shows the colours but gives no way to ask
@@ -757,13 +762,85 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True,
             "graph": graph}
 
 
+def build_p5x(workdir, point_radius=None, frame=True, clear=True):
+    """Draw a P5x result: one object per leaf, plus the skeleton and root.
+
+    P5x is the alternative to P4c+P5 and its output is a different shape, so
+    it gets its own builder rather than a flag inside `build`. There is no
+    stem graph to draw -- no centreline, no midribs, no fitted tips -- because
+    nothing has been fitted: the leaves come from SAM3's own 2D instance ids
+    projected onto the cloud, and the skeleton is the tissue that voted stem.
+
+    The leaves are split into *separate objects* rather than drawn as one
+    coloured cloud. That is the whole reason to open this in Blender: each
+    leaf appears in the outliner under its own name, so it can be soloed,
+    hidden, or exported on its own. A single cloud coloured per leaf looks the
+    same in a screenshot and can do none of that.
+    """
+    workdir = Path(workdir)
+    p5x = workdir / "p5x"
+    cloud = p5x / "segmented.ply"
+    if not cloud.exists():
+        print(f"[plant] ERROR: {cloud} not found.")
+        print("[plant] Run `pose-leaf-instances --workdir <dir>` first. It needs a P2 from")
+        print("[plant] `pose-segment --backend sam3`, which is what writes the leaf ids.")
+        return None
+
+    xyz, rgb, label = read_ply(cloud)
+    if label is None:
+        print(f"[plant] ERROR: {cloud} has no `label` column, so it cannot be split")
+        print("[plant] into leaves. It was written before P5x recorded them -- re-run")
+        print("[plant] pose-leaf-instances to rewrite it.")
+        return None
+    if not len(xyz):
+        print(f"[plant] ERROR: {cloud} is empty.")
+        return None
+
+    if clear:
+        _PREPARED.clear()
+        clear_startup_scene()
+
+    low, high = xyz.min(axis=0), xyz.max(axis=0)
+    extent = float((high - low).max())
+    if point_radius is None:
+        point_radius = extent * 0.0022
+
+    # Matches the sentinels in cli/leaf_instances.py. Spelled out rather than
+    # imported: this file runs inside Blender's bundled Python, which cannot
+    # import the repo.
+    SKELETON, ROOT = -2, -3
+
+    leaves_coll = _collection("p5x_leaves")
+    drawn = 0
+    for leaf_id in sorted({int(v) for v in np.unique(label) if v >= 0}):
+        keep = label == leaf_id
+        add_point_cloud(xyz[keep], rgb[keep], point_radius, leaves_coll,
+                        name=f"p5x_leaf_{leaf_id:03d}")
+        drawn += 1
+
+    for value, name, coll in ((SKELETON, "p5x_skeleton", "p5x_skeleton"),
+                              (ROOT, "p5x_root", "p5x_root")):
+        keep = label == value
+        if keep.any():
+            add_point_cloud(xyz[keep], rgb[keep], point_radius,
+                            _collection(coll), name=name)
+
+    print(f"[plant] P5x: {drawn} leaves, "
+          f"{int((label == SKELETON).sum())} skeleton points, "
+          f"{int((label == ROOT).sum())} root points")
+    print("[plant] each leaf is its own object under the 'p5x_leaves' collection")
+    if frame:
+        frame_view((low + high) / 2.0, extent)
+    return {"leaves": drawn, "points": len(xyz), "extent": extent}
+
+
 def branch_extent(workdir, backend):
     """The longest side of a branch's P5 cloud, or None if it has not run."""
     _p4c, p5 = branch_dirs(workdir, backend)
     cloud = p5 / "structure.ply"
     if not cloud.exists():
         return None
-    xyz, _rgb = read_ply(cloud)
+    xyz, _rgb, _ = read_ply(cloud)
     if not len(xyz):
         return None
     return float((xyz.max(axis=0) - xyz.min(axis=0)).max())
@@ -939,8 +1016,12 @@ def main():
         print("[plant]   blender --python blender_view_plant.py -- --workdir runs/plant_9")
         return
     backends, single, align = resolve_branches(list(sys.argv))
+    want_p5x = ("--p5x" in script_args(list(sys.argv))
+                or os.environ.get("PLANT_P5X", "") not in ("", "0"))
     try:
-        if backends:
+        if want_p5x:
+            build_p5x(target)
+        elif backends:
             build_comparison(target, backends, align=align)
         else:
             build(target, backend=single,

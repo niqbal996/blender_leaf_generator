@@ -143,3 +143,39 @@ def test_every_leaf_gets_its_own_colour(n):
     palette = leaf_palette(n)
     assert len(palette) == n
     assert len({tuple(c) for c in palette}) == n
+
+
+# --------------------------------------------------------------------------
+# The Blender viewer splits the cloud by the PLY's own label column.
+# --------------------------------------------------------------------------
+
+
+def test_segmented_ply_carries_the_leaf_labels(tmp_path):
+    """One coloured cloud looks identical in a screenshot and can do nothing
+    else. Splitting it into an object per leaf is the reason to open it in
+    Blender at all, and the split is driven by this column -- matching a
+    colour back to a leaf would be guessing at what the palette did."""
+    from pose_estimator.cli.leaf_instances import _write_outputs
+    from pose_estimator.ply_io import read_ply_vertices
+
+    n = 300
+    points = np.random.default_rng(0).random((n, 3))
+    assignment = np.full(n, UNSEEN, np.int32)
+    assignment[:80] = 0
+    assignment[80:150] = 1
+    assignment[150:240] = SKELETON
+    assignment[240:290] = ROOT                      # 10 left UNSEEN
+
+    p5x = tmp_path / "p5x"
+    p5x.mkdir()
+    _write_outputs(p5x, points, assignment, [0, 1], [None, None],
+                   np.full((n, 3), 160, np.uint8), 12, 12, 0, 40)
+
+    fields = read_ply_vertices(p5x / "segmented.ply")
+    assert "label" in fields, "the viewer cannot split the cloud without this"
+
+    label = np.asarray(fields["label"]).astype(int)
+    assert len(label) == n - 10, "unseen points must not reach the scene"
+    assert set(np.unique(label)) == {0, 1, SKELETON, ROOT}
+    assert int((label == 0).sum()) == 80
+    assert int((label == SKELETON).sum()) == 90
