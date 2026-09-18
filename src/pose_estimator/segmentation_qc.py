@@ -69,6 +69,18 @@ def centroid_trajectory(mask_paths: Sequence[Path]) -> np.ndarray:
     return np.array(out, dtype=float)
 
 
+def _backend_of(p2_dir) -> str:
+    """Which P2 backend wrote these masks, from the prompts it recorded.
+
+    Only used to word the root advice: telling a SAM3 run to go and click a
+    point sends the reader to a tool that backend never consults.
+    """
+    try:
+        return json.loads((Path(p2_dir) / "prompts.json").read_text()).get("backend", "sam2")
+    except Exception:
+        return "sam2"
+
+
 def run_qc(
     frames_dir: Union[str, Path],
     p2_dir: Union[str, Path],
@@ -130,7 +142,20 @@ def run_qc(
         # the clamp -- silently, because every other check here is happy with
         # a mask that is merely smaller.
         if area and holder_b.any():
-            jaw_row = float(np.nonzero(holder_b)[0].mean())
+            # "The jaws" is where the tool grips the plant, not the whole
+            # tool. SAM2's holder mask is the jaw tip, so its mean row is the
+            # grip and the two readings agree. SAM3's holder mask is the
+            # entire pair of pliers lying across the turntable, whose mean row
+            # is well below the crown -- which put every root pixel "above the
+            # jaws" and reported a tracked root as lost in 0 of 20 frames.
+            # Restricting to holder pixels touching the plant is the grip
+            # under either backend, and falls back to the old reading when the
+            # holder is nowhere near the plant.
+            reach = max(3, int(0.02 * min(plant_b.shape)))
+            near = cv2.dilate(plant_b.astype(np.uint8),
+                              np.ones((reach, reach), np.uint8)) > 0
+            grip = holder_b & near
+            jaw_row = float(np.nonzero(grip if grip.any() else holder_b)[0].mean())
             rows = np.arange(plant_b.shape[0])[:, None]
             below_jaw_fractions.append(float((plant_b & (rows > jaw_row)).sum() / area))
         else:
@@ -237,9 +262,14 @@ def run_qc(
                     f"pass {p}: root in {s['frames_with_root']}/{s['num_frames']} frames "
                     f"(median {s['median_fraction_below_jaws']:.1%} of mask below the jaws)"
                     for p, s in sorted(root_summary.items()))
-                + (f" -- pass(es) {', '.join(starved)} lost the root. SAM2 was seeded on "
-                   f"foliage only; the jaws cut the root into a separate blob that needs "
-                   f"its own tracked object (pose-pick-prompts, click the root with 3=root)."
+                + (f" -- pass(es) {', '.join(starved)} lost the root. " + (
+                    "No noun phrase matched the root on most frames; try "
+                    "--sam3-root-prompts with other wording, or accept that this capture "
+                    "has no usable exposed root and pass --sam3-root-prompts with no values."
+                    if _backend_of(p2_dir) == "sam3" else
+                    "SAM2 was seeded on foliage only; the jaws cut the root into a separate "
+                    "blob that needs its own tracked object (pose-pick-prompts, click the "
+                    "root with 3=root).")
                    if starved else "")
             ) if root_summary else "no holder mask -- cannot locate the jaws",
         },

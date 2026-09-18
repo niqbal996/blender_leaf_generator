@@ -250,6 +250,9 @@ DINO_MODEL="facebook/dinov3-vitb16-pretrain-lvd1689m"
 SEEDS=(); SKIP_TO=""; SEED_BANK=""; SEEDS_FILE=""; SKIP_P4B=0
 BACKEND="dino"; SAM_CHECKPOINT=""; STOP_AFTER=""
 PROMPT_BANK=""; PROMPT_ROOT=""; NO_PROMPT_BANK=0; USE_GPU=0; LOW_TEXTURE=0; ARCHITECTURE=""; PERSISTENCE=""; PROMPT_POINTS=""; KEEP_GOING=0
+SEGMENT_BACKEND=""   # P2: sam2 (clicked points) or sam3 (text prompts)
+# SAM3 phrases, comma-separated so a phrase may contain spaces ("metal clamp").
+SAM3_PLANT_PROMPTS=""; SAM3_HOLDER_PROMPTS=""; SAM3_ROOT_PROMPTS=""; SAM3_CROP_PROMPT=""
 CAMERAS=""; ALLOW_MIXED=0; STRICT_MIDRIBS=0
 GEOMETRY_BACKEND="colmap"; MODEL_PYTHON=""; IMAGE_RESOLUTION=""; BUNDLE_ADJUST=0
 CARVE_CHECK=0; INTRINSICS_FROM=""; POSES_FROM=""; REUSE_CLASS_MAPS=0; COMPARE=""
@@ -360,6 +363,11 @@ while [[ $# -gt 0 ]]; do
         --seed-bank) SET[seed_bank]=1;    SEED_BANK="$2"; shift 2 ;;
         --prompt-bank) SET[prompt_bank]=1;  PROMPT_BANK="$2"; shift 2 ;;
         --prompt-points) SET[prompt_points]=1; PROMPT_POINTS="$2"; shift 2 ;;
+        --segment-backend) SET[segment_backend]=1; SEGMENT_BACKEND="$2"; shift 2 ;;
+        --sam3-plant-prompts)  SET[sam3_plant_prompts]=1;  SAM3_PLANT_PROMPTS="$2"; shift 2 ;;
+        --sam3-holder-prompts) SET[sam3_holder_prompts]=1; SAM3_HOLDER_PROMPTS="$2"; shift 2 ;;
+        --sam3-root-prompts)   SET[sam3_root_prompts]=1;   SAM3_ROOT_PROMPTS="$2"; shift 2 ;;
+        --sam3-crop-prompt)    SET[sam3_crop_prompt]=1;    SAM3_CROP_PROMPT="$2"; shift 2 ;;
         --prompt-root) SET[prompt_root]=1;  PROMPT_ROOT="$2"; shift 2 ;;
         --no-prompt-bank) NO_PROMPT_BANK=1; shift ;;
         --use-gpu) SET[use_gpu]=1;      USE_GPU=1; shift ;;
@@ -444,6 +452,11 @@ load_config() {
                 prompt_bank)   PROMPT_BANK="$value" ;;
                 prompt_root)   PROMPT_ROOT="$value" ;;
                 prompt_points) PROMPT_POINTS="$value" ;;
+                segment_backend) SEGMENT_BACKEND="$value" ;;
+                sam3_plant_prompts)  SAM3_PLANT_PROMPTS="$value" ;;
+                sam3_holder_prompts) SAM3_HOLDER_PROMPTS="$value" ;;
+                sam3_root_prompts)   SAM3_ROOT_PROMPTS="$value" ;;
+                sam3_crop_prompt)    SAM3_CROP_PROMPT="$value" ;;
                 seed_bank)     SEED_BANK="$value" ;;
                 architecture)  ARCHITECTURE="$value" ;;
                 hf_token)      HF_TOKEN_ARG="$value" ;;
@@ -461,7 +474,10 @@ load_config() {
                 *) echo "$file:$line_no: unknown setting '$key'. Valid keys are the long" >&2
                    echo "  options with dashes as underscores: prompt_bank, seed_bank," >&2
                    echo "  architecture, hf_token, dino_model, backend, sam_checkpoint," >&2
-                   echo "  cameras, prompt_points, prompt_root, min_persistence_ratio," >&2
+                   echo "  cameras, prompt_points, prompt_root, segment_backend," >&2
+                   echo "  sam3_plant_prompts, sam3_holder_prompts, sam3_root_prompts," >&2
+                   echo "  sam3_crop_prompt," >&2
+                   echo "  min_persistence_ratio," >&2
                    echo "  low_texture, use_gpu, skip_p4b, keep_going, allow_mixed_capture,
                    strict_midribs." >&2
                    exit 1 ;;
@@ -1039,46 +1055,83 @@ if [[ -n "$SKIP_TO" ]]; then
 fi
 
 if should_run p1p2; then
-    phase "P1+P2  sharpest frames + SAM2 plant/holder masks   -> $WORKDIR/p1, p2"
     n_passes=$(( ${#VIDEOS[@]} + ${#PHOTOS[@]} ))
-    [[ $n_passes -gt 1 ]] && echo "  $n_passes capture passes, tracked separately, solved together in P3"
-    # --sam-checkpoint applies here too, not just to P4c: it used to be read
-    # only by the later phase, so pointing it at relocated weights left P2
-    # searching the default locations and failing.
-    SAM_CKPT="$SAM_CHECKPOINT"
-    if [[ -n "$SAM_CKPT" && -d "$SAM_CKPT" ]]; then
-        SAM_CKPT="${SAM_CKPT%/}/$SAM2_CHECKPOINT_NAME"
-    fi
-    if [[ -n "$SAM_CKPT" && ! -f "$SAM_CKPT" ]]; then
-        echo "ERROR: --sam-checkpoint $SAM_CHECKPOINT does not exist." >&2
-        exit 1
-    fi
-    if [[ -z "$SAM_CKPT" ]] && ! SAM_CKPT="$(find_sam_checkpoint)"; then
-        sam_checkpoint_error "$SAM2_CHECKPOINT_NAME"
-        exit 1
-    fi
-    echo "  SAM2 checkpoint: $SAM_CKPT"
-    if [[ -n "$PROMPT_BANK" ]]; then
-        echo "  plant/holder prompts: $PROMPT_BANK"
-    elif [[ -f "$WORKDIR/p2/prompts_clicked.json" ]]; then
-        echo "  plant/holder prompts: clicked, $WORKDIR/p2/prompts_clicked.json"
+    if [[ "$SEGMENT_BACKEND" == "sam3" ]]; then
+        phase "P1+P2  sharpest frames + SAM3 plant/holder masks   -> $WORKDIR/p1, p2"
+        [[ $n_passes -gt 1 ]] && echo "  $n_passes capture passes, tracked separately, solved together in P3"
+        # No checkpoint hunt and no prompt sources: SAM3 is told what the
+        # plant is, so none of the three click mechanisms below applies. The
+        # weights come from HuggingFace and the repo is gated, which is the
+        # one thing that can stop this phase before it starts.
+        echo "  backend: SAM3 (text prompts -- no clicking, no colour prepass)"
+        if [[ -f "$WORKDIR/p2/prompts_clicked.json" || -n "$PROMPT_BANK" ]]; then
+            echo "  note: this workdir has clicked prompts or a prompt bank; SAM3 ignores both."
+        fi
+        SAM3_ARGS=()
+        for spec in "plant:$SAM3_PLANT_PROMPTS" "holder:$SAM3_HOLDER_PROMPTS" \
+                    "root:$SAM3_ROOT_PROMPTS"; do
+            cls="${spec%%:*}"; csv="${spec#*:}"
+            [[ -n "$csv" ]] || continue
+            SAM3_ARGS+=("--sam3-${cls}-prompts")
+            # "none" is how a config file says "this capture has no exposed
+            # root": the flag is passed with no values, which argparse reads
+            # as an empty list and the backend reads as "skip this class".
+            [[ "$csv" == "none" ]] && continue
+            IFS=',' read -ra phrases <<< "$csv"
+            for phrase in "${phrases[@]}"; do
+                phrase="${phrase#"${phrase%%[![:space:]]*}"}"
+                phrase="${phrase%"${phrase##*[![:space:]]}"}"
+                [[ -n "$phrase" ]] && SAM3_ARGS+=("$phrase")
+            done
+        done
+        [[ -n "$SAM3_CROP_PROMPT" ]] && SAM3_ARGS+=(--sam3-crop-prompt "$SAM3_CROP_PROMPT")
+        $PY -m pose_estimator.cli.segment \
+            ${VIDEOS[0]:+--video} ${VIDEOS[@]+"${VIDEOS[@]}"} \
+            ${PHOTOS[0]:+--photos} ${PHOTOS[@]+"${PHOTOS[@]}"} --workdir "$WORKDIR" \
+            --backend sam3 ${SAM3_ARGS[@]+"${SAM3_ARGS[@]}"} \
+            $([[ "$ALLOW_MIXED" == 1 ]] && echo --allow-mixed-capture)
+        gate p1p2 "$WORKDIR/p2/qc.json"
     else
-        warn "  WARNING: no plant/holder prompts -- falling back to the COLOUR RULE."
-        echo "    That rule picks the largest green-dominant blob, and an orange or" >&2
-        echo "    amber plier grip is green-dominant in RGB. It has seeded on the tool" >&2
-        echo "    on more than one capture here. Check p2/qc.json before P3." >&2
-        echo "    A P4c --seed-bank does NOT feed P2: that bank holds organ classes." >&2
-        echo "    The P2 bank is p2/prompt_bank.npz, written by pose-pick-prompts." >&2
+        phase "P1+P2  sharpest frames + SAM2 plant/holder masks   -> $WORKDIR/p1, p2"
+        [[ $n_passes -gt 1 ]] && echo "  $n_passes capture passes, tracked separately, solved together in P3"
+        # --sam-checkpoint applies here too, not just to P4c: it used to be read
+        # only by the later phase, so pointing it at relocated weights left P2
+        # searching the default locations and failing.
+        SAM_CKPT="$SAM_CHECKPOINT"
+        if [[ -n "$SAM_CKPT" && -d "$SAM_CKPT" ]]; then
+            SAM_CKPT="${SAM_CKPT%/}/$SAM2_CHECKPOINT_NAME"
+        fi
+        if [[ -n "$SAM_CKPT" && ! -f "$SAM_CKPT" ]]; then
+            echo "ERROR: --sam-checkpoint $SAM_CHECKPOINT does not exist." >&2
+            exit 1
+        fi
+        if [[ -z "$SAM_CKPT" ]] && ! SAM_CKPT="$(find_sam_checkpoint)"; then
+            sam_checkpoint_error "$SAM2_CHECKPOINT_NAME"
+            exit 1
+        fi
+        echo "  SAM2 checkpoint: $SAM_CKPT"
+        if [[ -n "$PROMPT_BANK" ]]; then
+            echo "  plant/holder prompts: $PROMPT_BANK"
+        elif [[ -f "$WORKDIR/p2/prompts_clicked.json" ]]; then
+            echo "  plant/holder prompts: clicked, $WORKDIR/p2/prompts_clicked.json"
+        else
+            warn "  WARNING: no plant/holder prompts -- falling back to the COLOUR RULE."
+            echo "    That rule picks the largest green-dominant blob, and an orange or" >&2
+            echo "    amber plier grip is green-dominant in RGB. It has seeded on the tool" >&2
+            echo "    on more than one capture here. Check p2/qc.json before P3." >&2
+            echo "    A P4c --seed-bank does NOT feed P2: that bank holds organ classes." >&2
+            echo "    The P2 bank is p2/prompt_bank.npz, written by pose-pick-prompts." >&2
+        fi
+        $PY -m pose_estimator.cli.segment \
+            ${VIDEOS[0]:+--video} ${VIDEOS[@]+"${VIDEOS[@]}"} \
+            ${PHOTOS[0]:+--photos} ${PHOTOS[@]+"${PHOTOS[@]}"} --workdir "$WORKDIR" \
+            --checkpoint "$SAM_CKPT" \
+            ${PROMPT_BANK:+--prompt-bank "$PROMPT_BANK"} \
+            ${PROMPT_BANK:+--dino-model "$DINO_MODEL"} \
+            ${PROMPT_POINTS:+--prompt-points "$PROMPT_POINTS"} \
+            $([[ "$ALLOW_MIXED" == 1 ]] && echo --allow-mixed-capture)
+        gate p1p2 "$WORKDIR/p2/qc.json"
     fi
-    $PY -m pose_estimator.cli.segment \
-        ${VIDEOS[0]:+--video} ${VIDEOS[@]+"${VIDEOS[@]}"} \
-        ${PHOTOS[0]:+--photos} ${PHOTOS[@]+"${PHOTOS[@]}"} --workdir "$WORKDIR" \
-        --checkpoint "$SAM_CKPT" \
-        ${PROMPT_BANK:+--prompt-bank "$PROMPT_BANK"} \
-        ${PROMPT_BANK:+--dino-model "$DINO_MODEL"} \
-        ${PROMPT_POINTS:+--prompt-points "$PROMPT_POINTS"} \
-        $([[ "$ALLOW_MIXED" == 1 ]] && echo --allow-mixed-capture)
-    gate p1p2 "$WORKDIR/p2/qc.json"
 fi
 
 if should_run p3; then

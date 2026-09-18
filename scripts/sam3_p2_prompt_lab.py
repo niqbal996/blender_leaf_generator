@@ -11,6 +11,10 @@
         --group plant "leaf" "stem" --group holder "pliers" "metal clamp" "pot" \
         --out /tmp/sam3_p2_lab2
 
+    # no P2 at all -- SAM3 finds its own crop, on a bare folder of frames
+    python scripts/sam3_p2_prompt_lab.py --images /any/folder/of/frames \
+        --group plant "leaf" "stem" --out /tmp/sam3_bare
+
     # also check the localisation pass the real backend would need
     python scripts/sam3_p2_prompt_lab.py --images ... --p2 ... --localize
 
@@ -26,7 +30,13 @@ about the *other two* classes: `masks/holder` is read by P4a, P4b, P3 and P5,
 and `masks/root` is what P4c uses to place the root class. A SAM3 P2 that
 produces a beautiful plant mask and no holder mask is not a P2.
 
-So this script scores wording against the P2 masks already on disk:
+`--p2` is optional, and only turns scoring on. Without it SAM3 locates its own
+crop on a subsample of full frames (`--crop-from sam3`, the default in that
+case) and the run reports what each phrase found with no reference to compare
+it to -- which is all a bare folder of frames can support, and enough to judge
+wording by eye from the overlays.
+
+With `--p2`, this script scores wording against the P2 masks already on disk:
 
   * `iou_plant` / `iou_holder` -- agreement with that reference class.
   * `inside_plant` -- what fraction of the phrase's own pixels are plant. A
@@ -108,18 +118,22 @@ def fraction_of(part: np.ndarray, whole: np.ndarray) -> float:
     return float((part & whole).sum()) / total if total else 0.0
 
 
-def load_reference(p2_dir: Path, stem: str, box, shape) -> Dict[str, np.ndarray]:
+def load_reference(p2_dir: Optional[Path], stem: str, box, shape) -> Dict[str, np.ndarray]:
     """P2's own masks for one frame, cropped to the window SAM3 saw.
 
     A class P2 never wrote -- `root` on a run whose clicks lost it -- comes
     back as an empty mask rather than missing, so the metrics stay comparable
     across frames and the zero is visible in the table instead of absent.
+
+    With no `p2_dir` at all every class is empty and the IoU columns are
+    meaningless; `--p2` is what turns scoring on, and the caller drops those
+    columns from the table when it is absent.
     """
     height, width = shape
     out = {}
     for name in ("plant", "holder", "root"):
-        path = p2_dir / "masks" / name / f"{stem}.png"
-        full = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE) if path.exists() else None
+        path = (p2_dir / "masks" / name / f"{stem}.png") if p2_dir else None
+        full = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE) if (path and path.exists()) else None
         if full is None:
             out[name] = np.zeros((height, width), bool)
             continue
@@ -128,8 +142,70 @@ def load_reference(p2_dir: Path, stem: str, box, shape) -> Dict[str, np.ndarray]
     return out
 
 
+def crop_from_sam3(processor, model, torch, frame_paths, phrase: str, stride: int,
+                   padding: float, device: str):
+    """A plant-following crop solved by SAM3 itself, with no P2 in the loop.
+
+    This is what makes the lab runnable on a bare folder of frames, and it is
+    also the piece a real P2 backend needs: inside P2 there are no masks to
+    crop from, and the colour prepass that would otherwise supply the window
+    is the thing that fails when a pot or a pair of pliers is in shot.
+
+    Cheap on purpose. It runs on every `stride`th frame at full resolution --
+    enough to say where the plant is, which is all a crop window needs -- and
+    the frames in between take an interpolated centre. The window is one fixed
+    size for the whole sequence, as in `solve_tracking_crop` and
+    `crop_from_masks`: the frames are stacked into one tensor so they must
+    agree, and a per-frame size would rescale the plant frame to frame, which
+    is exactly the apparent motion that makes tracking harder.
+    """
+    from sam3_leaf_track import TrackingCrop
+
+    sub = list(range(0, len(frame_paths), stride))
+    if sub[-1] != len(frame_paths) - 1:
+        sub.append(len(frame_paths) - 1)   # both ends anchored, so nothing extrapolates
+    print(f"  locating the plant with {phrase!r} on {len(sub)} of {len(frame_paths)} full frames")
+
+    video = load_cropped_video([frame_paths[i] for i in sub], None)
+    full_h, full_w = video[0].shape[:2]
+    unions, _ = run_group(processor, model, torch, video, [phrase], device)
+
+    centres = np.full((len(frame_paths), 2), np.nan)
+    spans = []
+    for k, frame_index in enumerate(sub):
+        mask = unions.get(k, {}).get(phrase)
+        if mask is None or not mask.any():
+            continue
+        ys, xs = np.nonzero(mask)
+        centres[frame_index] = ((xs.min() + xs.max()) / 2.0, (ys.min() + ys.max()) / 2.0)
+        spans.append(max(xs.max() - xs.min(), ys.max() - ys.min()))
+    if not spans:
+        raise SystemExit(
+            f"SAM3 did not find {phrase!r} in any full frame, so there is nothing to crop to. "
+            "Try --crop-phrase with different wording, or pass --p2 to crop from existing masks.")
+    print(f"    found it in {len(spans)}/{len(sub)} of them; largest span {max(spans)} px")
+
+    for axis in (0, 1):
+        col = centres[:, axis]
+        bad = np.isnan(col)
+        if bad.all():
+            col[:] = (full_w if axis == 0 else full_h) / 2.0
+        elif bad.any():
+            col[bad] = np.interp(np.flatnonzero(bad), np.flatnonzero(~bad), col[~bad])
+
+    side = int(min(min(full_w, full_h), max(spans) * (1.0 + 2.0 * padding)))
+    side = max(side, 64)
+    boxes = []
+    for cx, cy in centres:
+        x0 = max(0, min(int(round(cx - side / 2)), full_w - side))
+        y0 = max(0, min(int(round(cy - side / 2)), full_h - side))
+        boxes.append((x0, y0, x0 + side, y0 + side))
+    return TrackingCrop(boxes=boxes, width=side, height=side,
+                        frame_width=full_w, frame_height=full_h)
+
+
 def draw_panel(view_bgr, by_phrase: Dict[str, np.ndarray], phrases: Sequence[str],
-               reference: Dict[str, np.ndarray], label: str):
+               reference: Optional[Dict[str, np.ndarray]], label: str):
     """photo | SAM3 coloured by phrase | P2's plant and holder, for the eye.
 
     The numbers cannot distinguish "SAM3 disagreed with P2" from "SAM3 was
@@ -147,15 +223,19 @@ def draw_panel(view_bgr, by_phrase: Dict[str, np.ndarray], phrases: Sequence[str
                                        cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(sam3, contours, -1, colour.tolist(), 2)
 
-    ref = view_bgr.copy()
-    for name, colour in (("plant", (90, 210, 100)), ("holder", (200, 60, 200)),
-                         ("root", (40, 140, 240))):
-        mask = reference[name]
-        if mask.any():
-            ref[mask] = (0.45 * ref[mask] + 0.55 * np.array(colour)).astype(np.uint8)
+    columns = [view_bgr, sam3]
+    lines = [label, "  ".join(f"[{p}]" for p in phrases)]
+    if reference is not None:
+        ref = view_bgr.copy()
+        for name, colour in (("plant", (90, 210, 100)), ("holder", (200, 60, 200)),
+                             ("root", (40, 140, 240))):
+            mask = reference[name]
+            if mask.any():
+                ref[mask] = (0.45 * ref[mask] + 0.55 * np.array(colour)).astype(np.uint8)
+        columns.append(ref)
+        lines.append("reference: P2 plant/holder/root")
 
-    panel = np.hstack([view_bgr, sam3, ref])
-    lines = [label, "  ".join(f"[{p}]" for p in phrases), "reference: P2 plant/holder/root"]
+    panel = np.hstack(columns)
     for row, text in enumerate(lines):
         for colour, thick in (((0, 0, 0), 4), ((255, 255, 255), 1)):
             cv2.putText(panel, text, (14, 30 + 28 * row), cv2.FONT_HERSHEY_SIMPLEX,
@@ -203,8 +283,16 @@ def measure(mask: np.ndarray, reference: Dict[str, np.ndarray], instances: int) 
     }
 
 
-def print_table(title: str, rows: Dict[str, dict]) -> None:
+def print_table(title: str, rows: Dict[str, dict], scored: bool = True) -> None:
+    """Without a reference every IoU column is 0.000 by construction, which
+    reads as a measurement rather than as the absence of one -- so drop them."""
     print(f"\n{title}")
+    if not scored:
+        print(f"    {'phrase':<18} {'frames':>8} {'inst':>5} {'area':>8}")
+        for phrase, s in rows.items():
+            print(f"    {phrase:<18} {s['frames']:>3}/{s['of']:<4} {s['instances']:>5} "
+                  f"{s['area']:>8}")
+        return
     print(f"    {'phrase':<18} {'frames':>8} {'inst':>5} {'area':>8} {'IoU pl':>7} "
           f"{'IoU ho':>7} {'in pl':>6} {'in ho':>6} {'cov pl':>7} {'cov ho':>7}")
     for phrase, s in rows.items():
@@ -356,9 +444,19 @@ def localize(processor, model, torch, frame_paths, phrase: str, stride: int,
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--images", required=True, help="<workdir>/p1/frames")
-    p.add_argument("--p2", required=True, type=Path,
-                   help="<workdir>/p2 from an existing SAM2 run -- the reference to score against")
+    p.add_argument("--images", required=True, help="<workdir>/p1/frames, or any folder of frames")
+    p.add_argument("--p2", type=Path, default=None,
+                   help="<workdir>/p2 from an existing SAM2 run, to score against. OPTIONAL: "
+                        "without it the lab still runs and reports what each phrase found, it "
+                        "just has no reference to compute IoU against")
+    p.add_argument("--crop-from", choices=("p2", "sam3", "none"), default=None,
+                   help="where the tracking crop comes from. Default: 'p2' when --p2 is given, "
+                        "'sam3' otherwise -- which is what a real P2 backend would have to do")
+    p.add_argument("--crop-phrase", default="plant",
+                   help="the noun phrase --crop-from sam3 locates the subject with")
+    p.add_argument("--crop-stride", type=int, default=8,
+                   help="locate the plant on every Nth full frame; the rest interpolate. "
+                        "A crop window does not need every frame measured")
     p.add_argument("--out", required=True)
     p.add_argument("--group", nargs="+", action="append", metavar=("NAME PHRASE", ""),
                    help="a P2 class name followed by the phrases to try for it. One SAM3 "
@@ -411,20 +509,40 @@ def main() -> None:
     frame_paths = frame_paths[::args.stride]
     print(f"\n{len(frame_paths)} frames: {frame_paths[0].name} .. {frame_paths[-1].name}")
 
-    crop = crop_from_masks(frame_paths, args.p2 / "masks" / "plant", args.pad)
-    print(f"crop {crop.width}x{crop.height} of {crop.frame_width}x{crop.frame_height} "
-          f"(from the reference P2 masks)")
-    video = load_cropped_video(frame_paths, crop)
-
-    references = [load_reference(args.p2, path.stem, crop.boxes[i],
-                                 (crop.height, crop.width))
-                  for i, path in enumerate(frame_paths)]
-    for name in ("plant", "holder", "root"):
-        present = sum(1 for r in references if r[name].any())
-        print(f"  reference {name:<7} present in {present}/{len(references)} frames")
-
     import torch
     processor, model = load_model(args.model, args.device)
+
+    # --- the crop window ---
+    source = args.crop_from or ("p2" if args.p2 else "sam3")
+    if source == "p2":
+        if not args.p2:
+            raise SystemExit("--crop-from p2 needs --p2")
+        crop = crop_from_masks(frame_paths, args.p2 / "masks" / "plant", args.pad)
+        print(f"crop {crop.width}x{crop.height} of {crop.frame_width}x{crop.frame_height} "
+              f"(from the reference P2 masks)")
+    elif source == "sam3":
+        crop = crop_from_sam3(processor, model, torch, frame_paths, args.crop_phrase,
+                              args.crop_stride, args.pad, args.device)
+        print(f"crop {crop.width}x{crop.height} of {crop.frame_width}x{crop.frame_height} "
+              f"(located by SAM3 -- no P2 involved)")
+    else:
+        crop = None
+        print("no crop -- full frames. SAM3 works at 1008px, so a small plant in a wide "
+              "shot has very little resolution left to segment")
+
+    video = load_cropped_video(frame_paths, crop)
+    shape = (crop.height, crop.width) if crop else video[0].shape[:2]
+    boxes = crop.boxes if crop else [(0, 0, shape[1], shape[0])] * len(frame_paths)
+
+    scored = args.p2 is not None
+    references = [load_reference(args.p2, path.stem, boxes[i], shape)
+                  for i, path in enumerate(frame_paths)]
+    if scored:
+        for name in ("plant", "holder", "root"):
+            present = sum(1 for r in references if r[name].any())
+            print(f"  reference {name:<7} present in {present}/{len(references)} frames")
+    else:
+        print("  no --p2: reporting what each phrase found, with nothing to score it against")
 
     # --- one session per group ---
     all_masks: Dict[int, Dict[str, np.ndarray]] = defaultdict(dict)
@@ -440,13 +558,14 @@ def main() -> None:
             for i in range(len(video)):
                 mask = unions.get(i, {}).get(phrase)
                 if mask is None:
-                    mask = np.zeros((crop.height, crop.width), bool)
+                    mask = np.zeros(shape, bool)
                 all_masks[i][phrase] = mask
                 all_counts[i][phrase] = counts.get(i, {}).get(phrase, 0)
                 per_frame.append(measure(mask, references[i], all_counts[i][phrase]))
             per_phrase[phrase] = per_frame
             rows[phrase] = score(per_frame, len(video))
-        print_table(f"group {name!r} -- per phrase, averaged over the frames it fired on", rows)
+        print_table(f"group {name!r} -- per phrase, averaged over the frames it fired on",
+                    rows, scored)
         results[name] = {"phrases": phrases, "scores": rows}
 
     # --- combinations, because P2 wants one mask per class ---
@@ -457,7 +576,7 @@ def main() -> None:
             continue
         per_frame = []
         for i in range(len(video)):
-            union = np.zeros((crop.height, crop.width), bool)
+            union = np.zeros(shape, bool)
             instances = 0
             for phrase in usable:
                 union |= all_masks[i][phrase]
@@ -466,7 +585,7 @@ def main() -> None:
         combo_rows["+".join(usable)] = score(per_frame, len(video))
     if combo_rows:
         print_table("unions -- what a P2 plant mask built from these phrases would score",
-                    combo_rows)
+                    combo_rows, scored)
     results["combinations"] = combo_rows
 
     # --- overlays ---
@@ -482,7 +601,7 @@ def main() -> None:
                 d = out_dir / "masks" / phrase.replace(" ", "_")
                 d.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(d / f"{path.stem}.png"), mask.astype(np.uint8) * 255)
-            for name, mask in references[i].items():
+            for name, mask in (references[i].items() if scored else ()):
                 d = out_dir / "masks" / f"reference_{name}"
                 d.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(d / f"{path.stem}.png"), mask.astype(np.uint8) * 255)
@@ -491,12 +610,13 @@ def main() -> None:
         label = f"{path.stem}   " + "  ".join(
             f"{p}:{all_counts[i][p]}" for p in ordered if all_counts[i][p])
         cv2.imwrite(str(out_dir / f"frame_{i:04d}.jpg"),
-                    draw_panel(view, all_masks[i], ordered, references[i], label),
+                    draw_panel(view, all_masks[i], ordered,
+                               references[i] if scored else None, label),
                     [cv2.IMWRITE_JPEG_QUALITY, 88])
 
     payload = {"frames": len(video),
                "frame_names": [p.name for p in frame_paths],
-               "crop": crop.to_dict(),
+               "crop": crop.to_dict() if crop else None,
                "groups": results,
                "per_phrase_per_frame": per_phrase,
                "settings": {k: str(v) for k, v in vars(args).items()}}

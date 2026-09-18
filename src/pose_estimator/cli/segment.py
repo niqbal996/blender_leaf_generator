@@ -74,6 +74,14 @@ def run(
     dino_size: int = 896,
     prompt_points: int = 3,
     allow_mixed_capture: bool = False,
+    backend: str = "sam2",
+    sam3_model: str = "facebook/sam3",
+    sam3_plant_prompts: Optional[list] = None,
+    sam3_holder_prompts: Optional[list] = None,
+    sam3_root_prompts: Optional[list] = None,
+    sam3_crop_prompt: Optional[str] = None,
+    sam3_crop_stride: int = 8,
+    sam3_no_instances: bool = False,
 ) -> dict:
     workdir.mkdir(parents=True, exist_ok=True)
     frames_dir = workdir / "p1" / "frames"
@@ -159,6 +167,20 @@ def run(
         sources = {p.stem: 0 for p in sorted(frames_dir.glob("frame_*.jpg"))}
         sources_file.parent.mkdir(parents=True, exist_ok=True)
         sources_file.write_text(json.dumps(sources, indent=2))
+
+    # The SAM3 backend is told what the plant is rather than where it is, so
+    # every clicked-prompt mechanism below -- the click file, the point
+    # overrides, the DINO prompt bank, the root re-acquirer -- has nothing to
+    # do. It is skipped wholesale rather than made conditional in ten places.
+    if backend == "sam3":
+        return _run_sam3(
+            workdir=workdir, frames_dir=frames_dir, p2_dir=p2_dir, sources=sources,
+            use_roi=use_roi, roi_padding=roi_padding, device=device,
+            model_name=sam3_model, plant_prompts=sam3_plant_prompts,
+            holder_prompts=sam3_holder_prompts, root_prompts=sam3_root_prompts,
+            crop_prompt=sam3_crop_prompt, crop_stride=sam3_crop_stride,
+            save_instances=not sam3_no_instances,
+        )
 
     # Clicked prompts, one set per pass, in full-frame coordinates. Found
     # automatically at the default path so a re-run after pose-pick-prompts
@@ -283,6 +305,85 @@ def run(
 
     return report
 
+
+
+def _run_sam3(workdir, frames_dir, p2_dir, sources, use_roi, roi_padding, device,
+              model_name, plant_prompts, holder_prompts, root_prompts,
+              crop_prompt, crop_stride, save_instances) -> dict:
+    """P2 via SAM3 text prompts. Same artifacts, same QC, no clicking.
+
+    Split out of `run` rather than threaded through it because the two
+    backends share only their output: everything `run` does between the frames
+    and the masks exists to place or recover a click.
+    """
+    from pose_estimator.segmentation_sam3 import (
+        DEFAULT_CROP_PROMPT, Sam3Prompts, load_sam3, segment_sequence_sam3)
+
+    prompts = Sam3Prompts(
+        plant=list(plant_prompts) if plant_prompts else Sam3Prompts().plant,
+        holder=list(holder_prompts) if holder_prompts else Sam3Prompts().holder,
+        # An explicit empty list is a real choice -- "this capture has no
+        # exposed root" -- so only `None` falls back to the default.
+        root=list(root_prompts) if root_prompts is not None else Sam3Prompts().root,
+        crop=crop_prompt or DEFAULT_CROP_PROMPT,
+    )
+
+    all_frames = sorted(frames_dir.glob("frame_*.jpg"))
+    per_pass = {}
+    for path in all_frames:
+        per_pass.setdefault(sources.get(path.stem, 0), []).append(path)
+
+    # Loaded once for every pass: the weights are 3.3 GB and a two-elevation
+    # capture would otherwise pay for them twice.
+    print(f"Loading {model_name} ...")
+    session = load_sam3(model_name, device)
+
+    combined_stats, crops, boxes_by_stem = [], {}, {}
+    for pass_index in sorted(per_pass):
+        paths = per_pass[pass_index]
+        print(f"Segmenting pass {pass_index} ({len(paths)} frames) with SAM3...")
+        result = segment_sequence_sam3(
+            frames_dir=frames_dir,
+            out_dir=p2_dir,
+            prompts=prompts,
+            use_roi=use_roi,
+            roi_padding=roi_padding,
+            device=device,
+            frame_paths=paths,
+            crop_stride=crop_stride,
+            save_instances=save_instances,
+            session=session,
+        )
+        combined_stats.extend(result["per_frame"])
+        crops[str(pass_index)] = result["crop"]
+        if result["crop"]:
+            for path, box in zip(paths, result["crop"]["boxes"]):
+                boxes_by_stem[path.stem] = box
+
+    with open(p2_dir / "frame_stats.json", "w") as f:
+        json.dump(combined_stats, f, indent=2)
+    with open(p2_dir / "crops_per_pass.json", "w") as f:
+        json.dump(crops, f, indent=2)
+
+    all_boxes = [boxes_by_stem[p.stem] for p in all_frames] if boxes_by_stem else None
+
+    print("Scoring the segmentation...")
+    report = run_qc(frames_dir, p2_dir, sources=sources)
+    # `mask_covers_its_own_prompts` is deliberately absent: there are no
+    # clicked points to fall outside a mask. The check it stood in for --
+    # did the mask keep only part of the plant -- is answered instead by the
+    # per-phrase match counts printed above, where a phrase that matched on
+    # few frames is the same warning in the backend's own terms.
+    with open(p2_dir / "qc.json", "w") as f:
+        json.dump(report, f, indent=2)
+
+    write_overlays(frames_dir, p2_dir, crop_boxes=all_boxes)
+    write_area_plot(p2_dir, report)
+
+    print_checks("P2", report)
+    print(f"\n  median plant mask area: {report['plant_area_px']['median']:.0f} px")
+    print(f"  artifacts + diagnostics in {p2_dir}")
+    return report
 
 
 def _warn_about_uneven_root_prompts(clicked, per_pass) -> None:
@@ -522,6 +623,38 @@ def main(argv: Optional[list] = None) -> None:
              "order). Only for a capture you know is right but whose EXIF says "
              "otherwise -- the check exists because a foreign pass is invisible "
              "after P1 and wrecks P3 without failing any phase.")
+    parser.add_argument(
+        "--backend", choices=("sam2", "sam3"), default="sam2",
+        help="sam2 (default) tracks clicked points and needs a prompt per capture pass. "
+             "sam3 is told what the plant is as text and finds it itself -- no clicking, "
+             "no colour prepass, and it writes per-leaf instance masks as a by-product. "
+             "Needs transformers>=5 and the gated facebook/sam3 weights; every "
+             "--plant-point/--prompts-file/--prompt-bank option above is ignored.")
+    parser.add_argument("--sam3-model", default="facebook/sam3")
+    parser.add_argument(
+        "--sam3-plant-prompts", nargs="+", metavar="PHRASE",
+        help="noun phrases unioned into masks/plant (default: leaf stem plant). They are "
+             "unioned, never chosen between: each drops out on its own frames and the "
+             "others cover for it, which is worth ~0.20 IoU over the best single phrase.")
+    parser.add_argument(
+        "--sam3-holder-prompts", nargs="+", metavar="PHRASE",
+        help="noun phrases unioned into masks/holder (default: pliers tool). Run on FULL "
+             "frames, not the plant crop, which clips the handles -- 'pliers' matched 3/15 "
+             "frames on the crop and 15/15 on full frames of the same capture.")
+    parser.add_argument(
+        "--sam3-root-prompts", nargs="*", metavar="PHRASE",
+        help="noun phrases for the exposed root (default: root). Pass with no values to "
+             "skip the root entirely on a capture that has none.")
+    parser.add_argument(
+        "--sam3-crop-prompt",
+        help="the phrase the tracking crop is centred on (default: plant)")
+    parser.add_argument(
+        "--sam3-crop-stride", type=int, default=8,
+        help="locate the subject on every Nth full frame; the rest interpolate")
+    parser.add_argument(
+        "--sam3-no-instances", action="store_true",
+        help="skip masks/leaf_instances/. They cost disk and nothing in P1-P6 reads them "
+             "yet, but they are the 2D leaf correspondence P4c/P5 rebuild in 3D.")
     parser.add_argument("--dino-size", type=int, default=896)
     parser.add_argument("--device", default="cuda", help="torch device (cuda or cpu)")
     parser.add_argument(
@@ -534,7 +667,10 @@ def main(argv: Optional[list] = None) -> None:
 
     run(
         workdir=args.workdir,
-        checkpoint=resolve_checkpoint(args.checkpoint),
+        # SAM3 carries its own weights from HuggingFace, so a missing SAM2
+        # checkpoint must not stop a run that will never open one.
+        checkpoint=(resolve_checkpoint(args.checkpoint) if args.backend == "sam2"
+                    else args.checkpoint),
         video_paths=args.video,
         photo_dirs=args.photos,
         photo_max_edge=args.photo_max_edge,
@@ -552,6 +688,14 @@ def main(argv: Optional[list] = None) -> None:
         dino_size=args.dino_size,
         prompt_points=args.prompt_points,
         allow_mixed_capture=args.allow_mixed_capture,
+        backend=args.backend,
+        sam3_model=args.sam3_model,
+        sam3_plant_prompts=args.sam3_plant_prompts,
+        sam3_holder_prompts=args.sam3_holder_prompts,
+        sam3_root_prompts=args.sam3_root_prompts,
+        sam3_crop_prompt=args.sam3_crop_prompt,
+        sam3_crop_stride=args.sam3_crop_stride,
+        sam3_no_instances=args.sam3_no_instances,
     )
 
 

@@ -14,6 +14,22 @@
 # prompt_bank  = /data/2026-09-01/sugarbeet_3/plant/p2/prompt_bank.npz
 # seed_bank    = /data/thistle3/plant/p4c/seed_bank.npz
 
+# --- P2 segmentation ------------------------------------------------------
+# sam2 (default) tracks clicked points and needs a prompt per capture pass.
+# sam3 is told what the plant is as text and finds it itself -- no clicking,
+# no colour prepass, and it writes per-leaf instance masks as a by-product.
+# Needs transformers>=5 and the gated facebook/sam3 weights.
+# segment_backend = sam3
+#
+# Phrases are comma-separated, so a phrase may contain spaces. Each class is
+# the UNION of its phrases, never a choice between them: they drop out on
+# different frames and cover for each other, which measured ~0.20 IoU better
+# than the best single phrase. Defaults shown; omit unless changing them.
+# sam3_plant_prompts  = leaf,stem,plant
+# sam3_holder_prompts = pliers,tool
+# sam3_root_prompts   = root          # or: none, on a capture with no root
+# sam3_crop_prompt    = plant
+
 # --- per specimen, but usually constant within a session -----------------
 # architecture = rosette
 
