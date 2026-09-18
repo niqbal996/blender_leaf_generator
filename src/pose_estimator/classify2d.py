@@ -89,6 +89,90 @@ def read_manifest(p4c_dir: Union[str, Path]) -> dict:
 # --------------------------------------------------------------------------
 
 
+class P2MaskClassifier:
+    """The class map read straight off P2's masks -- no features, no seeds.
+
+    The DINO backend exists because P2 used to hand P4c one silhouette and no
+    idea what was inside it, so the organ classes had to be inferred from
+    appearance, from a handful of clicked examples. The SAM3 P2 backend
+    already separates the plant into leaf instances, a stem-and-petiole
+    residual and a tracked root, on every frame, from text. Re-deriving those
+    same classes from patch features would be throwing away a better answer
+    that is already on disk.
+
+    The three classes partition the plant mask exactly, by construction:
+
+        root  = masks/root         P2's tracked root object
+        stem  = masks/stem         plant minus leaf, holder and root
+        leaf  = whatever is left inside masks/plant
+
+    Leaf is taken as the remainder rather than as the union of
+    masks/leaf_instances, and deliberately: the remainder is guaranteed to
+    tile the silhouette with no unlabelled pixels, whereas the instance union
+    can leave a hairline of plant that belongs to no class where the broad
+    phrase and the instances disagreed at a blade edge.
+
+    This is a *segmentation*, not a classification, so there is nothing to
+    tune and nothing to seed. What it cannot do is disagree with P2: an error
+    in masks/stem arrives here unchanged, which is the trade for not guessing.
+    """
+
+    name = "p2"
+    # Read per frame from disk, so classify_sequence has to say which frame.
+    wants_stem = True
+    # The root class is this backend's own mask, not a hint layered over an
+    # appearance guess -- a frame without one simply has no root tissue.
+    handles_root = True
+
+    def __init__(self, p2_dir: Union[str, Path], class_order: Sequence[str]):
+        self.p2_dir = Path(p2_dir)
+        self.class_order = list(class_order)
+
+    @staticmethod
+    def available_classes(p2_dir: Union[str, Path]) -> List[str]:
+        """The classes this P2 run actually produced masks for.
+
+        A capture with no exposed root writes no masks/root, and declaring a
+        class that is empty in every frame makes P4c's own survival check
+        report a class that was never segmented as lost in 3D.
+        """
+        p2_dir = Path(p2_dir)
+        order = ["leaf"]
+        if any((p2_dir / "masks" / "stem").glob("*.png")):
+            order.append("stem")
+        if any((p2_dir / "masks" / "root").glob("*.png")):
+            order.append("root")
+        return order
+
+    def _read(self, folder: str, stem: str, shape) -> np.ndarray:
+        path = self.p2_dir / "masks" / folder / f"{stem}.png"
+        if not path.exists():
+            return np.zeros(shape, bool)
+        raw = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        return (raw > 127) if raw is not None else np.zeros(shape, bool)
+
+    def classify(self, bgr: np.ndarray, plant_mask: np.ndarray,
+                 root_mask: Optional[np.ndarray] = None,
+                 stem: Optional[str] = None) -> Optional[np.ndarray]:
+        if stem is None:
+            raise ValueError("P2MaskClassifier needs the frame stem")
+        if not plant_mask.any():
+            return None
+
+        index = {name: i for i, name in enumerate(self.class_order)}
+        out = np.full(plant_mask.shape, -1, np.int16)
+        # Leaf first, then the two that are authoritative about their own
+        # tissue, so a pixel claimed by both ends up in the specific class.
+        out[plant_mask] = index["leaf"]
+        if "stem" in index:
+            out[self._read("stem", stem, plant_mask.shape) & plant_mask] = index["stem"]
+        if "root" in index:
+            root = (root_mask > 127) if root_mask is not None else \
+                self._read("root", stem, plant_mask.shape)
+            out[root & plant_mask] = index["root"]
+        return out
+
+
 class DinoClassifier:
     """Nearest hand-clicked example in DINOv3 patch-feature space.
 
@@ -275,8 +359,12 @@ def classify_sequence(
             else:
                 root = None
                 without_root.append(stem)
-        class_map = (classifier.classify(bgr, plant > 127, root_mask=root)
-                     if root is not None else classifier.classify(bgr, plant > 127))
+        # A backend that reads its answer off disk needs to know which frame
+        # this is; the feature-based ones only ever see the pixels, and are
+        # not given an argument they would have to accept and ignore.
+        extra = {"stem": stem} if getattr(classifier, "wants_stem", False) else {}
+        class_map = (classifier.classify(bgr, plant > 127, root_mask=root, **extra)
+                     if root is not None else classifier.classify(bgr, plant > 127, **extra))
         if class_map is None:
             continue
         save_class_map(out_dir, stem, class_map)
@@ -286,7 +374,13 @@ def classify_sequence(
         if (n + 1) % progress_every == 0:
             print(f"    {n + 1}/{len(frame_stems)} frames")
 
-    if root_mask_dir is not None:
+    if root_mask_dir is not None and getattr(classifier, "handles_root", False):
+        # This backend *is* P2's masks, so a frame without one has no root and
+        # nothing was substituted for it. Saying it "fell back to appearance"
+        # would describe a step that does not exist here.
+        print(f"    root class from p2/masks/root in {root_frames}/{written} frames"
+              + (f"; the other {len(without_root)} have no root tissue" if without_root else ""))
+    elif root_mask_dir is not None:
         print(f"    P2 root masks decided the root class in {root_frames}/{written} frames")
         if without_root:
             shown = ", ".join(without_root[:4]) + (" ..." if len(without_root) > 4 else "")

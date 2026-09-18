@@ -42,6 +42,7 @@ import numpy as np
 from pose_estimator.checkpoints import resolve_checkpoint
 from pose_estimator.classify2d import (
     DinoClassifier,
+    P2MaskClassifier,
     SamClassifier,
     classify_sequence,
     load_class_map,
@@ -209,6 +210,24 @@ def run(
                                            save_seed_bank, dino_model, dino_size,
                                            hf_token, device, seeds_file)
         settings = {"model": dino_model, "size": dino_size, "stride": stride}
+    elif backend == "p2":
+        # Nothing to load and nothing to seed: P2 already separated the plant
+        # into these classes on every frame, and this reads them back.
+        p2_dir = workdir / "p2"
+        available = P2MaskClassifier.available_classes(p2_dir)
+        if "stem" not in available:
+            raise SystemExit(
+                f"--backend p2 needs {p2_dir / 'masks' / 'stem'}, which only the SAM3 P2\n"
+                "backend writes (it is the plant mask minus leaf, holder and root -- the\n"
+                "tissue no noun phrase names). Re-run P2 with:\n"
+                f"    pose-segment --workdir {workdir} --backend sam3 --reuse-frames\n"
+                "or classify by appearance instead with --backend dino / --backend sam.")
+        classifier = P2MaskClassifier(p2_dir, available)
+        settings = {"source": str(p2_dir / "masks"), "stride": stride}
+        if "root" not in available:
+            print("  no p2/masks/root on this capture, so there is no root class. That is "
+                  "correct\n  for a specimen whose root is above the jaws or absent, and "
+                  "wrong if a root\n  prompt simply failed -- check p2/prompts.json.")
     elif backend == "sam":
         # Falls back to the usual search rather than demanding --checkpoint:
         # the weights are the same ones P2 already found.
@@ -293,8 +312,11 @@ def _write_diags(p4c: Path, frames_dir: Path, mask_dir: Path, frame_stems, class
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     """Shared with pose-semantic, which runs this stage and the next together."""
-    parser.add_argument("--backend", choices=["dino", "sam"], default="dino",
-                        help="dino: nearest clicked example in DINOv3 feature space, "
+    parser.add_argument("--backend", choices=["dino", "sam", "p2"], default="dino",
+                        help="p2: read the classes straight off P2's own masks -- leaf, the "
+                             "masks/stem residual, and the tracked root. No seeds, no weights, "
+                             "nothing to tune, but it needs a P2 run from --backend sam3. "
+                             "dino: nearest clicked example in DINOv3 feature space, "
                              "open-vocabulary. sam: SAM2 masks assigned to leaf/stem by shape, "
                              "fixed vocabulary but real object boundaries.")
     parser.add_argument("--seeds-file", type=Path,

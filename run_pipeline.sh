@@ -1194,7 +1194,16 @@ elif [[ "$SKIP_P4B" == 1 ]]; then
 fi
 
 if should_run p4c; then
-    if [[ "$BACKEND" != "sam" && -z "$SEEDS_FILE" && ${#SEEDS[@]} -eq 0 && -z "$SEED_BANK" ]]; then
+    # A SAM3 P2 has already separated the plant into leaf, stem-and-petiole and
+    # root on every frame, so the organ classes are on disk and there is
+    # nothing left for an appearance classifier to infer. Take them unless a
+    # backend was asked for explicitly.
+    P4C_BACKEND="$BACKEND"
+    if [[ -z "${SET[backend]:-}" ]] && compgen -G "$WORKDIR/p2/masks/stem/*.png" >/dev/null 2>&1; then
+        P4C_BACKEND="p2"
+    fi
+    if [[ "$P4C_BACKEND" != "sam" && "$P4C_BACKEND" != "p2" \
+          && -z "$SEEDS_FILE" && ${#SEEDS[@]} -eq 0 && -z "$SEED_BANK" ]]; then
         phase "P4c    SKIPPED -- no seeds given"
         echo "  The DINO backend needs a few labelled examples. Easiest way to get them:"
         echo "    pose-pick-seeds --workdir $WORKDIR"
@@ -1203,15 +1212,22 @@ if should_run p4c; then
         echo "  on the next run -- no argument needed."
         echo
         echo "  Alternatives:"
+        echo "    --segment-backend sam3   re-run P2 with text prompts; P4c then reads the"
+        echo "                             organ classes straight off its masks and needs no"
+        echo "                             seeds at all (this is the way to stop clicking)"
         echo "    --seed-bank <path>/seed_bank.npz   reuse an earlier specimen's vectors"
         echo "    --backend sam --sam-checkpoint <ckpt>   no seeds at all (leaf/stem only)"
     else
         # --backend sam needs a checkpoint too; fall back to the same search.
         SAM_CKPT_P4C="$SAM_CHECKPOINT"
-        if [[ -z "$SAM_CKPT_P4C" && "$BACKEND" == "sam" ]]; then
+        if [[ -z "$SAM_CKPT_P4C" && "$P4C_BACKEND" == "sam" ]]; then
             SAM_CKPT_P4C="$(find_sam_checkpoint || true)"
         fi
         phase "P4c    organ labels + coloured clouds            -> $P4C_DIR"
+        if [[ "$P4C_BACKEND" == "p2" ]]; then
+            echo "  classifier: p2 -- the organ classes are read off P2's own masks"
+            echo "  (leaf, the masks/stem residual, the tracked root). No seeds, no DINO."
+        fi
         echo "  two stages: classify (frames -> p4c/class_maps) then fuse (maps -> labels)."
         echo "  Run them separately with pose-classify / pose-fuse when debugging -- the"
         echo "  class maps are what tell you whether a bad label came from the 2D"
@@ -1227,7 +1243,7 @@ if should_run p4c; then
                 --workdir "$WORKDIR" --geometry-backend "$GEOMETRY_BACKEND"
         else
             $PY -m pose_estimator.cli.semantic \
-                --workdir "$WORKDIR" --backend "$BACKEND" --dino-model "$DINO_MODEL" \
+                --workdir "$WORKDIR" --backend "$P4C_BACKEND" --dino-model "$DINO_MODEL" \
                 --geometry-backend "$GEOMETRY_BACKEND" \
                 ${HF_TOKEN_ARG:+--hf-token "$HF_TOKEN_ARG"} \
                 ${SAM_CKPT_P4C:+--checkpoint "$SAM_CKPT_P4C"} \
