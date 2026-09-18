@@ -59,11 +59,16 @@ measures which word won a competition rather than what either word finds, and
 every extra concept costs GPU memory on a sequence this long.
 
 Writes into --out:
-    frame_XXXX.jpg     three titled panels side by side, each with its own
-                       colour key: 1. the crop SAM3 was given, 2. what SAM3
-                       returned (one colour per prompt, xN = instances, and
-                       prompts that matched nothing listed greyed), 3. the
-                       existing P2 masks, when --p2 is given
+    frame_XXXX.jpg     titled, colour-keyed panels in a grid (--panels-per-row):
+                       PHOTO, the crop SAM3 was given;
+                       SAM3 BY PROMPT, one colour per prompt, largest painted
+                         first so small prompts stay visible, and prompts that
+                         matched nothing listed greyed rather than omitted;
+                       LEAF INSTANCES, SAM3's own ids with the id drawn on
+                         each -- a leaf whose colour changes is an id switch;
+                       SKELETON, the plant union minus leaf, holder and root,
+                         which is the stem-and-petiole tissue no prompt names;
+                       REFERENCE, the existing P2 masks, when --p2 is given
     lab.json           every metric below, per phrase and per combination
     localize.json      the full-frame localisation check (--localize)
     run.log
@@ -85,7 +90,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from sam3_leaf_track import crop_from_masks, load_cropped_video  # noqa: E402
+from pose_estimator.segmentation_sam3 import (  # noqa: E402
+    INSTANCE_PROMPT, MISSED_LEAF_FRACTION, MIN_RESIDUAL_AREA,
+    RESIDUAL_SPECK_FRACTION, _drop_specks, _largest_component_area)
+from sam3_leaf_track import (  # noqa: E402
+    Track, color_for, crop_from_masks, load_cropped_video, report)
 from text_organ_lab import Tee  # noqa: E402
 
 # The wording actually worth trying, grouped by the P2 class it is a candidate
@@ -190,7 +199,7 @@ def crop_from_sam3(processor, model, torch, frame_paths, phrase: str, stride: in
 
     video = load_cropped_video([frame_paths[i] for i in sub], None)
     full_h, full_w = video[0].shape[:2]
-    unions, _ = run_group(processor, model, torch, video, [phrase], device)
+    unions, _, _, _ = run_group(processor, model, torch, video, [phrase], device)
 
     centres = np.full((len(frame_paths), 2), np.nan)
     spans = []
@@ -231,6 +240,10 @@ def crop_from_sam3(processor, model, torch, frame_paths, phrase: str, stride: in
 # confused with a green in column 2 -- they mean different things. BGR.
 REFERENCE_COLORS = {"plant": (90, 210, 100), "holder": (200, 60, 200),
                     "root": (40, 140, 240)}
+
+# The skeleton residual is one mask, not a class set, so it gets one colour --
+# deliberately not any of PHRASE_COLORS or REFERENCE_COLORS. BGR.
+SKELETON_COLOR = (60, 230, 250)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 BAND_BG = (38, 38, 38)
@@ -298,8 +311,13 @@ def _draw_header(width: int, title: str, entries: Sequence, scale: float) -> np.
     return band
 
 
-def _stack(columns: Sequence, scale: float) -> np.ndarray:
-    """Header over image, per column, joined by a visible separator."""
+def _stack(columns: Sequence, scale: float, per_row: int = 3) -> np.ndarray:
+    """Header over image, per column, wrapped into a grid.
+
+    Five panels in one row is 6400px of JPEG that nothing displays usefully.
+    Wrapping at `per_row` keeps the figure roughly square, which is what gets
+    looked at rather than scrolled past.
+    """
     bands = [_draw_header(img.shape[1], title, entries, scale)
              for title, img, entries in columns]
     band_h = max(b.shape[0] for b in bands)
@@ -310,17 +328,43 @@ def _stack(columns: Sequence, scale: float) -> np.ndarray:
                                             BAND_BG, np.uint8)])
         built.append(np.vstack([band, img]))
 
-    gap = np.full((built[0].shape[0], 3, 3), SEPARATOR, np.uint8)
-    out = built[0]
-    for column in built[1:]:
-        out = np.hstack([out, gap, column])
+    rows = [built[i:i + per_row] for i in range(0, len(built), per_row)]
+    assembled = []
+    for row in rows:
+        gap = np.full((row[0].shape[0], 3, 3), SEPARATOR, np.uint8)
+        strip = row[0]
+        for column in row[1:]:
+            strip = np.hstack([strip, gap, column])
+        assembled.append(strip)
+
+    # A short row is padded rather than centred, so every panel in a column
+    # keeps the same x position down the figure.
+    width = max(s.shape[1] for s in assembled)
+    padded = [s if s.shape[1] == width else
+              np.hstack([s, np.full((s.shape[0], width - s.shape[1], 3), BAND_BG, np.uint8)])
+              for s in assembled]
+    out = padded[0]
+    for strip in padded[1:]:
+        out = np.vstack([out, np.full((3, width, 3), SEPARATOR, np.uint8), strip])
     return out
+
+
+def _paint(base: np.ndarray, mask: np.ndarray, colour) -> None:
+    colour = np.array([int(c) for c in colour])
+    base[mask] = (0.45 * base[mask] + 0.55 * colour).astype(np.uint8)
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(base, contours, -1, [int(c) for c in colour], 2)
 
 
 def draw_panel(view_bgr, by_phrase: Dict[str, np.ndarray], phrases: Sequence[str],
                reference: Optional[Dict[str, np.ndarray]], frame_name: str,
                counts: Optional[Dict[str, int]] = None,
-               crop_note: str = ""):
+               crop_note: str = "",
+               instances: Optional[Dict[int, np.ndarray]] = None,
+               skeleton: Optional[np.ndarray] = None,
+               plant_area: int = 0,
+               per_row: int = 3):
     """photo | SAM3 coloured by phrase | P2's masks, each titled and keyed.
 
     The numbers cannot distinguish "SAM3 disagreed with P2" from "SAM3 was
@@ -333,36 +377,41 @@ def draw_panel(view_bgr, by_phrase: Dict[str, np.ndarray], phrases: Sequence[str
 
     sam3 = view_bgr.copy()
     legend = []
+    # Paint the biggest mask first so the small specific ones survive on top.
+    # `plant` covers nearly everything `leaf` and `stem` do, and painting in
+    # prompt order buried both of them under it -- the panel then showed one
+    # flat blob and nothing about what the parts were.
+    order = sorted(range(len(phrases)),
+                   key=lambda k: -int(by_phrase[phrases[k]].sum())
+                   if by_phrase.get(phrases[k]) is not None else 0)
+    for index in order:
+        phrase = phrases[index]
+        mask = by_phrase.get(phrase)
+        if mask is not None and mask.any():
+            _paint(sam3, mask, PHRASE_COLORS[index % len(PHRASE_COLORS)])
     for index, phrase in enumerate(phrases):
         colour = PHRASE_COLORS[index % len(PHRASE_COLORS)]
         mask = by_phrase.get(phrase)
         present = mask is not None and mask.any()
-        if present:
-            painted = np.array(colour)
-            sam3[mask] = (0.45 * sam3[mask] + 0.55 * painted).astype(np.uint8)
-            contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL,
-                                           cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(sam3, contours, -1, [int(c) for c in colour], 2)
-            n = counts.get(phrase, 0)
-            label = f"{phrase} x{n}" if n else phrase
-        else:
-            label = f"{phrase} - no match"
+        n = counts.get(phrase, 0)
+        label = (f"{phrase} x{n}" if present and n else phrase if present
+                 else f"{phrase} - no match")
         legend.append((label, colour, present))
-
-    # The phrases overlap -- `plant` covers most of what `leaf` covers -- and
-    # the later one is painted on top. Without saying so, a phrase that is
-    # working looks like it found nothing because a broader phrase painted
-    # over it. The legend's xN counts are unaffected and are the honest
-    # measure; only the picture has an order.
     if sum(1 for _, _, present in legend if present) > 1:
-        legend.append(("(overlaps: later prompts paint over earlier ones)", None, False))
+        legend.append(("(largest painted first, so small prompts stay visible)", None, False))
 
     columns = [
         (f"1. PHOTO   {frame_name}" + (f"   {crop_note}" if crop_note else ""),
          view_bgr,
          [("the pixels SAM3 was given, nothing drawn on them", None, True)]),
-        ("2. SAM3   one colour per prompt, xN = instances found", sam3, legend),
+        ("2. SAM3 BY PROMPT   one colour per prompt, xN = instances", sam3, legend),
     ]
+
+    if instances:
+        columns.append(_instance_column(view_bgr, instances, scale))
+    if skeleton is not None:
+        columns.append(_skeleton_column(view_bgr, skeleton, plant_area))
+
     if reference is not None:
         ref = view_bgr.copy()
         ref_legend = []
@@ -370,12 +419,61 @@ def draw_panel(view_bgr, by_phrase: Dict[str, np.ndarray], phrases: Sequence[str
             mask = reference[name]
             present = bool(mask.any())
             if present:
-                ref[mask] = (0.45 * ref[mask] + 0.55 * np.array(colour)).astype(np.uint8)
+                _paint(ref, mask, colour)
             ref_legend.append((name if present else f"{name} - absent", colour, present))
         columns.append(
-            ("3. REFERENCE   the existing P2 (SAM2) masks on disk", ref, ref_legend))
+            ("REFERENCE   the existing P2 (SAM2) masks on disk", ref, ref_legend))
 
-    return _stack(columns, scale)
+    # Number the columns as they actually end up, so the titles match the
+    # figure whatever combination of panels this run produced.
+    columns = [(f"{i}. {title}" if not title[0].isdigit() else title, img, entries)
+               for i, (title, img, entries) in enumerate(columns, start=1)]
+    return _stack(columns, scale, per_row)
+
+
+def _instance_column(view_bgr, instances: Dict[int, np.ndarray], scale: float):
+    """Every tracked leaf in its own colour, with its id written on it.
+
+    The colour comes from `sam3_leaf_track.color_for`, so an id is the same
+    colour here as in that script's overlays and the two can be read against
+    each other. That stability is the whole point: a leaf whose colour changes
+    between frames is an identity switch, which is the failure that would
+    poison instance fusion in 3D.
+    """
+    panel = view_bgr.copy()
+    # Largest first, so a small leaf stays visible on top of the big one
+    # behind it -- the same order sam3_leaf_track.py paints in.
+    for obj_id, mask in sorted(instances.items(), key=lambda kv: -int(kv[1].sum())):
+        if not mask.any():
+            continue
+        colour = color_for(obj_id)
+        _paint(panel, mask, colour)
+        ys, xs = np.nonzero(mask)
+        cx, cy = int(xs.mean()), int(ys.mean())
+        for c, thick in (((0, 0, 0), 4), ((255, 255, 255), 1)):
+            cv2.putText(panel, str(obj_id), (cx - 8, cy), FONT, 0.8, c, thick, cv2.LINE_AA)
+
+    ids = sorted(instances)
+    entries = [(f"{len(ids)} tracked ids: " + ", ".join(str(i) for i in ids[:14])
+                + (" ..." if len(ids) > 14 else ""), None, True),
+               ("colour is stable per id -- a leaf that changes colour is an id switch",
+                None, False)]
+    return ("LEAF INSTANCES   SAM3's own ids, held across frames", panel, entries)
+
+
+def _skeleton_column(view_bgr, skeleton: np.ndarray, plant_area: int):
+    """The stem-and-petiole residual, alone, against the photo."""
+    panel = view_bgr.copy()
+    if skeleton.any():
+        _paint(panel, skeleton, SKELETON_COLOR)
+    area = int(skeleton.sum())
+    share = (100.0 * area / plant_area) if plant_area else 0.0
+    biggest = _largest_component_area(skeleton)
+    entries = [(f"{area} px, {share:.1f}% of the plant mask", SKELETON_COLOR, bool(area))]
+    if plant_area and biggest > MISSED_LEAF_FRACTION * plant_area:
+        entries.append((f"WARNING: one component is {100.0 * biggest / plant_area:.0f}% "
+                        "of the plant -- a missed leaf, not a petiole", None, True))
+    return ("SKELETON   plant minus leaf, holder and root", panel, entries)
 
 
 def score(per_frame: List[dict], n_frames: int) -> dict:
@@ -464,29 +562,40 @@ def load_model(model_name: str, device: str):
 
 
 def decode(processor, session, model_outputs):
-    """One frame's instances as {obj_id: bool mask} plus {obj_id: phrase}."""
+    """One frame as {obj_id: mask}, {obj_id: phrase}, {obj_id: score}."""
     result = processor.postprocess_outputs(session, model_outputs)
     masks = result["masks"]
+    scores = result["scores"]
     if hasattr(masks, "cpu"):
         masks = masks.cpu().numpy()
+    if hasattr(scores, "cpu"):
+        scores = scores.cpu().numpy()
     masks = np.asarray(masks)
     if masks.ndim == 4:                       # (n, 1, H, W)
         masks = masks[:, 0]
     if masks.dtype != bool:
         masks = masks > 0.5
 
-    by_id = {int(o): masks[k].astype(bool) for k, o in enumerate(result["object_ids"])}
+    obj_ids = [int(o) for o in result["object_ids"]]
+    by_id = {o: masks[k].astype(bool) for k, o in enumerate(obj_ids)}
+    score_by_id = {o: float(np.asarray(scores).reshape(-1)[k]) for k, o in enumerate(obj_ids)}
     id_to_phrase = {}
     for phrase, ids in (result.get("prompt_to_obj_ids") or {}).items():
         for o in ids:
             id_to_phrase[int(o)] = phrase
-    return by_id, id_to_phrase
+    return by_id, id_to_phrase, score_by_id
 
 
 def run_group(processor, model, torch, video, phrases: Sequence[str], device: str):
     """Track one group of phrases over the whole clip.
 
-    Returns per frame: {phrase: union mask} and {phrase: instance count}.
+    Returns per frame: {phrase: union mask}, {phrase: instance count},
+    {phrase: {obj_id: mask}} and {obj_id: score}.
+
+    The per-instance masks are kept, not just the union, because the ids SAM3
+    carries between frames are the thing that would let P4c/P5 stop rebuilding
+    leaf correspondence in 3D -- and whether they are stable enough to do that
+    is judged by eye, from one colour per id held across the sequence.
     """
     session = processor.init_video_session(
         video=video, inference_device=device,
@@ -496,11 +605,13 @@ def run_group(processor, model, torch, video, phrases: Sequence[str], device: st
 
     unions: Dict[int, Dict[str, np.ndarray]] = defaultdict(dict)
     counts: Dict[int, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    instances: Dict[int, Dict[str, Dict[int, np.ndarray]]] = defaultdict(dict)
+    scores: Dict[int, Dict[int, float]] = defaultdict(dict)
     with torch.inference_mode():
         for model_outputs in model.propagate_in_video_iterator(
                 inference_session=session, show_progress_bar=True):
             i = model_outputs.frame_idx
-            by_id, id_to_phrase = decode(processor, session, model_outputs)
+            by_id, id_to_phrase, score_by_id = decode(processor, session, model_outputs)
             for obj_id, mask in by_id.items():
                 if not mask.any():
                     continue
@@ -512,11 +623,13 @@ def run_group(processor, model, torch, video, phrases: Sequence[str], device: st
                 unions[i][phrase] = (mask if phrase not in unions[i]
                                      else unions[i][phrase] | mask)
                 counts[i][phrase] += 1
+                instances[i].setdefault(phrase, {})[obj_id] = mask
+                scores[i][obj_id] = score_by_id.get(obj_id, 0.0)
 
     del session
     if device == "cuda":
         torch.cuda.empty_cache()
-    return unions, counts
+    return unions, counts, instances, scores
 
 
 def localize(processor, model, torch, frame_paths, phrase: str, stride: int,
@@ -538,7 +651,7 @@ def localize(processor, model, torch, frame_paths, phrase: str, stride: int,
     print(f"\nlocalisation check: {phrase!r} on {len(sub)} full frames "
           f"(every {stride}{'st' if stride == 1 else 'th'})")
     video = load_cropped_video(sub, None)
-    unions, counts = run_group(processor, model, torch, video, [phrase], device)
+    unions, counts, _, _ = run_group(processor, model, torch, video, [phrase], device)
 
     rows = []
     for i, path in enumerate(sub):
@@ -616,6 +729,9 @@ def parse_args():
                    help="also check whether SAM3 finds the plant in uncropped frames")
     p.add_argument("--localize-phrase", default="plant")
     p.add_argument("--localize-stride", type=int, default=4)
+    p.add_argument("--panels-per-row", type=int, default=3,
+                   help="wrap the overlay panels into rows of this many. Five panels in "
+                        "one row is 6400px that nothing displays usefully")
     p.add_argument("--model", default="facebook/sam3")
     p.add_argument("--device", default="cuda")
     return p.parse_args()
@@ -688,10 +804,27 @@ def main() -> None:
     all_masks: Dict[int, Dict[str, np.ndarray]] = defaultdict(dict)
     all_counts: Dict[int, Dict[str, int]] = defaultdict(dict)
     per_phrase: Dict[str, List[dict]] = {}
+    # Per-frame {obj_id: mask} for the prompt whose instances are the point --
+    # "leaf". These are what the LEAF INSTANCES panel draws and what the track
+    # table below is built from.
+    leaf_instances: Dict[int, Dict[int, np.ndarray]] = defaultdict(dict)
+    tracks: Dict[int, Track] = {}
     results = {}
     for name, phrases in groups:
         print(f"\n=== group {name!r}: {phrases} over {len(video)} frames ===")
-        unions, counts = run_group(processor, model, torch, video, phrases, args.device)
+        unions, counts, instances, scores = run_group(
+            processor, model, torch, video, phrases, args.device)
+        if INSTANCE_PROMPT in phrases:
+            for i in range(len(video)):
+                for obj_id, mask in instances.get(i, {}).get(INSTANCE_PROMPT, {}).items():
+                    leaf_instances[i][obj_id] = mask
+                    track = tracks.setdefault(obj_id, Track(obj_id))
+                    track.prompt = INSTANCE_PROMPT
+                    ys, xs = np.nonzero(mask)
+                    track.frames.append(i)
+                    track.areas.append(int(mask.sum()))
+                    track.scores.append(scores.get(i, {}).get(obj_id, 0.0))
+                    track.centroids.append([float(xs.mean()), float(ys.mean())])
         rows = {}
         for phrase in phrases:
             per_frame = []
@@ -753,6 +886,34 @@ def main() -> None:
                 d = out_dir / "masks" / f"reference_{name}"
                 d.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(d / f"{path.stem}.png"), mask.astype(np.uint8) * 255)
+    # The skeleton residual, computed the same way the P2 SAM3 backend does
+    # -- the broad plant union minus the leaf instances, the holder and the
+    # root -- so what is drawn here is what would land in p2/masks/stem.
+    by_group = {name: phrases for name, phrases in groups}
+    plant_phrases = by_group.get("plant", [])
+    holder_phrases = by_group.get("holder", [])
+    root_phrases = by_group.get("root", [])
+    if not plant_phrases:
+        print(f"\nno --group named 'plant', so there is no broad mask to subtract from: "
+              "the SKELETON panel is omitted")
+    skeletons, plant_areas = [], []
+    for i in range(len(video)):
+        def union_of(names):
+            out = np.zeros(shape, bool)
+            for phrase in names:
+                mask = all_masks[i].get(phrase)
+                if mask is not None:
+                    out |= mask
+            return out
+
+        plant = union_of(plant_phrases)
+        residual = plant & ~union_of([INSTANCE_PROMPT]) & ~union_of(holder_phrases) \
+            & ~union_of(root_phrases)
+        residual = _drop_specks(residual, max(MIN_RESIDUAL_AREA,
+                                              int(RESIDUAL_SPECK_FRACTION * plant.sum())))
+        skeletons.append(residual)
+        plant_areas.append(int(plant.sum()))
+
     crop_note = (f"crop {crop.width}x{crop.height} of "
                  f"{crop.frame_width}x{crop.frame_height}" if crop else "full frame")
     for i, path in enumerate(frame_paths):
@@ -760,10 +921,30 @@ def main() -> None:
         cv2.imwrite(str(out_dir / f"frame_{i:04d}.jpg"),
                     draw_panel(view, all_masks[i], ordered,
                                references[i] if scored else None,
-                               path.stem, all_counts[i], crop_note),
+                               path.stem, all_counts[i], crop_note,
+                               instances=leaf_instances.get(i) or None,
+                               skeleton=skeletons[i] if plant_phrases else None,
+                               plant_area=plant_areas[i],
+                               per_row=args.panels_per_row),
                     [cv2.IMWRITE_JPEG_QUALITY, 88])
+        if args.save_masks and skeletons[i].any():
+            d = out_dir / "masks" / "skeleton"
+            d.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(d / f"{path.stem}.png"), skeletons[i].astype(np.uint8) * 255)
+
+    # The track table sam3_leaf_track.py prints, from the same data, so the
+    # two scripts report leaf identity in one format.
+    if tracks:
+        track_summary = report(tracks, len(video), [INSTANCE_PROMPT])
+    else:
+        track_summary = {"frames": len(video), "per_prompt": {}, "tracks": []}
+    share = [100.0 * int(s.sum()) / a for s, a in zip(skeletons, plant_areas) if a]
+    print(f"\nskeleton residual (plant minus {INSTANCE_PROMPT}/holder/root): "
+          f"median {np.median(share) if share else 0:.1f}% of the plant mask")
 
     payload = {"frames": len(video),
+               "leaf_tracks": track_summary,
+               "skeleton_share_of_plant_percent": [round(x, 2) for x in share],
                "frame_names": [p.name for p in frame_paths],
                "crop": crop.to_dict() if crop else None,
                "groups": results,
