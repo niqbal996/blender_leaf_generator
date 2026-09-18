@@ -13,6 +13,7 @@ P4b, P4c and P5 cannot tell which backend ran:
     masks/plant/frame_XXXX.png   binary 0/255, full-frame coordinates
     masks/holder/frame_XXXX.png  binary 0/255, full-frame coordinates
     masks/root/frame_XXXX.png    binary 0/255, when a root prompt matched
+    masks/stem/frame_XXXX.png    plant minus leaf, holder and root -- see below
     alpha/frame_XXXX.png         soft plant matte
     crop.json                    the tracking window
     prompts.json                 the phrases used, and what each one found
@@ -37,6 +38,19 @@ on sugarbeet_4 and vogelmeere_1:
 * **One session per class.** A session assigns each instance to exactly one
   prompt, so putting "plant" and "pliers" in one session measures which word
   won rather than what either found.
+
+masks/stem is reached by subtraction rather than by prompting, because the
+vocabulary runs out before the tissue does: "petiole" and "branch" matched
+nothing at all on gaensefuss_1, while the same pixels sit reliably inside what
+the broad phrase `plant` returns (which covered 0.88 of the reference there
+against leaf+stem's 0.81). So the stem class is what `plant` claimed and the
+leaf instances, the holder and the root did not -- the stem, the petioles and
+the crown, which is the tissue a skeleton is actually built along.
+
+It doubles as a check on the leaf prompt. A petiole is thin, so a *large*
+connected component in that residual is not a petiole: it is a leaf blade the
+leaf prompt lost on that frame, and the run says so rather than quietly
+filing it as stem.
 
 The leaf instance ids SAM3 carries across frames are written out too, as
 masks/leaf_instances/<id>/. Nothing in P1-P6 reads them yet; they are the 2D
@@ -96,6 +110,24 @@ DEFAULT_ROI_PADDING = 0.20
 # earns that: it is the one class whose instances are the thing downstream
 # cannot currently recover.
 INSTANCE_PROMPT = "leaf"
+
+# Plant tissue that the leaf prompt did not claim -- the stem, the petioles
+# and the crown -- written as its own class. It is a *subtraction*, not a
+# prompt: "petiole" and "branch" match nothing on these plants, while the
+# same pixels are reliably inside what `plant` returns.
+STEM_MASK_DIR = "stem"
+# Specks to drop from that subtraction. A boundary disagreement of one or two
+# pixels between the broad phrase and the leaf instances leaves a rind of
+# pepper noise along every blade edge, and it is not tissue. Whichever of the
+# two thresholds is larger wins, so a big plant is cleaned proportionally and
+# a small one is not scrubbed away.
+MIN_RESIDUAL_AREA = 40
+RESIDUAL_SPECK_FRACTION = 0.0008
+# A residual component this large a share of the plant mask is not a petiole.
+# Petioles are thin; on the captures measured here the whole residual runs a
+# few percent of the plant. One component at a fifth of it is a leaf blade the
+# leaf prompt lost on that frame -- the sugarbeet_4 frame-4 failure exactly.
+MISSED_LEAF_FRACTION = 0.20
 
 
 @dataclass
@@ -228,6 +260,23 @@ def _run_session(processor, model, torch, video, phrases: Sequence[str], device:
     if device == "cuda":
         torch.cuda.empty_cache()
     return per_frame, (soft if want_soft else None)
+
+
+def _drop_specks(mask: np.ndarray, min_area: int) -> np.ndarray:
+    """Components below `min_area` removed, in one pass."""
+    if not mask.any():
+        return mask
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+    keep = np.zeros(count, bool)
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_area
+    return keep[labels]
+
+
+def _largest_component_area(mask: np.ndarray) -> int:
+    if not mask.any():
+        return 0
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+    return int(stats[1:, cv2.CC_STAT_AREA].max()) if count > 1 else 0
 
 
 def _union(frame: Dict[str, Dict[int, np.ndarray]], phrases: Sequence[str],
@@ -381,6 +430,7 @@ def segment_sequence_sam3(
     per_frame_stats, found_counts = [], {p: 0 for p in
                                          list(prompts.plant) + list(prompts.holder) + list(prompts.root)}
     instance_frames: Dict[int, List[str]] = {}
+    missed_leaf_frames: List[str] = []
 
     for i, path in enumerate(frame_paths):
         box = crop.boxes[i] if crop is not None else None
@@ -419,6 +469,32 @@ def segment_sequence_sam3(
         plant_full = _paste(plant_crop, box, full_h, full_w).astype(np.uint8) * 255
         cv2.imwrite(str(out_dir / "masks" / "plant" / f"{path.stem}.png"), plant_full)
         stats["plant_area_px"] = int((plant_full > 0).sum())
+
+        # What the broad phrase claimed and the organ phrases did not. SAM3
+        # segments petioles perfectly well inside "plant" but will not return
+        # them for the word "petiole" -- measured on gaensefuss_1, where
+        # "petiole" and "branch" matched nothing while `plant` covered 0.88 of
+        # the reference against leaf+stem's 0.81. Subtracting is the way to
+        # reach tissue the vocabulary cannot name.
+        leaf_union = np.zeros(crop_shape, bool)
+        for mask in plant_frame.get(INSTANCE_PROMPT, {}).values():
+            leaf_union |= mask
+        residual = plant_crop & ~leaf_union & ~holder_in_crop
+        if root_crop is not None:
+            residual = residual & ~root_crop
+        residual = _drop_specks(residual, max(MIN_RESIDUAL_AREA,
+                                              int(RESIDUAL_SPECK_FRACTION * plant_crop.sum())))
+        (out_dir / "masks" / STEM_MASK_DIR).mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out_dir / "masks" / STEM_MASK_DIR / f"{path.stem}.png"),
+                    _paste(residual, box, full_h, full_w).astype(np.uint8) * 255)
+        stats["stem_area_px"] = int(residual.sum())
+        # A petiole is thin. A *large* residual blob is not a petiole, it is a
+        # leaf the leaf prompt missed on this frame -- which makes this number
+        # the cheapest detector there is for exactly that failure.
+        biggest = _largest_component_area(residual)
+        stats["stem_largest_component_px"] = biggest
+        if plant_crop.any() and biggest > MISSED_LEAF_FRACTION * plant_crop.sum():
+            missed_leaf_frames.append(path.stem)
 
         holder_png = holder_full.astype(np.uint8) * 255
         cv2.imwrite(str(out_dir / "masks" / "holder" / f"{path.stem}.png"), holder_png)
@@ -459,12 +535,30 @@ def segment_sequence_sam3(
         held = sum(1 for frames in instance_frames.values() if len(frames) == n)
         print(f"  {len(instance_frames)} leaf instances tracked, {held} present in all {n} frames")
 
+    stem_areas = [s["stem_area_px"] for s in per_frame_stats]
+    plant_areas = [s["plant_area_px"] for s in per_frame_stats]
+    share = (100.0 * sum(stem_areas) / sum(plant_areas)) if sum(plant_areas) else 0.0
+    print(f"  masks/{STEM_MASK_DIR}: plant minus leaf/holder/root, median "
+          f"{int(np.median(stem_areas))} px, {share:.1f}% of the plant mask")
+    if missed_leaf_frames:
+        print(f"  WARNING: on {len(missed_leaf_frames)} frame(s) the residual holds one "
+              f"component larger than {MISSED_LEAF_FRACTION:.0%} of the plant mask.")
+        print(f"    A petiole is not that big -- this is a leaf the {INSTANCE_PROMPT!r} prompt "
+              "lost on that frame,")
+        print(f"    landing in masks/{STEM_MASK_DIR} as if it were stem. Check "
+              f"{', '.join(missed_leaf_frames[:6])}"
+              + (" ..." if len(missed_leaf_frames) > 6 else "") + " in p2/diag/.")
+
     with open(out_dir / "crop.json", "w") as f:
         json.dump(crop.to_dict() if crop else
                   {"boxes": None, "frame_width": full_w, "frame_height": full_h}, f, indent=2)
     payload = prompts.to_dict()
     payload["matched_frames"] = found_counts
     payload["frames"] = n
+    payload["stem_residual"] = {
+        "share_of_plant_percent": round(share, 2),
+        "frames_with_a_leaf_sized_component": missed_leaf_frames,
+    }
     if instance_frames:
         payload["leaf_instances"] = {str(k): v for k, v in sorted(instance_frames.items())}
     with open(out_dir / "prompts.json", "w") as f:

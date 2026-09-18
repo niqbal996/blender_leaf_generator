@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -99,7 +100,11 @@ DEFAULT_GROUPS = [
 ]
 # Phrase unions worth scoring as a whole, since P2 wants one mask per class
 # and not one per word. Any phrase not present in a run is skipped.
-DEFAULT_COMBOS = ["leaf+stem+plant", "leaf+stem", "plant"]
+# A part written "-phrase" subtracts. "plant-leaf" is the stem-and-petiole
+# residual: the tissue the broad phrase claims and the leaf prompt does not,
+# which is the only way to reach petioles -- "petiole" and "branch" match
+# nothing on these plants.
+DEFAULT_COMBOS = ["leaf+stem+plant", "leaf+stem", "plant", "plant-leaf"]
 
 # BGR, one per phrase in the order the group lists them.
 PHRASE_COLORS = [
@@ -111,6 +116,17 @@ PHRASE_COLORS = [
 # --------------------------------------------------------------------------
 # scoring
 # --------------------------------------------------------------------------
+
+
+def _parse_combo(text: str) -> List[str]:
+    """'leaf+stem' -> ['leaf', 'stem'];  'plant-leaf' -> ['plant', '-leaf'].
+
+    Splitting on '+' alone is not enough: the minus sits *inside* a token, so
+    'plant-leaf' arrives as one phrase that matches nothing and the
+    subtraction silently does not happen.
+    """
+    parts = re.findall(r"[+-]?[^+-]+", text)
+    return [p if p.startswith("-") else p.lstrip("+").strip() for p in parts if p.strip("+- ")]
 
 
 def iou(a: np.ndarray, b: np.ndarray) -> float:
@@ -582,8 +598,9 @@ def parse_args():
                    help="a P2 class name followed by the phrases to try for it. One SAM3 "
                         "session per group. Repeatable; replaces the defaults entirely")
     p.add_argument("--combo", action="append",
-                   help="phrases to also score as one union, joined by '+', e.g. 'leaf+stem'. "
-                        "Repeatable; replaces the defaults")
+                   help="phrases to also score as one mask, joined by '+', e.g. 'leaf+stem'. "
+                        "A part written '-phrase' is SUBTRACTED, so 'plant-leaf' scores the "
+                        "stem-and-petiole residual. Repeatable; replaces the defaults")
     p.add_argument("--frames", help="'a,b,c' or an inclusive range 'a-b'. ONE capture pass: "
                                     "SAM3 reads a jump between passes as motion")
     p.add_argument("--stride", type=int, default=1)
@@ -615,7 +632,7 @@ def main() -> None:
     for name, phrases in groups:
         if not phrases:
             raise SystemExit(f"--group {name} was given no phrases")
-    combos = [c.split("+") for c in (args.combo or DEFAULT_COMBOS)]
+    combos = [_parse_combo(c) for c in (args.combo or DEFAULT_COMBOS)]
 
     # --- frames ---
     images = Path(args.images)
@@ -694,18 +711,26 @@ def main() -> None:
     # --- combinations, because P2 wants one mask per class ---
     combo_rows = {}
     for parts in combos:
-        usable = [p for p in parts if p in per_phrase]
-        if not usable:
+        # A part written "-leaf" is subtracted rather than added. That is how
+        # the stem-and-petiole tissue is reached: SAM3 segments petioles
+        # inside `plant` but returns nothing for the words "petiole" or
+        # "branch", so "plant-leaf" measures tissue no prompt can name.
+        adds = [p for p in parts if not p.startswith("-") and p in per_phrase]
+        subs = [p[1:] for p in parts if p.startswith("-") and p[1:] in per_phrase]
+        if not adds:
             continue
         per_frame = []
         for i in range(len(video)):
             union = np.zeros(shape, bool)
             instances = 0
-            for phrase in usable:
+            for phrase in adds:
                 union |= all_masks[i][phrase]
                 instances += all_counts[i][phrase]
+            for phrase in subs:
+                union &= ~all_masks[i][phrase]
             per_frame.append(measure(union, references[i], instances))
-        combo_rows["+".join(usable)] = score(per_frame, len(video))
+        name = "+".join(adds) + "".join(f"-{p}" for p in subs)
+        combo_rows[name] = score(per_frame, len(video))
     if combo_rows:
         print_table("unions -- what a P2 plant mask built from these phrases would score",
                     combo_rows, scored)
