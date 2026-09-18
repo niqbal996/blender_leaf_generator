@@ -356,6 +356,10 @@ def _run_sam3(workdir, frames_dir, p2_dir, sources, use_roi, roi_padding, device
             frame_paths=paths,
             crop_stride=crop_stride,
             save_instances=save_instances,
+            # Each pass is its own SAM3 session and its ids restart at zero,
+            # so the folders have to say which pass an id belongs to or three
+            # different leaves end up sharing one.
+            instance_prefix=f"pass{pass_index}_",
             session=session,
         )
         combined_stats.extend(result["per_frame"])

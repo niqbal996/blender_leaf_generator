@@ -366,6 +366,7 @@ def segment_sequence_sam3(
     model_name: str = "facebook/sam3",
     crop_stride: int = DEFAULT_CROP_STRIDE,
     save_instances: bool = True,
+    instance_prefix: str = "",
     session: Optional[Tuple] = None,
 ) -> dict:
     """Segment one capture pass with SAM3. Same artifacts as `segment_sequence`.
@@ -373,6 +374,12 @@ def segment_sequence_sam3(
     `session` is an already-loaded `(processor, model)`; P2 runs one session
     per capture pass and the weights are 3.3 GB, so the caller loads them once
     and passes them in.
+
+    `instance_prefix` namespaces the leaf-instance folders, and a multi-pass
+    capture must set it. Each pass is its own SAM3 session and its object ids
+    restart from zero, so writing them all to masks/leaf_instances/<id>/ files
+    three unrelated leaves under one id -- measured on gaensefuss_1, whose
+    three passes are 45, 40 and 50 frames and where id 16 accumulated 130.
     """
     import torch
 
@@ -518,11 +525,11 @@ def segment_sequence_sam3(
 
         if save_instances:
             for obj_id, mask in plant_frame.get(INSTANCE_PROMPT, {}).items():
-                folder = out_dir / "masks" / "leaf_instances" / str(obj_id)
+                folder = out_dir / "masks" / "leaf_instances" / f"{instance_prefix}{obj_id}"
                 folder.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(folder / f"{path.stem}.png"),
                             _paste(mask, box, full_h, full_w).astype(np.uint8) * 255)
-                instance_frames.setdefault(obj_id, []).append(path.stem)
+                instance_frames.setdefault(f"{instance_prefix}{obj_id}", []).append(path.stem)
 
         per_frame_stats.append(stats)
 
@@ -561,6 +568,7 @@ def segment_sequence_sam3(
     }
     if instance_frames:
         payload["leaf_instances"] = {str(k): v for k, v in sorted(instance_frames.items())}
+        payload.setdefault("instance_prefix", instance_prefix)
     with open(out_dir / "prompts.json", "w") as f:
         json.dump(payload, f, indent=2)
 
