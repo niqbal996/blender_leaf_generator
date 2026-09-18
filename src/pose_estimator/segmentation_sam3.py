@@ -73,6 +73,24 @@ DEFAULT_ROOT_PROMPTS = ("root",)
 # 4 of 4 full frames at a median box IoU of 0.853 against P2's own bounding
 # box, which is far more than a padded crop needs.
 DEFAULT_CROP_PROMPT = "plant"
+# Every frame, not a subsample. Interpolating the window between located
+# frames is a real approximation -- the orbit is smooth but the plant's
+# apparent size is not, and a window solved on frame 0 and frame 8 sits
+# slightly wrong on the six between. Locating on all of them costs one extra
+# full-resolution pass and removes the approximation; raise it only if that
+# pass is what does not fit.
+DEFAULT_CROP_STRIDE = 1
+# Tighter than the SAM2 path's 0.45, deliberately. That margin exists so the
+# clamp jaws land inside the same window as the plant, and here they do not
+# have to: the holder is prompted on full frames precisely because the crop
+# clips the tool. What is left to pay for is the error in SAM3's own
+# localisation box, which measured a median IoU of 0.853 against P2's plant
+# bounding box -- a fifth of the subject's size covers that comfortably.
+#
+# It is worth being tight. SAM3 resizes its input to 1008px and its mask head
+# emits 288x288, so on a 1280px crop one mask pixel is 4.4 real pixels: the
+# padding is paid for in the resolution of every petiole in the frame.
+DEFAULT_ROI_PADDING = 0.20
 
 # The instance ids of this prompt are kept per-instance on disk. Only "leaf"
 # earns that: it is the one class whose instances are the thing downstream
@@ -293,11 +311,11 @@ def segment_sequence_sam3(
     out_dir: Union[str, Path],
     prompts: Optional[Sam3Prompts] = None,
     use_roi: bool = True,
-    roi_padding: float = 0.18,
+    roi_padding: float = DEFAULT_ROI_PADDING,
     device: str = "cuda",
     frame_paths: Optional[Sequence[Path]] = None,
     model_name: str = "facebook/sam3",
-    crop_stride: int = 8,
+    crop_stride: int = DEFAULT_CROP_STRIDE,
     save_instances: bool = True,
     session: Optional[Tuple] = None,
 ) -> dict:
@@ -324,7 +342,8 @@ def segment_sequence_sam3(
 
     crop = None
     if use_roi:
-        print(f"  locating the subject with {prompts.crop!r} on every {crop_stride}th frame...")
+        where = "every frame" if crop_stride == 1 else f"every {crop_stride}th frame"
+        print(f"  locating the subject with {prompts.crop!r} on {where}...")
         crop = solve_crop_with_sam3(processor, model, torch, frame_paths, prompts.crop,
                                     crop_stride, roi_padding, device)
         # Both paths end up resized to SAM3's 1008px square, so the gain from

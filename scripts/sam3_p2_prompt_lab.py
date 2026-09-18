@@ -84,16 +84,18 @@ from sam3_leaf_track import crop_from_masks, load_cropped_video  # noqa: E402
 from text_organ_lab import Tee  # noqa: E402
 
 # The wording actually worth trying, grouped by the P2 class it is a candidate
-# for. `plant` is the one already known to work; the run this script exists to
-# judge is the other two.
+# for. Measured across sugarbeet_4, vogelmeere_1 and gaensefuss_1. The phrases that
+# returned nothing at all on every capture tried -- "metal clamp", "metal
+# gripper", "metal plier", "plant pot", "taproot" -- are left out: the plural
+# bare noun is what fires. Add them back on the command line to re-test.
 DEFAULT_GROUPS = [
     ("plant", ["leaf", "stem", "plant"]),
-    ("holder", ["pliers", "metal clamp", "plant pot"]),
-    ("root", ["root", "taproot"]),
+    ("holder", ["pliers", "tool"]),
+    ("root", ["root"]),
 ]
 # Phrase unions worth scoring as a whole, since P2 wants one mask per class
 # and not one per word. Any phrase not present in a run is skipped.
-DEFAULT_COMBOS = ["leaf+stem", "leaf+stem+root", "plant"]
+DEFAULT_COMBOS = ["leaf+stem+plant", "leaf+stem", "plant"]
 
 # BGR, one per phrase in the order the group lists them.
 PHRASE_COLORS = [
@@ -454,9 +456,10 @@ def parse_args():
                         "'sam3' otherwise -- which is what a real P2 backend would have to do")
     p.add_argument("--crop-phrase", default="plant",
                    help="the noun phrase --crop-from sam3 locates the subject with")
-    p.add_argument("--crop-stride", type=int, default=8,
+    p.add_argument("--crop-stride", type=int, default=1,
                    help="locate the plant on every Nth full frame; the rest interpolate. "
-                        "A crop window does not need every frame measured")
+                        "Defaults to every frame, matching the P2 backend; raise it to "
+                        "trade window accuracy for one cheaper localisation pass")
     p.add_argument("--out", required=True)
     p.add_argument("--group", nargs="+", action="append", metavar=("NAME PHRASE", ""),
                    help="a P2 class name followed by the phrases to try for it. One SAM3 "
@@ -467,7 +470,10 @@ def parse_args():
     p.add_argument("--frames", help="'a,b,c' or an inclusive range 'a-b'. ONE capture pass: "
                                     "SAM3 reads a jump between passes as motion")
     p.add_argument("--stride", type=int, default=1)
-    p.add_argument("--pad", type=float, default=0.18, help="crop margin, fraction of plant size")
+    p.add_argument("--pad", type=float, default=0.20,
+                   help="crop margin, fraction of plant size. Matches the P2 SAM3 "
+                        "backend: SAM3's mask head emits 288x288, so margin is paid "
+                        "for in petiole resolution")
     p.add_argument("--save-masks", action="store_true",
                    help="write each phrase's union mask per frame, in CROP coordinates, so the "
                         "disagreement with P2 can be analysed offline. The reference masks are "

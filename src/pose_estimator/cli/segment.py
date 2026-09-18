@@ -62,7 +62,7 @@ def run(
     photo_max_edge: int = 1920,
     num_frames: int = 96,
     use_roi: bool = True,
-    roi_padding: float = 0.45,
+    roi_padding: Optional[float] = None,
     plant_point: Optional[Tuple[int, int]] = None,
     holder_point: Optional[Tuple[int, int]] = None,
     root_point: Optional[Tuple[int, int]] = None,
@@ -80,7 +80,7 @@ def run(
     sam3_holder_prompts: Optional[list] = None,
     sam3_root_prompts: Optional[list] = None,
     sam3_crop_prompt: Optional[str] = None,
-    sam3_crop_stride: int = 8,
+    sam3_crop_stride: int = 1,
     sam3_no_instances: bool = False,
 ) -> dict:
     workdir.mkdir(parents=True, exist_ok=True)
@@ -267,7 +267,10 @@ def run(
             checkpoint=checkpoint,
             prompts=clicked.get(pass_index, prompts),
             use_roi=use_roi,
-            roi_padding=roi_padding,
+            # The SAM2 margin exists so the clamp jaws land in the same window
+            # as the plant; SAM3 prompts the holder on full frames instead and
+            # picks its own, tighter default.
+            roi_padding=0.45 if roi_padding is None else roi_padding,
             device=device,
             frame_paths=paths,
             reacquire_root=reacquire,
@@ -317,7 +320,8 @@ def _run_sam3(workdir, frames_dir, p2_dir, sources, use_roi, roi_padding, device
     and the masks exists to place or recover a click.
     """
     from pose_estimator.segmentation_sam3 import (
-        DEFAULT_CROP_PROMPT, Sam3Prompts, load_sam3, segment_sequence_sam3)
+        DEFAULT_CROP_PROMPT, DEFAULT_ROI_PADDING, Sam3Prompts, load_sam3,
+        segment_sequence_sam3)
 
     prompts = Sam3Prompts(
         plant=list(plant_prompts) if plant_prompts else Sam3Prompts().plant,
@@ -347,7 +351,7 @@ def _run_sam3(workdir, frames_dir, p2_dir, sources, use_roi, roi_padding, device
             out_dir=p2_dir,
             prompts=prompts,
             use_roi=use_roi,
-            roi_padding=roi_padding,
+            roi_padding=DEFAULT_ROI_PADDING if roi_padding is None else roi_padding,
             device=device,
             frame_paths=paths,
             crop_stride=crop_stride,
@@ -576,9 +580,11 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument(
         "--roi-padding",
         type=float,
-        default=0.45,
-        help="Pad the tracking crop by this fraction of the plant's size on each side. Generous "
-        "by default so the crop also contains the clamp jaws gripping the stem.",
+        default=None,
+        help="Pad the tracking crop by this fraction of the plant's size on each side. The "
+        "default depends on the backend: 0.45 for sam2, which needs the clamp jaws in the "
+        "same window as the plant, and 0.20 for sam3, which prompts the holder on full "
+        "frames and so spends the margin on petiole resolution instead.",
     )
     parser.add_argument(
         "--plant-point",
@@ -649,8 +655,10 @@ def main(argv: Optional[list] = None) -> None:
         "--sam3-crop-prompt",
         help="the phrase the tracking crop is centred on (default: plant)")
     parser.add_argument(
-        "--sam3-crop-stride", type=int, default=8,
-        help="locate the subject on every Nth full frame; the rest interpolate")
+        "--sam3-crop-stride", type=int, default=1,
+        help="locate the subject on every Nth full frame; the rest interpolate. The "
+             "default locates on every frame -- one extra full-resolution pass, and no "
+             "interpolated windows. Raise it if that pass is what does not fit.")
     parser.add_argument(
         "--sam3-no-instances", action="store_true",
         help="skip masks/leaf_instances/. They cost disk and nothing in P1-P6 reads them "
