@@ -188,7 +188,7 @@ def _frames_as_rgb(frame_paths: Sequence[Path],
 
 
 def _run_session(processor, model, torch, video, phrases: Sequence[str], device: str,
-                 want_soft: bool = False):
+                 want_soft: bool = False, label: str = "tracking"):
     """Track every instance of every phrase over one clip.
 
     Returns `(per_frame, soft)` where `per_frame[i][phrase]` is
@@ -213,9 +213,18 @@ def _run_session(processor, model, torch, video, phrases: Sequence[str], device:
     per_frame: Dict[int, Dict[str, Dict[int, np.ndarray]]] = {}
     soft: Dict[int, np.ndarray] = {}
 
+    # Our own bar rather than the model's, so it can say *which* of the four
+    # sessions a pass runs is on screen. Without that the run prints a header
+    # and then nothing for minutes, which is indistinguishable from a hang --
+    # and the per-frame cost climbs through a session, so the early frames do
+    # not predict the late ones either.
+    from tqdm.auto import tqdm
+
     with torch.inference_mode():
-        for model_outputs in model.propagate_in_video_iterator(
-                inference_session=session, show_progress_bar=False):
+        frames = model.propagate_in_video_iterator(
+            inference_session=session, show_progress_bar=False)
+        for model_outputs in tqdm(frames, total=len(video), desc=f"    {label}",
+                                  unit="frame", leave=True, dynamic_ncols=True):
             index = model_outputs.frame_idx
             result = processor.postprocess_outputs(session, model_outputs)
 
@@ -313,7 +322,8 @@ def solve_crop_with_sam3(processor, model, torch, frame_paths: Sequence[Path],
 
     video = _frames_as_rgb([frame_paths[i] for i in sampled], None)
     full_h, full_w = video[0].shape[:2]
-    per_frame, _ = _run_session(processor, model, torch, video, [phrase], device)
+    per_frame, _ = _run_session(processor, model, torch, video, [phrase], device,
+                                label=f"locating {phrase!r}")
 
     centres = np.full((len(frame_paths), 2), np.nan)
     spans: List[int] = []
@@ -396,6 +406,18 @@ def segment_sequence_sam3(
     first = cv2.imread(str(frame_paths[0]))
     full_h, full_w = first.shape[:2]
 
+    # Said before any of it starts. A pass is several full propagations, not
+    # one, and the count is the difference between a long wait that is
+    # understood and a long wait that looks like a failure.
+    sessions = ["plant"] + (["root"] if prompts.root else []) \
+        + (["holder"] if prompts.holder else [])
+    localising = (f"1 localisation over {len(frame_paths)} full frames + "
+                  if use_roi and crop_stride == 1 else
+                  f"1 localisation over ~{len(frame_paths) // max(crop_stride, 1) + 1} "
+                  f"full frames + " if use_roi else "")
+    print(f"  {localising}{len(sessions)} tracking session(s) "
+          f"({', '.join(sessions)}) over {len(frame_paths)} frames each")
+
     crop = None
     if use_roi:
         where = "every frame" if crop_stride == 1 else f"every {crop_stride}th frame"
@@ -414,12 +436,14 @@ def segment_sequence_sam3(
     print(f"  plant   {list(prompts.plant)}")
     cropped = _frames_as_rgb(frame_paths, crop)
     plant_frames, plant_soft = _run_session(processor, model, torch, cropped,
-                                            prompts.plant, device, want_soft=True)
+                                            prompts.plant, device, want_soft=True,
+                                            label="plant")
 
     root_frames = {}
     if prompts.root:
         print(f"  root    {list(prompts.root)}")
-        root_frames, _ = _run_session(processor, model, torch, cropped, prompts.root, device)
+        root_frames, _ = _run_session(processor, model, torch, cropped, prompts.root,
+                                      device, label="root")
     del cropped
 
     # --- the holder, on full frames, because the crop clips the handles ---
@@ -427,7 +451,8 @@ def segment_sequence_sam3(
     if prompts.holder:
         print(f"  holder  {list(prompts.holder)}  (full frames -- the crop clips the tool)")
         full = _frames_as_rgb(frame_paths, None)
-        holder_frames, _ = _run_session(processor, model, torch, full, prompts.holder, device)
+        holder_frames, _ = _run_session(processor, model, torch, full, prompts.holder,
+                                        device, label="holder (full frames)")
         del full
 
     # --- write, in full-frame coordinates, exactly as the SAM2 path does ---
