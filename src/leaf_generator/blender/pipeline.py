@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from math import radians
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import bpy
 from mathutils import Vector
@@ -19,6 +19,7 @@ from .. import calibration, discovery, sizing
 from ..calibration import SessionCalibration
 from ..keypoints import NoContourError, estimate_attachment_point, pixel_to_local
 from ..mismatch import mask_shape_iou
+from . import staging
 from .keypoint_empty import create_attachment_empty
 from .materials import build_leaf_material
 from .mesh import create_contour_based_mesh
@@ -30,6 +31,10 @@ def run(
     row_spacing: float = 0.02,
     mismatch_warn_threshold: float = 0.5,
     root_collection_name: str = "LeafAssets",
+    attachment_style: str = "point",
+    attachment_size_ratio: float = 0.06,
+    stage_view: bool = True,
+    focus_leaf: Optional[str] = None,
 ) -> None:
     """Load every leaf found under `base_path` into the scene.
 
@@ -44,6 +49,20 @@ def run(
     Sessions without a usable log fall back to normalizing every leaf's
     longer side to `fallback_scale` meters -- those leaves will *not* be
     correctly sized relative to each other or to calibrated sessions.
+
+    `attachment_style` is how the stem-attachment markers are drawn:
+    "point" (a small sphere), "axes" (the old crosses) or "hidden". Their
+    drawn size is `attachment_size_ratio` of the leaf they belong to, so a
+    marker can't end up bigger than its leaf. The Empty and the keypoint
+    JSON are written either way -- "hidden" only stops it being drawn.
+
+    `stage_view` sets up a camera and key light on the finished leaves and
+    fixes the viewport near-clip plane for centimetre-scale subjects; see
+    `staging`. Turn it off to leave the scene's own camera and lighting
+    alone. By default it frames every leaf built, which for a long row means
+    each one is small -- pass `focus_leaf` (a substring of the object name,
+    e.g. "leaf_17") to frame just those instead. `staging.focus_on` does the
+    same thing from the console afterwards, without rebuilding.
     """
     base_path = Path(base_path)
 
@@ -64,23 +83,31 @@ def run(
     bpy.context.scene.render.engine = 'CYCLES'
     root_collection = _get_or_create_collection(bpy.context.scene.collection, root_collection_name)
 
-    total_leaves = 0
+    built: List[bpy.types.Object] = []
     for session_path in sessions:
         session_name = session_path.parent.name
         session_collection = _get_or_create_collection(root_collection, session_name)
-        total_leaves += _process_session(
+        built.extend(_process_session(
             session_path,
             session_name,
             session_collection,
             fallback_scale=fallback_scale,
             row_spacing=row_spacing,
             mismatch_warn_threshold=mismatch_warn_threshold,
-        )
+            attachment_style=attachment_style,
+            attachment_size_ratio=attachment_size_ratio,
+        ))
 
     print(
-        f"[leaf_generator] Done. Built {total_leaves} leaf object(s) across "
+        f"[leaf_generator] Done. Built {len(built)} leaf object(s) across "
         f"{len(sessions)} session(s) under collection '{root_collection_name}'."
     )
+
+    if stage_view:
+        if focus_leaf:
+            staging.focus_on(focus_leaf)
+        else:
+            staging.stage(built)
 
 
 def _discover_sessions(base_path: Path) -> List[Path]:
@@ -105,10 +132,12 @@ def _process_session(
     fallback_scale: float,
     row_spacing: float,
     mismatch_warn_threshold: float,
-) -> int:
+    attachment_style: str,
+    attachment_size_ratio: float,
+) -> List[bpy.types.Object]:
     leaves = discovery.find_leaf_groups(session_path)
     if not leaves:
-        return 0
+        return []
 
     session_calibration = calibration.load_session_calibration(session_path, side=discovery.PRIMARY_SIDE)
     if session_calibration is not None:
@@ -128,9 +157,9 @@ def _process_session(
     keypoints_dir.mkdir(exist_ok=True)
 
     y_offset = 0.0
-    count = 0
+    built: List[bpy.types.Object] = []
     for leaf in leaves.values():
-        next_offset = _process_leaf(
+        result = _process_leaf(
             leaf,
             session_name=session_name,
             collection=collection,
@@ -140,13 +169,15 @@ def _process_session(
             row_spacing=row_spacing,
             mismatch_warn_threshold=mismatch_warn_threshold,
             keypoints_dir=keypoints_dir,
+            attachment_style=attachment_style,
+            attachment_size_ratio=attachment_size_ratio,
         )
-        if next_offset is None:
+        if result is None:
             continue
-        y_offset = next_offset
-        count += 1
+        obj, y_offset = result
+        built.append(obj)
 
-    return count
+    return built
 
 
 def _process_leaf(
@@ -159,7 +190,9 @@ def _process_leaf(
     row_spacing: float,
     mismatch_warn_threshold: float,
     keypoints_dir: Path,
-) -> Optional[float]:
+    attachment_style: str,
+    attachment_size_ratio: float,
+) -> Optional[Tuple[bpy.types.Object, float]]:
     primary_side = leaf.primary_side
     front_maps = leaf.maps_for(primary_side)
     mask_path = front_maps.get("mask")
@@ -214,7 +247,13 @@ def _process_leaf(
     obj.location.z = -z_min
     bpy.context.view_layer.update()
 
-    attachment_record = _place_attachment_empty(mesh_name, obj, mask_path, mesh_result, collection, leaf.leaf_id)
+    attachment_record = _place_attachment_empty(
+        mesh_name, obj, mask_path, mesh_result, collection, leaf.leaf_id,
+        # Sized off the leaf rather than a fixed constant, so the marker
+        # stays legible on a 6 cm leaf without burying a 2 cm one.
+        display_size=leaf_height * attachment_size_ratio,
+        style=attachment_style,
+    )
     size_record = _measure_leaf_size(mask_path, session_calibration, leaf.leaf_id)
 
     _write_keypoint_json(
@@ -230,10 +269,13 @@ def _process_leaf(
     )
 
     print(f"[leaf_generator] {mesh_name}: positioned at Y={obj.location.y:.3f}, height={leaf_height:.3f}m")
-    return y_offset + leaf_height + row_spacing
+    return obj, y_offset + leaf_height + row_spacing
 
 
-def _place_attachment_empty(mesh_name, obj, mask_path, mesh_result, collection, leaf_id) -> Optional[Dict]:
+def _place_attachment_empty(
+    mesh_name, obj, mask_path, mesh_result, collection, leaf_id,
+    display_size: float, style: str,
+) -> Optional[Dict]:
     try:
         keypoint = estimate_attachment_point(mask_path)
     except (NoContourError, FileNotFoundError) as exc:
@@ -241,7 +283,10 @@ def _place_attachment_empty(mesh_name, obj, mask_path, mesh_result, collection, 
         return None
 
     local = pixel_to_local(keypoint["pixel"], keypoint["image_size"], mesh_result.scale_x, mesh_result.scale_y)
-    empty = create_attachment_empty(f"{mesh_name}_attachment", obj, local, collection=collection)
+    empty = create_attachment_empty(
+        f"{mesh_name}_attachment", obj, local, collection=collection,
+        display_size=display_size, style=style,
+    )
     bpy.context.view_layer.update()
     world = empty.matrix_world.translation
 

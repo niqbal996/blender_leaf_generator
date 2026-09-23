@@ -153,8 +153,9 @@ vggt = [
 # NOT use: it requires Python 3.12+ and torch 2.7+, and setup_env.sh builds a
 # 3.10 env. The transformers port runs the same weights on 3.10.
 sam3 = [
-    "torch",
+    "torch>=2.5",
     "transformers>=5.0",
+    "kernels>=0.16,<0.17",
     "opencv-contrib-python",
 ]
 # pose-geometry --backends vggt_omega -- VGGT-Omega ships no COLMAP exporter,

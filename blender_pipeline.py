@@ -61,7 +61,47 @@ from leaf_generator.blender.pipeline import run  # noqa: E402
 # viewed from inside WSL, so this reaches the same files:
 MAPS_FOLDER = os.environ.get(
     "LEAF_MAPS_PATH",
-    r"E:\Camera_rig_data\2026-07-20-Naeem\weed1\maps",
+    r"D:\PBR_Scans\2026-09-16-Naeem\gaensefuss_1\maps",
 )
 
 run(MAPS_FOLDER)
+
+# --- Optional: animate the camera and key light over the leaves, to see how
+# the materials behave as the lighting angle travels across them. Leave
+# ANIMATE as None for a still scene.
+#
+#   "dolly" tracks along the row from above, close enough that each leaf
+#           roughly fills the frame -- the way to actually look at a row
+#           that's over a metre long.
+#   "orbit" circles one leaf; pair it with FOCUS.
+#
+# Set FOCUS to part of an object name ("leaf_17") to animate just that leaf.
+# After running, press Spacebar in the viewport to play it back. Set
+# VIDEO_OUTPUT to a path to also write an mp4 (slow -- it renders every
+# frame), or leave it None and use Render > Render Animation when ready. ---
+ANIMATE = None        # None | "dolly" | "orbit"
+FOCUS = None          # e.g. "leaf_17"
+VIDEO_OUTPUT = None   # e.g. r"C:\Users\niqbal\Desktop\gaensefuss"
+
+# Dolly pace: how many frames the camera spends covering each leaf. Higher is
+# slower. At 24fps, 8 frames/leaf is a brisk pass and 24 is a leaf per second.
+# This is preferred over a fixed total frame count because it holds the pace
+# steady whether a session has 8 leaves or 35.
+FRAMES_PER_LEAF = 12
+
+# Dolly height, as a multiple of what framing the median leaf asks for.
+# Below 1 moves the camera down (closer, bigger leaves, more raking light);
+# above 1 moves it up (smaller leaves, more of the row in shot).
+HEIGHT_SCALE = 1.0
+
+if ANIMATE:
+    from leaf_generator.blender import animation  # noqa: E402
+
+    animation.flythrough(
+        mode=ANIMATE,
+        focus=FOCUS,
+        frames_per_leaf=FRAMES_PER_LEAF,
+        height_scale=HEIGHT_SCALE,
+    )
+    if VIDEO_OUTPUT:
+        animation.render_video(VIDEO_OUTPUT)

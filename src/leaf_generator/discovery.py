@@ -13,6 +13,12 @@ Expects filenames of the form ``<leaf_id>_<TYPE>_<side>.png`` inside a flat
 
 ``unterseite`` (underside) is optional per leaf; ``oberseite`` (topside) is
 treated as the primary side whenever it exists.
+
+The trailing token doesn't have to be a side name. Sessions captured from
+2026-07-31 on put the plant name there instead (``1_ALBEDO_plant_1.png``,
+``10_mask_gaensefuss_1.png``) and scan a single face per leaf; those load as
+one unnamed side, which `primary_side` picks up and `has_both_sides` reports
+False for, so they build as single-sided leaves.
 """
 
 from __future__ import annotations
@@ -22,9 +28,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Union
 
+# The trailing token is whatever the capture wrote there. Older sessions put
+# the side (`oberseite`/`unterseite`) in that slot and scanned both faces of
+# each leaf; since 2026-07-31 the capture writes the plant name instead
+# (`1_ALBEDO_plant_1.png`) and scans one face only. Anything that isn't a
+# recognized side name is therefore treated as a single unnamed side -- see
+# `LeafMapSet.primary_side` / `has_both_sides`, which key off the two real
+# side names and so degrade to single-sided on their own.
 _FILENAME_RE = re.compile(
     r"^(?P<id>[A-Za-z0-9]+)_(?P<type>ALBEDO|HEIGHT|MASK|NORMAL_GL|NORMAL_DX|ROUGHNESS)"
-    r"_(?P<side>oberseite|unterseite)\.(?:png|jpe?g|tiff?)$",
+    r"_(?P<side>[A-Za-z0-9_-]+)\.(?:png|jpe?g|tiff?)$",
     re.IGNORECASE,
 )
 

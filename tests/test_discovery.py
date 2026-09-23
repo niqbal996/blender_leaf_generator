@@ -38,3 +38,33 @@ def test_find_leaf_groups_sorts_numerically(tmp_path):
     groups = find_leaf_groups(tmp_path)
 
     assert list(groups.keys()) == ["1", "2", "10"]
+
+
+def test_find_leaf_groups_plant_name_in_side_slot(tmp_path):
+    """Captures from 2026-07-31 on write the plant name where the side used
+    to go, and scan one face only."""
+    for leaf_id in ("1", "10"):
+        for map_type in ("ALBEDO", "HEIGHT", "mask", "NORMAL_GL", "ROUGHNESS"):
+            (tmp_path / f"{leaf_id}_{map_type}_gaensefuss_1.png").touch()
+    (tmp_path / "gaensefuss_1_log.json").touch()
+
+    groups = find_leaf_groups(tmp_path)
+
+    assert list(groups.keys()) == ["1", "10"]
+    leaf = groups["1"]
+    assert not leaf.has_both_sides
+    assert leaf.primary_side == "gaensefuss_1"
+    assert set(leaf.maps_for("gaensefuss_1").keys()) == {
+        "albedo", "height", "mask", "normal", "roughness",
+    }
+
+
+def test_find_leaf_groups_skips_log_sidecars(tmp_path):
+    """The looser side token must still not swallow the *_log.json sidecars
+    or other stray files sitting in the same folder."""
+    (tmp_path / "1_mask_gaensefuss_1.png").touch()
+    (tmp_path / "gaensefuss_1_log.json").touch()
+    (tmp_path / "oberseite_log.json").touch()
+    (tmp_path / "notes.txt").touch()
+
+    assert list(find_leaf_groups(tmp_path).keys()) == ["1"]
