@@ -17,6 +17,7 @@ from pose_estimator.pose import evaluate_poses, _connectivity_checks
 from pose_estimator.reconstruction import (
     capture_guidance,
     describe_connectivity,
+    log_connectivity,
 )
 
 
@@ -55,10 +56,24 @@ def test_a_split_names_the_pass_that_was_left_out():
     assert info["winner"]["passes"] == {0: 96}
     assert info["passes_absent_from_winner"] == [1]
     assert info["discarded_models"] == [
-        {"model": 1, "num_images": 30, "passes": {1: 30}}
+        {"model": 1, "num_images": 30, "passes": {1: 30}, "shared_images": 0}
     ]
     # Every image is accounted for by some scene, so none are "unregistered".
     assert info["unregistered"] == []
+
+
+def test_a_scene_that_shares_an_image_is_not_reported_as_disjoint(capsys):
+    # maize_1 (2026-09-28): the side-pass scene also registered one 45-degree
+    # frame that the winner holds too. The log used to say "shares no images".
+    bridge = TOPDOWN[0]
+    orbit, topdown = FakeModel(ORBIT + [bridge]), FakeModel(TOPDOWN)
+    info = describe_connectivity({0: orbit, 1: topdown}, orbit, ORBIT + TOPDOWN, SOURCES)
+
+    assert info["discarded_models"][0]["shared_images"] == 1
+    log_connectivity("mapping", info)
+    out = capsys.readouterr().out
+    assert "shares 1 image(s)" in out
+    assert "shares no images" not in out
 
 
 def test_a_lost_pass_fails_the_check():

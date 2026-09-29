@@ -194,6 +194,10 @@ def describe_connectivity(models: dict, best, all_names, sources=None) -> dict:
             "model": int(model_id),
             "num_images": len(names),
             "passes": _pass_counts(names, sources),
+            # COLMAP may register one image in two scenes. Nonzero means the
+            # scenes do overlap -- thinly -- but COLMAP never merges scenes, so
+            # this one is dropped all the same.
+            "shared_images": len(names & won),
         })
 
     nowhere = [n for n in all_names if n not in claimed]
@@ -222,8 +226,13 @@ def log_connectivity(stage: str, info: dict) -> None:
     for other in info["discarded_models"]:
         print(f"  [{stage}] SEPARATE scene {other['model']}: {other['num_images']} image(s) -- "
               f"{_fmt_passes(other['passes'])}")
-        print(f"  [{stage}]   ^ built fine, but shares no images with the winning scene, "
-              f"so keeping the winner throws it away")
+        shared = other.get("shared_images", 0)
+        if shared:
+            print(f"  [{stage}]   ^ built fine and shares {shared} image(s) with the winning "
+                  f"scene, but COLMAP does not merge scenes, so keeping the winner throws it away")
+        else:
+            print(f"  [{stage}]   ^ built fine, but shares no images with the winning scene, "
+                  f"so keeping the winner throws it away")
     if info["unregistered"]:
         print(f"  [{stage}] in no scene at all: {len(info['unregistered'])} image(s) -- "
               f"{_fmt_passes(info['unregistered_passes'])}")
@@ -250,7 +259,7 @@ def capture_guidance(info: dict, low_texture: bool) -> List[str]:
         lines.append(
             f"  - frames from {_fmt_passes({p: info['passes_total'].get(p, 0) for p in split_passes})} "
             f"match each other but not the winning scene. Exhaustive matching already "
-            f"compared every image pair, so this is missing overlap in the capture, "
+            f"compared every image pair, so this is too little overlap in the capture, "
             f"not a setting that needs loosening.")
         lines.append(
             "  - shoot the joining pass as a CONTINUOUS climb in elevation starting from "
@@ -400,9 +409,20 @@ def build_sparse_reconstruction(
         print(f"  EXIF intrinsics: {len(known)} camera(s) seeded from the lens -- {summary}"
               + (f"; {len(unknown)} frame(s) without EXIF left to COLMAP's guess" if unknown else ""))
     else:
+        mode = _camera_mode(cameras, single_camera)
         if cameras == "exif":
             print("  no EXIF focal lengths recorded for these frames "
-                  "(video, or photos with stripped EXIF) -- using one shared camera")
+                  "(video, or photos with stripped EXIF)")
+        # Said every time. A free camera per frame is right for mixed zooms
+        # without EXIF, but it loosens every pose and makes each registration
+        # estimate its own focal -- maize_1 (2026-09-28) solved that way, with
+        # its focal wandering 1710..1826px on one fixed lens, and the log was silent.
+        if mode == pycolmap.CameraMode.SINGLE:
+            print("  cameras: one shared camera, focal left to COLMAP's guess")
+        else:
+            print(f"  cameras: {mode.name} -- every frame gets its own camera and free "
+                  f"focal (cameras={cameras!r}, single_camera={single_camera}). For one "
+                  f"lens at one zoom, --cameras exif (or single) is much tighter")
         pycolmap.extract_features(
             db_path,
             image_dir,
@@ -484,8 +504,11 @@ def build_sparse_reconstruction(
                 best = candidate
                 reconstructions = again
             else:
-                print(f"  no images recovered (still {best.num_reg_images()}) -- "
-                      f"the missing frames genuinely do not overlap this scene")
+                # Not "no overlap": maize_1 (2026-09-28) recovered nothing here
+                # while its side pass had 365 verified matches into this scene,
+                # all at one azimuth -- just short of the registration minimum.
+                print(f"  no images recovered (still {best.num_reg_images()}) -- none "
+                      f"reached COLMAP's registration minimum against this scene")
         recovery = describe_connectivity(reconstructions, best, all_names, sources)
         log_connectivity("after retry", recovery)
 
