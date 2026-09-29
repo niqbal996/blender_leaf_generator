@@ -227,7 +227,11 @@ def log_connectivity(stage: str, info: dict) -> None:
         print(f"  [{stage}] SEPARATE scene {other['model']}: {other['num_images']} image(s) -- "
               f"{_fmt_passes(other['passes'])}")
         shared = other.get("shared_images", 0)
-        if shared:
+        if "focal_drift" in other:
+            print(f"  [{stage}]   ^ larger, but REJECTED as degenerate: its focal settled "
+                  f"{other['focal_drift']:+.0%} off the lens's EXIF focal "
+                  f"(limit {MAX_FOCAL_DRIFT:.0%})")
+        elif shared:
             print(f"  [{stage}]   ^ built fine and shares {shared} image(s) with the winning "
                   f"scene, but COLMAP does not merge scenes, so keeping the winner throws it away")
         else:
@@ -254,10 +258,16 @@ def capture_guidance(info: dict, low_texture: bool) -> List[str]:
         return []
 
     lines = ["why this happens and what fixes it:"]
-    split_passes = sorted({p for other in info["discarded_models"] for p in other["passes"]})
+    # Frames actually in the separate scene(s), not the pass totals: a scene can
+    # hold part of a pass that the winner also holds (maize_1: 20 of 37).
+    split_counts: Dict[int, int] = {}
+    for other in info["discarded_models"]:
+        for p, n in other["passes"].items():
+            split_counts[p] = split_counts.get(p, 0) + n
+    split_passes = sorted(split_counts)
     if split_passes:
         lines.append(
-            f"  - frames from {_fmt_passes({p: info['passes_total'].get(p, 0) for p in split_passes})} "
+            f"  - frames from {_fmt_passes(split_counts)} "
             f"match each other but not the winning scene. Exhaustive matching already "
             f"compared every image pair, so this is too little overlap in the capture, "
             f"not a setting that needs loosening.")
@@ -280,6 +290,84 @@ def capture_guidance(info: dict, low_texture: bool) -> List[str]:
         "low and a high camera, and a repeating checkerboard aliases); the plant is "
         "weakest of all -- smooth, self-occluding and slightly mobile.")
     return lines
+
+
+# --------------------------------------------------------------------------
+# Scene sanity: which scene may win, and which images it may keep
+# --------------------------------------------------------------------------
+#
+# "Most images wins" assumes every scene COLMAP built is geometrically sound.
+# On maize_1 (2026-09-29, EXIF cameras) it was not: the larger scene (45-degree
+# + top-down passes, 72 images) had its one shared focal run away to 2698px on a
+# 1653px lens, and it beat a 61-image scene whose side and 45-degree orbits were
+# 0.12% and 0.22% circles, 0.6 deg apart. The top-down pass is near-pure spin
+# about the optical axis, which says nothing about focal, so a scene it
+# dominates can let the focal drift with nothing pulling it back.
+#
+# The lens is known, so a scene's focal is an independent check on it. Measured
+# over five scenes on maize_1 and sugarbeet_1: sound ones land within 11.5% of
+# EXIF per image (median drift at most 7.2%); the degenerate one at +63%.
+MAX_FOCAL_DRIFT = 0.25
+
+# An image left with this few triangulated points is placed by nothing -- BA
+# filtered away what it registered on. Measured: the lowest sound image across
+# the same five scenes had 37; sugarbeet_1's frame_0089 had 3 and sat 62 units
+# off an orbit of radius 3.6, which alone failed three P3 checks.
+MIN_IMAGE_SUPPORT = 15
+
+
+def focal_drift(reconstruction, focal_priors: Optional[Dict[str, float]]) -> Optional[float]:
+    """Median relative gap between a scene's solved focal and each frame's EXIF
+    focal, or None when there is no EXIF to compare against."""
+    if not focal_priors:
+        return None
+    drifts = []
+    for image_id in reconstruction.reg_image_ids():
+        image = reconstruction.images[image_id]
+        prior = focal_priors.get(Path(image.name).stem)
+        if prior:
+            focal = reconstruction.cameras[image.camera_id].mean_focal_length()
+            drifts.append(focal / prior - 1.0)
+    return float(np.median(drifts)) if drifts else None
+
+
+def pick_winner(reconstructions: dict, focal_priors: Optional[Dict[str, float]]):
+    """The largest scene whose focal is plausible for the lens.
+
+    Returns (winner, rejected) where `rejected` lists the scenes that were
+    excluded, largest ones included. If every scene is implausible the largest
+    still wins -- a degenerate result reported loudly beats no result, and the
+    orbit checks will fail it downstream.
+    """
+    plausible, rejected = {}, []
+    for model_id, model in reconstructions.items():
+        drift = focal_drift(model, focal_priors)
+        if drift is not None and abs(drift) > MAX_FOCAL_DRIFT:
+            rejected.append({"model": int(model_id), "num_images": model.num_reg_images(),
+                             "focal_drift": drift})
+        else:
+            plausible[model_id] = model
+    pool = plausible or reconstructions
+    return max(pool.values(), key=lambda model: model.num_reg_images()), rejected
+
+
+def _mark_rejected(info: dict, rejected: List[dict]) -> dict:
+    drift_of = {r["model"]: r["focal_drift"] for r in rejected}
+    for other in info["discarded_models"]:
+        if other["model"] in drift_of:
+            other["focal_drift"] = drift_of[other["model"]]
+    return info
+
+
+def drop_unsupported_images(reconstruction, min_support: int = MIN_IMAGE_SUPPORT) -> List[Tuple[str, int]]:
+    """Deregister images too weakly supported to trust. Returns (name, support)."""
+    dropped = []
+    for image_id in list(reconstruction.reg_image_ids()):
+        image = reconstruction.images[image_id]
+        if image.num_points3D < min_support:
+            dropped.append((image.name, int(image.num_points3D)))
+            reconstruction.deregister_frame(image.frame_id)
+    return dropped
 
 
 def build_sparse_reconstruction(
@@ -451,10 +539,11 @@ def build_sparse_reconstruction(
             "or steadier rotation."
         )
 
-    best = max(reconstructions.values(), key=lambda rec: rec.num_reg_images())
+    best, rejected = pick_winner(reconstructions, focal_priors)
 
     # --- Layer 1: say what happened -------------------------------------
-    first = describe_connectivity(reconstructions, best, all_names, sources)
+    first = _mark_rejected(describe_connectivity(reconstructions, best, all_names, sources),
+                           rejected)
     log_connectivity("mapping", first)
 
     # --- Layer 2: give the leftovers a second, fairer attempt -----------
@@ -498,21 +587,35 @@ def build_sparse_reconstruction(
         if again:
             candidate = max(again.values(), key=lambda rec: rec.num_reg_images())
             gained = candidate.num_reg_images() - best.num_reg_images()
-            if gained > 0:
+            drift = focal_drift(candidate, focal_priors)
+            if drift is not None and abs(drift) > MAX_FOCAL_DRIFT:
+                print(f"  retry REJECTED: its focal drifted {drift:+.0%} off the lens's EXIF "
+                      f"focal (limit {MAX_FOCAL_DRIFT:.0%}) -- keeping the first result")
+            elif gained > 0:
                 print(f"  recovered {gained} image(s): "
                       f"{best.num_reg_images()} -> {candidate.num_reg_images()} registered")
                 best = candidate
                 reconstructions = again
+                rejected = []   # model ids refer to the first mapping, not this one
             else:
                 # Not "no overlap": maize_1 (2026-09-28) recovered nothing here
                 # while its side pass had 365 verified matches into this scene,
                 # all at one azimuth -- just short of the registration minimum.
                 print(f"  no images recovered (still {best.num_reg_images()}) -- none "
                       f"reached COLMAP's registration minimum against this scene")
-        recovery = describe_connectivity(reconstructions, best, all_names, sources)
+        recovery = _mark_rejected(
+            describe_connectivity(reconstructions, best, all_names, sources), rejected)
         log_connectivity("after retry", recovery)
 
     final = recovery or first
+
+    dropped = drop_unsupported_images(best)
+    if dropped:
+        print(f"  dropped {len(dropped)} image(s) with fewer than {MIN_IMAGE_SUPPORT} "
+              f"triangulated points -- a pose nothing supports: "
+              + ", ".join(f"{name} ({n})" for name, n in dropped))
+        final = _mark_rejected(
+            describe_connectivity(reconstructions, best, all_names, sources), rejected)
 
     # --- Layer 3: when the solver is out of moves, say what to change ----
     guidance = capture_guidance(final, low_texture)
@@ -538,6 +641,8 @@ def build_sparse_reconstruction(
         "recovered_images": (
             (recovery["winner"]["num_images"] - first["winner"]["num_images"])
             if recovery else 0),
+        "rejected_scenes": rejected,
+        "dropped_images": [{"name": name, "support": n} for name, n in dropped],
         "guidance": guidance,
     }
     with open(output_dir / "solve.json", "w") as handle:
