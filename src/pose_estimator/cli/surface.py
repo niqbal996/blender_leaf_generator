@@ -49,7 +49,11 @@ def run(
     hull_fields = read_ply_vertices(workdir / "p4" / "hull_points.ply")
     hull = np.stack([hull_fields["x"], hull_fields["y"], hull_fields["z"]], axis=1).astype(np.float64)
     with open(workdir / "p4" / "hull.json") as f:
-        hull_voxel = json.load(f)["voxel_size"]
+        hull_meta = json.load(f)
+    hull_voxel = hull_meta["voxel_size"]
+    # What P4a dilated its masks by, so the rejection below can be the same
+    # physical slack rather than a multiple of whatever grid was carved.
+    mask_dilation_px = hull_meta.get("mask_dilation_px")
 
     reconstruction = pycolmap.Reconstruction(str(workdir / "p3" / "sparse" / "best"))
     sparse = np.array([p.xyz for p in reconstruction.points3D.values()])
@@ -81,10 +85,14 @@ def run(
 
     print("Extracting geometry from rendered depth and carving against the hull...")
     points, normals, carve_stats = render_surface_points(
-        params, views, hull, hull_voxel, alpha_threshold=alpha_threshold, device=device
+        params, views, hull, hull_voxel, alpha_threshold=alpha_threshold,
+        mask_dilation_px=mask_dilation_px, device=device
     )
+    tolerance = ("the %g px mask dilation at each point's own depth" % mask_dilation_px
+                 if mask_dilation_px else "2 voxels")
     print(f"  back-projected {carve_stats['raw_backprojected']} points, "
-          f"{carve_stats['rejected_fraction']:.1%} rejected by the hull")
+          f"{carve_stats['rejected_fraction']:.1%} rejected by the hull "
+          f"(tolerance: {tolerance})")
 
     points, normals = consolidate(points, normals, voxel=hull_voxel)
     print(f"  consolidated to {len(points)} surface points")

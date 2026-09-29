@@ -909,6 +909,33 @@ if [[ -n "${MISSING// /}" ]]; then
     exit 1
 fi
 
+# pycolmap is imported lazily, so the check above proves only that it is
+# installed. A CUDA build whose runtime will not load -- or use_gpu on a CPU
+# build -- otherwise fails at P3, after P1/P2 have already spent their time.
+if [[ " $REQUIRED " == *" pycolmap "* ]]; then
+    COLMAP_STATE="$("$PY" - <<'PYCHECK' 2>&1
+try:
+    import pycolmap
+except Exception as exc:
+    cause = exc.__cause__ or exc     # the real loader error, not pycolmap's rewrap
+    print(f"{type(cause).__name__}: {cause}")
+else:
+    print(int(bool(getattr(pycolmap, "has_cuda", False))))
+PYCHECK
+)"
+    case "$COLMAP_STATE" in
+        0|1) ;;
+        *)  echo "ERROR: pycolmap is installed but does not import: $COLMAP_STATE" >&2
+            echo "  pycolmap-cuda:  python scripts/link_pycolmap_cuda.py   (or re-run ./setup_env.sh)" >&2
+            exit 1 ;;
+    esac
+    if [[ "$USE_GPU" == 1 && "$COLMAP_STATE" != 1 ]]; then
+        echo "ERROR: use_gpu is on, but this pycolmap is a CPU build (pycolmap.has_cuda is False)" >&2
+        echo "  install pycolmap-cuda with ./setup_env.sh, or set use_gpu = 0" >&2
+        exit 1
+    fi
+fi
+
 # P4b's CUDA toolchain, checked now rather than after COLMAP. gsplat ships no
 # prebuilt wheels, so it JIT-compiles on first render -- and if nvcc is too
 # old or missing, that surfaces 40 minutes into a run, immediately after the

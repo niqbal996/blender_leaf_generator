@@ -46,18 +46,19 @@ skeleton = [
 # Same as "skeleton", but with GPU-accelerated SIFT feature extraction
 # (pycolmap-cuda instead of pycolmap -- CPU SIFT on phone-camera-sized
 # images is easy to OOM-kill with the default thread-per-core extraction).
-# After installing, `import pycolmap` may raise "libcudart.so.12: cannot
-# open shared object file" if no CUDA runtime is on the system already;
-# nvidia-cuda-runtime-cu12 provides one, but its lib/ dir still needs to be
-# on LD_LIBRARY_PATH, e.g.:
-#   conda env config vars set LD_LIBRARY_PATH=$(python -c \
-#     "import nvidia.cuda_runtime as m, os; print(os.path.join(m.__path__[0], 'lib'))")
+# The wheel links libcudart.so.12 and libcurand.so.10 but bundles neither,
+# so a bare install fails `import pycolmap` with "libcudart.so.12: cannot
+# open shared object file". The two nvidia-*-cu12 packages below supply the
+# files; setup_env.sh then symlinks them into site-packages/pycolmap_cuda.libs,
+# which is on the extension's RPATH -- no LD_LIBRARY_PATH needed. By hand:
+#   python scripts/link_pycolmap_cuda.py
 # Mutually exclusive with "skeleton"/"splat" (or plain "pycolmap") in the
 # same environment -- both packages install into the same `pycolmap`
 # importable module, so whichever installs last wins.
 skeleton-gpu = [
     "pycolmap-cuda",
     "nvidia-cuda-runtime-cu12",
+    "nvidia-curand-cu12",
     "matplotlib",
 ]
 # pose-train-splat -- trains a 3D Gaussian Splat from a "skeleton"

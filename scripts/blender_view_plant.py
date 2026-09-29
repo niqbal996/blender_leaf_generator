@@ -251,8 +251,15 @@ def emission_material(name, rgba, strength=1.0):
     return mat
 
 
-def vertex_colour_material(name):
-    """Emission driven by the mesh's own Color attribute."""
+def vertex_colour_material(name, fallback=None):
+    """Emission driven by the mesh's own Color attribute.
+
+    `fallback` is what Blender's **Solid** viewport shows. Solid mode does not
+    read the Color attribute -- it uses the material's `diffuse_color` -- so
+    without this every cloud here renders flat grey until the viewport is
+    switched to Material Preview, which looks exactly like the colours never
+    having been written. `emission_material` has always set it; this did not.
+    """
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
     nodes, links = mat.node_tree.nodes, mat.node_tree.links
@@ -263,6 +270,9 @@ def vertex_colour_material(name):
     attr.attribute_name = "Color"
     links.new(attr.outputs["Color"], emit.inputs["Color"])
     links.new(emit.outputs["Emission"], out.inputs["Surface"])
+    if fallback is not None:
+        mat.diffuse_color = (float(fallback[0]), float(fallback[1]),
+                             float(fallback[2]), 1.0)
     return mat
 
 
@@ -324,7 +334,12 @@ def add_point_cloud(xyz, rgb, radius, into, name="plant_cloud", material=None):
     layer.data.foreach_set("color", np.hstack([rgb, alpha]).ravel())
 
     obj = bpy.data.objects.new(name, mesh)
-    material = material or vertex_colour_material(f"{name}_mat")
+    # The cloud's mean colour stands in for it in Solid shading, which cannot
+    # read per-point colour. On a single-organ object -- every P5x leaf -- the
+    # mean *is* the colour, so Solid view becomes exact rather than merely
+    # closer.
+    material = material or vertex_colour_material(
+        f"{name}_mat", fallback=(np.asarray(rgb).mean(axis=0) if len(rgb) else None))
     obj.data.materials.append(material)
     into.objects.link(obj)
 
@@ -746,6 +761,8 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True,
     print(f"[plant] origin: {graph.get('origin_definition', 'unknown')}")
     print(f"[plant] extent {extent:.3f}, stem radius {stem_radius:.4f}, "
           f"points {point_radius:.4f}")
+    print("[plant] this is the P5 scene (crown -> tips -> geodesic midribs). For one")
+    print("[plant] object per leaf from SAM3's own 2D ids, re-run with --p5x.")
     print(f"[plant] collections: {prefix}plant_cloud, {prefix}plant_root, "
           f"{prefix}plant_stem_cloud, {prefix}plant_stem, {prefix}plant_midribs, "
           f"{prefix}plant_tips")
@@ -825,10 +842,51 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True):
             add_point_cloud(xyz[keep], rgb[keep], point_radius,
                             _collection(coll), name=name)
 
+    # The traced skeleton: a midrib per leaf, the petiole that carries it, and
+    # a ball on every tip. Drawn from p5x/skeleton.json rather than from the
+    # clouds, because these are curves -- the whole point of tracing them was
+    # to stop describing a leaf as a heap of points.
+    drawn_ribs = 0
+    graph_path = p5x / "skeleton.json"
+    if graph_path.exists():
+        with open(graph_path) as f:
+            graph = json.load(f)
+        ribs = _collection("p5x_midribs")
+        petioles = _collection("p5x_petioles")
+        tips = _collection("p5x_tips")
+        for leaf in graph.get("leaves", []):
+            colour = LEAF_RGBA[leaf["id"] % len(LEAF_RGBA)]
+            midrib = np.asarray(leaf.get("midrib") or [], float)
+            if len(midrib) >= 2:
+                add_curve(midrib, f"p5x_midrib_{leaf['id']:03d}", colour,
+                          point_radius * 1.6, ribs)
+                drawn_ribs += 1
+            petiole = np.asarray(leaf.get("petiole") or [], float)
+            if len(petiole) >= 2:
+                add_curve(petiole, f"p5x_petiole_{leaf['id']:03d}", STEM_RGBA,
+                          point_radius * 1.3, petioles)
+            add_sphere(np.asarray(leaf["tip"], float), f"p5x_tip_{leaf['id']:03d}",
+                       TIP_RGBA, point_radius * 3.0, tips)
+        crown = graph.get("crown")
+        if crown:
+            add_sphere(np.asarray(crown, float), "p5x_crown", CROWN_RGBA,
+                       point_radius * 4.5, _collection("p5x_crown"))
+        print(f"[plant] {drawn_ribs} midribs, {len(graph.get('leaves', []))} tips, "
+              f"crown {'placed' if crown else 'not found'}")
+        if graph.get("unreachable"):
+            print(f"[plant] no midrib for leaves {graph['unreachable']} -- they never")
+            print("[plant] reach the crown through the cloud")
+    else:
+        print(f"[plant] no {graph_path.name}: point clouds only, no traced skeleton.")
+        print("[plant] Re-run pose-leaf-instances to trace midribs and tips.")
+
     print(f"[plant] P5x: {drawn} leaves, "
           f"{int((label == SKELETON).sum())} skeleton points, "
           f"{int((label == ROOT).sum())} root points")
     print("[plant] each leaf is its own object under the 'p5x_leaves' collection")
+    print("[plant] if everything looks grey, the viewport is in Solid shading with")
+    print("[plant] Color set to Material -- press Z and pick Material Preview, or set")
+    print("[plant] Viewport Shading > Color > Attribute.")
     if frame:
         frame_view((low + high) / 2.0, extent)
     return {"leaves": drawn, "points": len(xyz), "extent": extent}

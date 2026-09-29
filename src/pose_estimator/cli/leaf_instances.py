@@ -81,6 +81,7 @@ from pose_estimator.semantic import (
     render_points,
     view_weights,
 )
+from pose_estimator.leaf_skeleton import trace
 from pose_estimator.cli.report import print_checks
 
 # Sentinels in instances.npy, chosen so a leaf index stays a plain 0-based
@@ -458,9 +459,47 @@ def run(
             assignment[mask] = SKELETON
             dropped += 1
 
+    # --- upright, and in the same frame P5 draws in ---
+    #
+    # The cloud is in the reconstruction's own frame, where "up" is wherever
+    # COLMAP's first camera happened to look -- which is why an unrotated P5x
+    # scene lies on its side in Blender. P5 already solves the upright plant
+    # frame and records it, so it is read rather than solved again: two scenes
+    # built from one capture must not disagree about which way the plant grew.
+    frame = _plant_frame(workdir, geometry_backend)
+    if frame is not None:
+        origin, rotation = frame
+        points = (points - origin) @ rotation.T
+        print("  rotated into P5's upright plant frame (origin on the clamp line)")
+    else:
+        print("  WARNING: no p5/stem_graph.json, so the cloud is drawn in the raw")
+        print("    reconstruction frame and will not stand upright. Run pose-structure,")
+        print("    or accept an arbitrarily oriented scene.")
+
+    # --- the skeleton, traced through tissue whose identity is already known ---
+    voxel, voxel_origin = cloud_source.voxel_size(workdir, geometry_backend, points)
+    skeleton = trace(points, assignment, voxel)
+    if skeleton.get("crown_moved_to_largest_component"):
+        moved = skeleton["crown_moved_to_largest_component"]
+        print(f"  the crown fell on a {moved['from_component_size']}-point island, so it was "
+              f"moved to the foot of the {moved['to_component_size']}-point plant body")
+    if skeleton.get("graph_components", 1) > 1:
+        print(f"  the cloud is {skeleton['graph_components']} disconnected pieces -- the clamp "
+              "cuts the root off, and a thin petiole can be carved through")
+    if skeleton["unreachable"]:
+        print(f"  {len(skeleton['unreachable'])} leaf/leaves never reach the crown through "
+              f"the cloud: {skeleton['unreachable']}")
+        print("    their bridge to the plant was carved away, so they get no midrib.")
+    if skeleton["leaves"]:
+        heights = [leaf["height"] for leaf in skeleton["leaves"]]
+        print(f"  traced {len(skeleton['leaves'])} midribs from the crown; "
+              f"tips span z {min(heights):.3f}..{max(heights):.3f} ({voxel_origin} voxel "
+              f"{voxel:.5f})")
+
     surviving = sorted({int(v) for v in np.unique(assignment) if v >= 0})
     report = _write_outputs(p5x, points, assignment, surviving, leaf_dirs,
-                            photo_rgb, used, total_views, dropped, min_points)
+                            photo_rgb, used, total_views, dropped, min_points,
+                            skeleton=skeleton)
 
     print_checks("P5x", report)
     print(f"\n  {len(surviving)} leaf instance(s) in 3D, "
@@ -472,8 +511,63 @@ def run(
     return report
 
 
+def _write_curves(path: Path, polylines, colours) -> None:
+    """Polylines as a PLY edge list -- real curves, not a cloud of samples.
+
+    A midrib drawn as points looks like thin tissue that happened to be
+    labelled; drawn as a line it reads as the measurement it is, and Blender
+    can bevel it into a tube. `edge` elements are the standard way to say so
+    and the repo's own reader ignores them, so the file stays loadable
+    everywhere it was before.
+    """
+    usable = [(np.asarray(line, float), colour)
+              for line, colour in zip(polylines, colours) if len(np.asarray(line)) >= 2]
+    if not usable:
+        return
+    vertices, edges, rgb = [], [], []
+    for line, colour in usable:
+        start = len(vertices)
+        vertices.extend(line)
+        rgb.extend([colour] * len(line))
+        edges.extend((start + i, start + i + 1) for i in range(len(line) - 1))
+
+    with open(path, "w") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {len(vertices)}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        f.write(f"element edge {len(edges)}\n")
+        f.write("property int vertex1\nproperty int vertex2\n")
+        f.write("end_header\n")
+        for (x, y, z), colour in zip(vertices, rgb):
+            f.write(f"{x} {y} {z} {int(colour[0])} {int(colour[1])} {int(colour[2])}\n")
+        for a, b in edges:
+            f.write(f"{a} {b}\n")
+
+
+def _plant_frame(workdir: Path, geometry_backend: str):
+    """(origin, rotation) from P5's stem graph, or None if it has not run.
+
+    Read, not re-solved. `solve_plant_frame` needs the sparse model, the orbit
+    and the holder masks, and re-deriving it here would give a second answer
+    to a question the workdir has already answered -- two scenes of one
+    capture disagreeing about which way is up is worse than one that is not
+    upright at all.
+    """
+    p5 = (workdir / "p5" if geometry_backend in (None, "", cloud_source.BASELINE)
+          else workdir / "p5" / "experiments" / geometry_backend)
+    graph_path = p5 / "stem_graph.json"
+    if not graph_path.exists():
+        return None
+    frame = json.loads(graph_path.read_text()).get("plant_frame")
+    if not frame:
+        return None
+    return np.asarray(frame["origin"], float), np.asarray(frame["rotation"], float)
+
+
 def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
-                   photo_rgb, views_used, views_total, dropped, min_points) -> dict:
+                   photo_rgb, views_used, views_total, dropped, min_points,
+                   skeleton=None) -> dict:
     palette = leaf_palette(max(len(leaf_dirs), 1))
 
     rgb = np.zeros((len(points), 3), np.uint8)
@@ -508,6 +602,16 @@ def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
     dump(p5x / "segmented.ply", assignment != UNSEEN, rgb, with_label=True)
     np.save(p5x / "instances.npy", assignment)
 
+    # The skeleton as curves, one polyline per leaf, so Blender can draw the
+    # midribs as curves rather than as another cloud of points.
+    skeleton = skeleton or {"crown": None, "leaves": [], "unreachable": []}
+    with open(p5x / "skeleton.json", "w") as f:
+        json.dump(skeleton, f, indent=2)
+    _write_curves(p5x / "midribs.ply", [leaf["midrib"] for leaf in skeleton["leaves"]],
+                  [palette[leaf["id"] % len(palette)] for leaf in skeleton["leaves"]])
+    _write_curves(p5x / "petioles.ply", [leaf["petiole"] for leaf in skeleton["leaves"]],
+                  [SKELETON_RGB] * len(skeleton["leaves"]))
+
     per_leaf = {str(i): int((assignment == i).sum()) for i in surviving}
     unseen = int((assignment == UNSEEN).sum())
     checks = {
@@ -539,6 +643,9 @@ def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
     }
     report = {
         "num_points": int(len(points)),
+        "midribs_traced": len(skeleton["leaves"]),
+        "leaves_not_reaching_the_crown": skeleton["unreachable"],
+        "crown": skeleton["crown"],
         "num_leaves_2d": len(leaf_dirs),
         "num_leaves_3d": len(surviving),
         "points_per_leaf": per_leaf,

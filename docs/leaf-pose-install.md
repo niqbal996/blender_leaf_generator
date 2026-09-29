@@ -50,6 +50,8 @@ Nothing to install; measure your markers and pass the number.
 ```bash
 leaf-pose --input <capture> --workdir runs/x --marker-mm 20
 ```
+Assuming that the leaf instance ID tracking works only for the 60-70 percent of the time and then SAM3 invents new tracks for the same leaves in subsequent but segmentatino quality still remains good, can that still lead to good 3D reconstruction fo the leaves with pointclouds and plant skeleton in pose_estimator after taking a majority votes out of the frames that are inconsistent across the entire sequence? 
+
 
 The markers lie in the same plane as the leaves, so they measure the scale at
 the subject, which is the only place it matters. Without `--marker-mm` every

@@ -407,9 +407,24 @@ if "$PY" -m pip list 2>/dev/null | grep -q '^pycolmap '; then
         echo "    kept $KEEP"
     fi
 fi
+# Before the import test, not after: pycolmap-cuda needs libcudart.so.12 and
+# libcurand.so.10 and bundles neither. This step used to be an LD_LIBRARY_PATH
+# pinned onto the env at the very end of the script -- after this test had
+# already failed without it and swapped in the CPU build, every time.
+if [[ "$MODE" == "gpu" ]]; then
+    "$PY" scripts/link_pycolmap_cuda.py || true
+fi
 if ! "$PY" -c "import pycolmap" >/dev/null 2>&1; then
     PYCOLMAP_ERR="$("$PY" -c "import pycolmap" 2>&1 | tail -1)"
     warn "pycolmap does not import: $PYCOLMAP_ERR"
+    # Name every unresolved library at once, not just the first one the loader
+    # tripped on. The CUDA build also needs system X11/GL libraries that slim
+    # containers leave out.
+    CORE_SO="$("$PY" -c "import sysconfig, glob; print(next(iter(glob.glob(sysconfig.get_paths()['platlib'] + '/pycolmap/_core*.so')), ''))")"
+    if [[ -n "$CORE_SO" ]] && command -v ldd >/dev/null 2>&1; then
+        ldd "$CORE_SO" | grep "not found" | sed 's/^\s*/        unresolved: /' || true
+        echo "    libGL/libSM/libICE/libX11/libXext -> apt-get install -y libgl1 libsm6 libice6 libx11-6 libxext6"
+    fi
     echo "    falling back to the CPU build (GPU SIFT off, everything else identical)"
     "$PY" -m pip uninstall -y pycolmap-cuda >/dev/null 2>&1 || true
     "$PY" -m pip install pycolmap
@@ -461,11 +476,10 @@ fetch_checkpoint
 say "Pinning environment variables onto '$ENV_NAME'"
 VARS=()
 if [[ "$MODE" == "gpu" ]]; then
-    # pycolmap-cuda links against a CUDA runtime that pip supplies as a
-    # package; without its lib/ on the loader path `import pycolmap` dies
-    # with "libcudart.so.12: cannot open shared object file".
-    CUDART_LIB="$("$PY" -c "import nvidia.cuda_runtime as m, os; print(os.path.join(m.__path__[0],'lib'))" 2>/dev/null || true)"
-    [[ -n "$CUDART_LIB" && -d "$CUDART_LIB" ]] && VARS+=("LD_LIBRARY_PATH=$CUDART_LIB")
+    # No LD_LIBRARY_PATH: pycolmap-cuda's runtime is symlinked onto its RPATH
+    # above. The old pinned value also *replaced* the container's own
+    # LD_LIBRARY_PATH on every activation, so drop it from envs that have it.
+    conda env config vars unset -n "$ENV_NAME" LD_LIBRARY_PATH >/dev/null 2>&1 || true
     [[ -n "$HOST_CC" ]] && VARS+=("CC=$HOST_CC" "CXX=$HOST_CXX")
     [[ -n "$ARCH" ]] && VARS+=("TORCH_CUDA_ARCH_LIST=$ARCH")
     # Points gsplat's build at the env's nvcc rather than whatever the system
@@ -503,7 +517,7 @@ check("torchvision", "SAM2")
 check("transformers", "P4c DINOv2/DINOv3 features")
 cv2 = check("cv2", "everywhere")
 check("sam2", "P2 mask propagation")
-check("pycolmap", "P3 camera solve")
+colmap = check("pycolmap", "P3 camera solve")
 check("gsplat", "P4b", required=False)
 check("pytorch_msssim", "P4b", required=False)
 check("pose_estimator", "this repo")
@@ -512,6 +526,9 @@ check("leaf_generator", "this repo")
 if torch is not None:
     print(f"    cuda available:  {torch.cuda.is_available()}"
           f"{'  <-- GPU phases will not run' if not torch.cuda.is_available() else ''}")
+if colmap is not None:
+    print(f"    pycolmap cuda:   {getattr(colmap, 'has_cuda', False)}"
+          "  (True = use_gpu = 1 in the pipeline config works)")
 if cv2 is not None:
     has = hasattr(cv2, "aruco")
     print(f"    cv2.aruco:       {has}{'' if has else '  <-- P1 ChArUco path will fail'}")
