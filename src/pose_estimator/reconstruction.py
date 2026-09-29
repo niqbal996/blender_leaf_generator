@@ -381,6 +381,13 @@ def build_sparse_reconstruction(
         extraction_options.sift.estimate_affine_shape = True
         extraction_options.sift.domain_size_pooling = True
         matching_options.guided_matching = True
+        if use_gpu:
+            # COLMAP picks the covariant CPU extractor whenever either option
+            # is set, ahead of use_gpu (colmap/feature/sift.cc), and says so
+            # only in a glog line. Matching still runs on the GPU.
+            print("  low_texture: affine shape / domain-size pooling exist only in "
+                  "COLMAP's CPU extractor -- SIFT extraction stays on the CPU, "
+                  "matching uses the GPU")
 
     device = pycolmap.Device.cuda if use_gpu else pycolmap.Device.cpu
 
