@@ -211,13 +211,26 @@ fi
 # shellcheck disable=SC1091
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 
+# Every conda call that can (re)activate the env goes through this. conda's
+# shell function sources each installed package's activate.d/deactivate.d
+# hooks -- including after `conda install` into the active env -- and those
+# are not written for `set -u`: gcc_linux-64's deactivate hook reads an unset
+# variable, which killed this script outright, past any `|| warn`.
+conda_env() {
+    local rc=0
+    set +u
+    conda "$@" || rc=$?
+    set -u
+    return $rc
+}
+
 if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
     say "Reusing existing conda env '$ENV_NAME'"
 else
     say "Creating conda env '$ENV_NAME' (python 3.10)"
-    conda create -n "$ENV_NAME" python=3.10 -y
+    conda_env create -n "$ENV_NAME" python=3.10 -y
 fi
-conda activate "$ENV_NAME"
+conda_env activate "$ENV_NAME"
 
 # conda activate can leave an earlier env's python first on PATH, so every
 # step below uses this absolute interpreter rather than bare `python`.
@@ -308,8 +321,13 @@ if [[ "$MODE" == "gpu" && -n "$NVCC_VERSION" ]]; then
         # cuda-nvcc alone lacks the headers its own generated code includes;
         # cuda-cudart-dev supplies them. The pair is ~200MB against ~3GB for
         # the full cuda-toolkit, and nothing here needs the rest of it.
-        conda install -n "$ENV_NAME" -c nvidia -y \
-            "cuda-nvcc=$NVCC_VERSION" "cuda-cudart-dev=$NVCC_VERSION" \
+        #
+        # cuda-nvcc_linux-64, not the `cuda-nvcc` metapackage: that one is
+        # this plus gcc_linux-64/gxx_linux-64, conda's own gcc 15, whose
+        # activation hook overwrites the CC/CXX pinned below with a compiler
+        # nvcc was never checked against here.
+        conda_env install -n "$ENV_NAME" -c nvidia -y \
+            "cuda-nvcc_linux-64=$NVCC_VERSION" "cuda-cudart-dev=$NVCC_VERSION" \
             || warn "could not install nvcc $NVCC_VERSION -- P4b will fail to build gsplat"
     fi
 
@@ -490,7 +508,7 @@ fi
 if [[ ${#VARS[@]} -gt 0 ]]; then
     conda env config vars set -n "$ENV_NAME" "${VARS[@]}" >/dev/null
     printf '    %s\n' "${VARS[@]}"
-    conda deactivate; conda activate "$ENV_NAME"
+    conda_env deactivate; conda_env activate "$ENV_NAME"
 else
     echo "    (none needed)"
 fi
