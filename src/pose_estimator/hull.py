@@ -40,6 +40,11 @@ class CarveCamera:
     mask: np.ndarray  # bool (H, W), True = subject
     name: str
     occluder: Optional[np.ndarray] = None  # bool (H, W), True = something in front
+    # The solved pycolmap camera, lens distortion included. Without it the
+    # projection is pinhole-only while the masks are cut from the distorted
+    # photos: on maize_1 (k1 -0.09) that put plant pixels up to 19px off, 5-6px
+    # at the 95th percentile -- against a 2px mask dilation.
+    lens: Optional[object] = None
 
     def project(self, points_world: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """World points -> (pixel coords Nx2, in-front-of-camera flag)."""
@@ -48,6 +53,9 @@ class CarveCamera:
         cam = points_world @ R.T + t
         depth = cam[:, 2]
         valid = depth > 1e-6
+        if self.lens is not None:
+            safe = np.where(valid[:, None], cam, [0.0, 0.0, 1.0])
+            return np.asarray(self.lens.img_from_cam(safe), dtype=np.float64), valid
         safe_depth = np.where(valid, depth, 1.0)
         pixels = (cam[:, :2] / safe_depth[:, None]) @ self.K[:2, :2].T + self.K[:2, 2]
         return pixels, valid
@@ -107,6 +115,7 @@ def load_carve_cameras(
                 mask=binary,
                 name=image.name,
                 occluder=occluder,
+                lens=cam,
             )
         )
     return cameras
@@ -297,18 +306,39 @@ def carve(
     bounds_max = occupied.max(axis=0) + 2 * span
 
     # --- refine by repeated subdivision of survivors only ---
-    level_resolution = coarse_resolution
-    points = _grid_points(bounds_min, bounds_max, level_resolution)
-    points = points[survives(points)]
-    voxel = float(np.max((bounds_max - bounds_min) / level_resolution))
-
-    while level_resolution < resolution:
-        level_resolution *= 2
-        voxel /= 2.0
-        points = _subdivide(points, voxel)
+    def refine(lo: np.ndarray, hi: np.ndarray) -> Tuple[np.ndarray, float]:
+        level_resolution = coarse_resolution
+        points = _grid_points(lo, hi, level_resolution)
         points = points[survives(points)]
-        if len(points) == 0:
-            raise RuntimeError(f"Hull vanished while refining to {level_resolution}^3")
+        voxel = float(np.max((hi - lo) / level_resolution))
+        while level_resolution < resolution:
+            level_resolution *= 2
+            voxel /= 2.0
+            points = _subdivide(points, voxel)
+            points = points[survives(points)]
+            if len(points) == 0:
+                raise RuntimeError(f"Hull vanished while refining to {level_resolution}^3")
+        return points, voxel
+
+    # A hull that reaches its own working box was cut by the box, not by the
+    # silhouettes -- silently: the result still looks like a plant, just with
+    # its outer leaves gone. So check, grow the box on the sides it touches,
+    # and refine again.
+    for _ in range(4):
+        points, voxel = refine(bounds_min, bounds_max)
+        cell = (bounds_max - bounds_min) / coarse_resolution
+        low_touch = points.min(axis=0) - bounds_min < cell
+        high_touch = bounds_max - points.max(axis=0) < cell
+        if not (low_touch.any() or high_touch.any()):
+            break
+        grow = 0.25 * (bounds_max - bounds_min)
+        print(f"  hull reached its working box (axes low {np.flatnonzero(low_touch).tolist()}, "
+              f"high {np.flatnonzero(high_touch).tolist()}) -- growing the box and re-carving")
+        bounds_min = bounds_min - grow * low_touch
+        bounds_max = bounds_max + grow * high_touch
+    else:
+        print("  WARNING: hull still touches its working box after 4 enlargements -- "
+              "parts of the plant may be cut off")
 
     return points, voxel, bounds_min
 
@@ -342,6 +372,41 @@ def bounds_from_points(points: np.ndarray, percentile: float = 2.0, margin: floa
     high = np.percentile(points, 100 - percentile, axis=0)
     pad = (high - low) * margin
     return low - pad, high + pad
+
+
+def plant_points(reconstruction, mask_dir: Union[str, Path], min_share: float = 0.5) -> np.ndarray:
+    """Sparse points whose observations mostly land on the plant masks.
+
+    The carve's first, coarse pass is sized to the box it is given. When P3
+    matched only turntable and plant, the whole sparse cloud *was* that box.
+    On the boom rig P3 also matches the floor and the room -- rigid with the
+    plant, so right for poses -- and the cloud spans the room: maize_1's box
+    was 10 x 28 x 16 units around a plant of ~1.4 x 1.8 x 1.8, only 2 coarse
+    cells survived, and the working box built from them cut 0.48 units off
+    the plant. Every outer leaf was outside the grid before a vote was cast.
+    """
+    mask_dir = Path(mask_dir)
+    inside: dict = {}
+    total: dict = {}
+    for image_id in reconstruction.reg_image_ids():
+        image = reconstruction.images[image_id]
+        mask = cv2.imread(str(mask_dir / f"{Path(image.name).stem}.png"), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            continue
+        observed = image.get_observation_points2D()
+        if not observed:
+            continue
+        xy = np.array([p.xy for p in observed])
+        ids = [p.point3D_id for p in observed]
+        h, w = mask.shape
+        x = np.clip(xy[:, 0].astype(int), 0, w - 1)
+        y = np.clip(xy[:, 1].astype(int), 0, h - 1)
+        hit = mask[y, x] > 127
+        for pid, on_plant in zip(ids, hit):
+            total[pid] = total.get(pid, 0) + 1
+            inside[pid] = inside.get(pid, 0) + int(on_plant)
+    keep = [pid for pid, n in total.items() if n >= 2 and inside.get(pid, 0) >= min_share * n]
+    return np.array([reconstruction.points3D[pid].xyz for pid in keep]).reshape(-1, 3)
 
 
 def to_mesh(points: np.ndarray, voxel: float) -> Tuple[np.ndarray, np.ndarray]:

@@ -29,6 +29,7 @@ from pose_estimator.hull import (
     bounds_from_points,
     carve,
     load_carve_cameras,
+    plant_points,
     to_mesh,
     write_hull_3d_plot,
     write_ply_mesh,
@@ -77,8 +78,16 @@ def run(
         raise RuntimeError(f"Only {len(cameras)} usable views -- carving needs many more than that")
 
     sparse_xyz = np.array([p.xyz for p in reconstruction.points3D.values()])
-    bounds_min, bounds_max = bounds_from_points(sparse_xyz)
-    print(f"  initial volume {np.round(bounds_max - bounds_min, 3).tolist()} (COLMAP units)")
+    # Sized to the plant, not the whole cloud -- see `plant_points`.
+    on_plant = plant_points(reconstruction, plant_masks)
+    if len(on_plant) >= 50:
+        bounds_min, bounds_max = bounds_from_points(on_plant)
+        print(f"  initial volume {np.round(bounds_max - bounds_min, 3).tolist()} (COLMAP units), "
+              f"from {len(on_plant)} sparse points on the plant masks")
+    else:
+        bounds_min, bounds_max = bounds_from_points(sparse_xyz)
+        print(f"  initial volume {np.round(bounds_max - bounds_min, 3).tolist()} (COLMAP units), "
+              f"from the whole sparse cloud -- only {len(on_plant)} points fall on the plant masks")
 
     print(f"Carving to {resolution}^3 (voxel must be in-silhouette in >={min_inside_fraction:.0%} of views)...")
     points, voxel, _ = carve(

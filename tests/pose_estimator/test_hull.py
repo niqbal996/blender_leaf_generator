@@ -190,3 +190,20 @@ def test_good_poses_still_carve_the_sphere_after_the_diagnosis_change():
                          np.array([0.6, 0.6, 0.6]), resolution=48, min_inside_fraction=0.86)
     radius = np.linalg.norm(points - points.mean(axis=0), axis=1).max()
     assert 0.25 < radius < 0.40      # the known 0.30, within voxel resolution
+
+
+def test_a_box_that_cuts_the_object_is_grown_rather_than_clipping_it():
+    """maize_1 (2026-09-29): the working box came from 2 coarse cells of a
+    room-sized volume and cut 0.48 units off the plant -- every outer leaf was
+    outside the grid, and nothing said so. Here the given box cuts the sphere
+    in half on every axis; the hull must still reach the true radius."""
+    cameras = _sphere_views()
+    points, _voxel, _bounds = carve(
+        cameras,
+        np.array([-0.15, -0.15, -0.15]),
+        np.array([0.15, 0.15, 0.15]),
+        resolution=96,
+        min_inside_fraction=1.0,
+    )
+
+    assert np.abs(points).max(axis=0).min() >= SPHERE_RADIUS * 0.95, "the box clipped the hull"
