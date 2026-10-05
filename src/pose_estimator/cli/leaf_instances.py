@@ -80,7 +80,9 @@ from pose_estimator.semantic import (
     estimate_normals,
     finalise_votes,
     render_points,
+    surface_scale,
     view_weights,
+    visible_only,
 )
 from pose_estimator.leaf_skeleton import trace
 from pose_estimator.cli.report import print_checks
@@ -371,6 +373,7 @@ def run(
     source: str = "auto",
     merge_overlap: float = 0.30,
     covisible_frames: int = 2,
+    occlusion_test: bool = True,
 ) -> dict:
     import pycolmap
 
@@ -449,6 +452,16 @@ def run(
     else:
         photo_rgb = np.full((len(points), 3), 160, np.uint8)
 
+    # Occlusion: a point votes only in views where it is the visible surface.
+    # Both scales are measured on this cloud -- see `visible_only`.
+    spacing = tolerance = 0.0
+    hidden = [0, 0]                         # pixels dropped as hidden, pixels drawn
+    if occlusion_test:
+        spacing, thickness = surface_scale(points)
+        tolerance = 2.0 * thickness
+        print(f"  occlusion test on: point spacing {spacing:.5f}, sheet thickness "
+              f"{thickness:.5f}; a point votes only within {tolerance:.5f} of the visible surface")
+
     sparse_model, _ = cloud_source.geometry(workdir, geometry_backend)
     reconstruction = pycolmap.Reconstruction(str(sparse_model))
     image_ids = sorted(reconstruction.reg_image_ids())
@@ -486,6 +499,11 @@ def run(
             if label_map is None:
                 continue
             _rgb, index_map = render_points(points, photo_rgb, camera)
+            if occlusion_test:
+                drawn = int((index_map >= 0).sum())
+                index_map = visible_only(points, camera, index_map, spacing, tolerance)
+                hidden[0] += drawn - int((index_map >= 0).sum())
+                hidden[1] += drawn
             weights = view_weights(points, normals, camera) if normals is not None else None
             cast_votes(tally, index_map, label_map, weights)
             seen_here += 1
@@ -507,6 +525,10 @@ def run(
         raise SystemExit(
             "none of the registered views had a leaf-instance mask -- the frame names in "
             f"{sparse_model} do not match the mask filenames in {p2 / 'masks'}")
+
+    if occlusion_test and hidden[1]:
+        print(f"  occlusion test dropped {hidden[0] / hidden[1]:.1%} of rendered pixels: points "
+              "hidden behind the visible surface, which would have voted for what is in front")
 
     total_views = sum(len(frames_of_pass.get(prefix, image_ids)) for prefix in by_pass)
     cannot_link = cannot_link_pairs(co_visible, covisible_frames)
@@ -579,7 +601,11 @@ def run(
                                    "per_pass_ids": len(leaf_counts),
                                    "groups": len(set(merged.values())) if merged else 0,
                                    "cannot_link_pairs": len(cannot_link),
-                                   "links_refused": merge_stats.get("links_refused", 0)})
+                                   "links_refused": merge_stats.get("links_refused", 0)},
+                            visibility={"occlusion_test": occlusion_test,
+                                        "point_spacing": spacing, "depth_tolerance": tolerance,
+                                        "hidden_pixels_dropped": (hidden[0] / hidden[1]
+                                                                  if hidden[1] else 0.0)})
 
     print_checks("P5x", report)
     print(f"\n  {len(surviving)} leaf instance(s) in 3D, "
@@ -647,7 +673,7 @@ def _plant_frame(workdir: Path, geometry_backend: str):
 
 def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
                    photo_rgb, views_used, views_total, dropped, min_points,
-                   skeleton=None, merge=None) -> dict:
+                   skeleton=None, merge=None, visibility=None) -> dict:
     palette = leaf_palette(max(len(leaf_dirs), 1))
 
     rgb = np.zeros((len(points), 3), np.uint8)
@@ -729,6 +755,7 @@ def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
         "num_leaves_2d": len(leaf_dirs),
         "num_leaves_3d": len(surviving),
         "merge": merge or {},
+        "visibility": visibility or {},
         "points_per_leaf": per_leaf,
         "skeleton_points": n_skeleton,
         "root_points": int((assignment == ROOT).sum()),
@@ -759,6 +786,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                              "showed as separate masks on at least this many frames -- SAM3 "
                              "saying they are two objects. 0 turns it off, which is the old "
                              "transitive merge that chained a crown into one leaf")
+    parser.add_argument("--no-occlusion-test", action="store_true",
+                        help="let a point vote in views where it is hidden behind another "
+                             "surface, as before. Only for comparison: on gaensefuss_1 a quarter "
+                             "of rendered pixels were such hidden points")
     parser.add_argument("--no-normal-weighting", action="store_true",
                         help="count every view equally instead of weighting by how "
                              "broad-side the surface is to it. Only for comparison: an "
@@ -777,6 +808,7 @@ def main(argv: Optional[list] = None) -> None:
     args = parser.parse_args(argv)
     run(workdir=args.workdir, min_frames=args.min_frames, min_points=args.min_points,
         normal_weighting=not args.no_normal_weighting,
+        occlusion_test=not args.no_occlusion_test,
         geometry_backend=args.geometry_backend, cloud=args.cloud, source=args.source,
         merge_overlap=args.merge_overlap, covisible_frames=args.covisible_frames)
 
