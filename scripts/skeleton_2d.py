@@ -342,20 +342,26 @@ def _fit_leaf(run: Run, obs, rng, stem):
             "fit_px": float(np.median(err)) if len(err) else float("nan")}
 
 
-def reconstruct(run: Run, leaves2d, stems2d, frames, rng, merge_tol: float = 6.0 / MM_PER_UNIT):
+def reconstruct(run: Run, leaves2d, stems2d, frames, rng, merge_tol: float = 6.0 / MM_PER_UNIT,
+                has_stem: bool = True):
     """Leaves and the stem, from the 2D evidence of `frames` only.
 
     1. the stem first, so each leaf's petiole node can be put on it;
     2. every SAM3 id split into the pieces that agree on a tip (`_segments`);
-    3. pieces whose tips (6 mm) and bases (8 mm) coincide and that never
-       claim the same frame merged -- one leaf carried by swapped ids. The
-       frame test is the real guard: two leaves seen together never merge;
+    3. pieces merged when they never claim the same frame and their tips are
+       within 6 mm -- and, within one pass, their bases within 8 mm too. One
+       leaf carried by swapped ids, or seen by two passes. Across passes the
+       base is not compared: whether SAM3's leaf mask takes in part of the
+       petiole changes with elevation, so one leaf's base moves between passes
+       while its tip does not (sugarbeet_1, 28-09). Within a pass the frame
+       test guards leaves seen side by side; across passes nothing can, so two
+       leaves whose tips sit within 6 mm in different passes would merge;
     4. every leaf refitted on all of its observations.
     """
     crown = run.to_world(run.skeleton["crown"])
     st = [(f, s) for f, s in stems2d.items() if f in frames]
     stem = None
-    if len(st) >= MIN_INLIERS:
+    if has_stem and len(st) >= MIN_INLIERS:
         rays = Rays(run, [f for f, _ in st], [s["apex"] for _, s in st])
         apex = ransac_point(rays, np.ones(len(st)), rng)
         if apex is not None:
@@ -389,10 +395,12 @@ def reconstruct(run: Run, leaves2d, stems2d, frames, rng, merge_tol: float = 6.0
             if owner[b] != b or owner[a] != a:
                 continue
             fa, fb = pieces[a]["fit"], pieces[b]["fit"]
+            same_pass = _pass_of(pieces[a]) == _pass_of(pieces[b])
             if (np.linalg.norm(fa["tip"] - fb["tip"]) < merge_tol
-                    and np.linalg.norm(fa["base"] - fb["base"]) < 1.33 * merge_tol
                     and len({o["frame"] for o in pieces[a]["obs"]}
-                            & {o["frame"] for o in pieces[b]["obs"]}) <= 1):
+                            & {o["frame"] for o in pieces[b]["obs"]}) <= 1
+                    and (not same_pass
+                         or np.linalg.norm(fa["base"] - fb["base"]) < 1.33 * merge_tol)):
                 owner[b] = a
     leaves = {}
     for i, p in enumerate(pieces):
@@ -414,8 +422,15 @@ def reconstruct(run: Run, leaves2d, stems2d, frames, rng, merge_tol: float = 6.0
     return leaves, failed, stem, crown, len(pieces)
 
 
-def petiole(leaf: dict, stem):
+def _pass_of(piece: dict) -> str:
+    return sorted(piece["tracks"])[0].split("_", 1)[0]
+
+
+def petiole(leaf: dict, stem, crown=None):
     """(petiole polyline, which rule placed it).
+
+    A rosette (P5's --architecture) has no stem: its petioles meet at the
+    crown, so each runs from the blade base to the crown.
 
     The petiole continues the leaf's own axis: from the tip through the
     blade-petiole joint (the base) and on until it meets the stem. Snapping the
@@ -429,6 +444,8 @@ def petiole(leaf: dict, stem):
     to the node triangulated from the photos, then to the nearest stem point.
     """
     if stem is None:
+        if crown is not None:
+            return np.vstack([np.asarray(crown), np.asarray(leaf["base"])]), "to the crown (rosette)"
         return np.zeros((0, 3)), "none"
     tip, base = np.asarray(leaf["tip"]), np.asarray(leaf["base"])
     chord = base - tip
@@ -510,7 +527,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--workdir", type=Path, required=True, help="a single-pass run, e.g. plant_pass0")
-    ap.add_argument("--masks", type=Path, required=True, help="clean masks.npz of that pass")
+    ap.add_argument("--masks", type=Path,
+                    help="masks.npz (p5x_views.py's cache); default: built from the workdir's "
+                         "p2/masks/leaf_instances into --out")
+    ap.add_argument("--passes", type=int, nargs="+",
+                    help="use only these capture passes' frames -- the skeleton needs P2 masks, "
+                         "P3 poses and P5's crown/frame, not a per-pass 3D run")
+    ap.add_argument("--architecture", choices=["upright", "caulescent", "rosette"],
+                    help="override P5's (p5/instancing.json); rosette = no stem, petioles to "
+                         "the crown")
     ap.add_argument("--other-passes", type=Path, help="full run, to draw on frames not used")
     ap.add_argument("--flat-lay", type=Path, help="leaf-pose output dir with leaves.json")
     ap.add_argument("--retrace-p5x", action="store_true",
@@ -521,10 +546,23 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(0)
 
+    from pose_estimator import cloud_source
+    from pose_estimator.cli.leaf_instances import _architecture
+    from p5x_views import cache_masks
+
     run = Run(args.workdir)
-    z = np.load(args.masks, allow_pickle=True)
-    masks = {k: z[k] for k in z.files}
-    frames = sorted(run.image_of)
+    if args.masks:
+        z = np.load(args.masks, allow_pickle=True)
+        masks = {k: z[k] for k in z.files}
+    else:
+        masks = cache_masks(args.workdir, args.out)
+    frames = sorted(f for f in run.image_of
+                    if args.passes is None or int(run.sources[f]) in set(args.passes))
+    architecture = args.architecture or _architecture(args.workdir, cloud_source.BASELINE)
+    has_stem = architecture != "rosette"
+    print(f"  {len(frames)} frames" + (f" of passes {args.passes}" if args.passes else "")
+          + f"; architecture {architecture or 'unknown'} -> "
+          + ("stem + petioles off it" if has_stem else "no stem, petioles to the crown"))
     junk = junk_masks(masks, args.workdir, set(frames))
     life = defaultdict(set)
     for t, f in zip(masks["track"], masks["frame"]):
@@ -534,7 +572,7 @@ def main():
     # 1. honesty first: fit on even frames, measure on the odd ones it never saw
     even = {f for i, f in enumerate(frames) if i % 2 == 0}
     odd = set(frames) - even
-    part, _, _, _, _ = reconstruct(run, leaves2d, stems2d, even, rng)
+    part, _, _, _, _ = reconstruct(run, leaves2d, stems2d, even, rng, has_stem=has_stem)
     by_track = defaultdict(list)
     for leaf in part.values():
         for t in leaf["tracks"]:
@@ -553,10 +591,11 @@ def main():
           f"({len(held)} leaf views)")
 
     # 2. the skeleton itself, from every frame of the pass
-    leaves, failed, stem, crown, n_pieces = reconstruct(run, leaves2d, stems2d, set(frames), rng)
+    leaves, failed, stem, crown, n_pieces = reconstruct(run, leaves2d, stems2d, set(frames), rng,
+                                                        has_stem=has_stem)
     rules = defaultdict(int)
     for leaf in leaves.values():
-        leaf["petiole"], leaf["petiole_rule"] = petiole(leaf, stem)
+        leaf["petiole"], leaf["petiole_rule"] = petiole(leaf, stem, crown)
         rules[leaf["petiole_rule"]] += 1
     n_ids = len({r["track"] for r in leaves2d})
     print(f"\n  {n_ids} SAM3 leaf ids -> {n_pieces} consistent pieces (ids split where SAM3 "
@@ -606,6 +645,14 @@ def main():
     shots = [frames[i] for i in np.linspace(2, len(frames) - 3, 4).round().astype(int)]
     tiles = [tile(args.workdir, rec0, f, f"{f}  pass {run.sources[f]}  (fitted)", stem, leaves,
                   colours) for f in shots]
+    if args.passes and not args.other_passes:
+        # frames of this same workdir that the fit did not use
+        rest = sorted(f for f in run.image_of if int(run.sources[f]) not in set(args.passes))
+        for p in sorted({int(run.sources[f]) for f in rest})[:2]:
+            fs = [f for f in rest if int(run.sources[f]) == p]
+            f = fs[len(fs) // 3]
+            tiles.append(tile(args.workdir, rec0, f, f"{f}  pass {p}  (NOT used for the fit)",
+                              stem, leaves, colours))
     if args.other_passes:
         rec_all = pycolmap.Reconstruction(str(args.other_passes / "p3" / "sparse" / "best"))
         src = json.loads((args.other_passes / "p1" / "sources.json").read_text())
@@ -620,7 +667,6 @@ def main():
     # P5x's traced skeleton next to this one, same views
     p5x = run.skeleton
     if args.retrace_p5x:
-        from pose_estimator import cloud_source
         from pose_estimator.leaf_skeleton import trace
         upright = (run.points - run.origin) @ run.rotation.T
         voxel, _ = cloud_source.voxel_size(args.workdir, cloud_source.BASELINE, upright)

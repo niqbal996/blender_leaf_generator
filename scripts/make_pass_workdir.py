@@ -119,10 +119,15 @@ def build(workdir: Path, passes, out: Path, force: bool = False) -> dict:
     p2, q2 = workdir / "p2", out / "p2"
     for sub in sorted(d for d in (p2 / "masks").iterdir() if d.is_dir()):
         if sub.name == "leaf_instances":
+            # Real folders holding per-file links, not links to folders: the
+            # download tool used to copy these runs back dereferences file
+            # links but drops folder links, which arrived as an empty
+            # leaf_instances/.
             for folder in sorted(d for d in sub.iterdir() if d.is_dir()):
                 prefix = folder.name.split("_", 1)[0]
                 if prefix.startswith("pass") and int(prefix[4:]) in passes:
-                    _link(folder, q2 / "masks" / "leaf_instances" / folder.name)
+                    for png in sorted(folder.glob("*.png")):
+                        _link(png, q2 / "masks" / "leaf_instances" / folder.name / png.name)
             continue
         for frame in chosen:
             src = sub / f"{frame}.png"
