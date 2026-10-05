@@ -574,7 +574,9 @@ def run(
 
     # --- the skeleton, traced through tissue whose identity is already known ---
     voxel, voxel_origin = cloud_source.voxel_size(workdir, geometry_backend, points)
-    skeleton = trace(points, assignment, voxel)
+    architecture = _architecture(workdir, geometry_backend)
+    skeleton = trace(points, assignment, voxel, architecture=architecture)
+    skeleton["architecture"] = architecture
     if skeleton.get("crown_moved_to_largest_component"):
         moved = skeleton["crown_moved_to_largest_component"]
         print(f"  the crown fell on a {moved['from_component_size']}-point island, so it was "
@@ -615,6 +617,18 @@ def run(
     print(f"  open in Blender: {p5x / 'segmented.ply'}  (leaves + skeleton)")
     print(f"                   {p5x / 'leaves.ply'} / {p5x / 'skeleton.ply'} separately")
     return report
+
+
+def _architecture(workdir: Path, geometry_backend: str) -> Optional[str]:
+    """P5's --architecture, read from its output like the plant frame is: it
+    decides whether the plant has a stem the petioles branch off, or leaves
+    that meet at a crown (rosette)."""
+    p5 = (workdir / "p5" if geometry_backend in (None, "", cloud_source.BASELINE)
+          else workdir / "p5" / "experiments" / geometry_backend)
+    path = p5 / "instancing.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text()).get("architecture")
 
 
 def _write_curves(path: Path, polylines, colours) -> None:

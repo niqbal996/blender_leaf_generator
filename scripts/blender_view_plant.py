@@ -867,6 +867,11 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True):
                           point_radius * 1.3, petioles)
             add_sphere(np.asarray(leaf["tip"], float), f"p5x_tip_{leaf['id']:03d}",
                        TIP_RGBA, point_radius * 3.0, tips)
+        # The stem, once. Older skeleton.json files have no "stem": each leaf's
+        # petiole then still runs from the crown, and that is how they draw.
+        stem = np.asarray(graph.get("stem") or [], float)
+        if len(stem) >= 2:
+            add_curve(stem, "p5x_stem", STEM_RGBA, point_radius * 2.2, _collection("p5x_stem"))
         crown = graph.get("crown")
         if crown:
             add_sphere(np.asarray(crown, float), "p5x_crown", CROWN_RGBA,
@@ -890,6 +895,65 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True):
     if frame:
         frame_view((low + high) / 2.0, extent)
     return {"leaves": drawn, "points": len(xyz), "extent": extent}
+
+
+def build_skeleton2d(path, point_radius=None, frame=True, clear=False):
+    """Draw a skeleton built in 2D and fused in 3D (scripts/skeleton_2d.py).
+
+    Its skeleton.json uses P5x's schema and P5's upright plant frame, so it
+    lands exactly on a P5x scene: open both (`--p5x --skeleton2d <dir>`) and
+    toggle the s2d_* collections against p5x_midribs. Every part is its own
+    object -- stem, one petiole and one midrib per leaf, one ball per tip --
+    named after the SAM3 id(s) the leaf came from.
+    """
+    path = Path(path)
+    if path.is_dir():
+        path = path / "skeleton.json"
+    if not path.exists():
+        print(f"[plant] ERROR: {path} not found -- run scripts/skeleton_2d.py first.")
+        return None
+    with open(path) as f:
+        graph = json.load(f)
+    if clear:
+        _PREPARED.clear()
+        clear_startup_scene()
+
+    pts = [np.asarray(l["midrib"], float) for l in graph.get("leaves", [])]
+    if graph.get("stem"):
+        pts.append(np.asarray(graph["stem"], float))
+    allp = np.vstack(pts) if pts else np.zeros((1, 3))
+    low, high = allp.min(axis=0), allp.max(axis=0)
+    extent = float((high - low).max()) or 1.0
+    if point_radius is None:
+        point_radius = extent * 0.0022
+
+    stem = np.asarray(graph.get("stem") or [], float)
+    if len(stem) >= 2:
+        add_curve(stem, "s2d_stem", STEM_RGBA, point_radius * 2.4, _collection("s2d_stem"))
+    ribs, petioles, tips = (_collection("s2d_midribs"), _collection("s2d_petioles"),
+                            _collection("s2d_tips"))
+    for leaf in graph.get("leaves", []):
+        b, g, r = leaf.get("colour_bgr", (255, 255, 255))
+        colour = (r / 255.0, g / 255.0, b / 255.0, 1.0)
+        name = "+".join(leaf.get("sam3_ids") or [str(leaf["id"])])
+        midrib = np.asarray(leaf["midrib"], float)
+        if len(midrib) >= 2:
+            add_curve(midrib, f"s2d_midrib_{leaf['id']:02d}_{name}", colour,
+                      point_radius * 1.8, ribs)
+        petiole = np.asarray(leaf.get("petiole") or [], float)
+        if len(petiole) >= 2:
+            add_curve(petiole, f"s2d_petiole_{leaf['id']:02d}", STEM_RGBA,
+                      point_radius * 1.2, petioles)
+        add_sphere(np.asarray(leaf["tip"], float), f"s2d_tip_{leaf['id']:02d}", colour,
+                   point_radius * 3.2, tips)
+    if graph.get("crown"):
+        add_sphere(np.asarray(graph["crown"], float), "s2d_crown", CROWN_RGBA,
+                   point_radius * 4.5, _collection("s2d_crown"))
+    print(f"[plant] skeleton from 2D: {len(graph.get('leaves', []))} leaves, "
+          f"stem {'drawn' if len(stem) >= 2 else 'missing'} -- collections s2d_*")
+    if frame:
+        frame_view((low + high) / 2.0, extent)
+    return {"leaves": len(graph.get("leaves", [])), "extent": extent}
 
 
 def branch_extent(workdir, backend):
@@ -1076,9 +1140,16 @@ def main():
     backends, single, align = resolve_branches(list(sys.argv))
     want_p5x = ("--p5x" in script_args(list(sys.argv))
                 or os.environ.get("PLANT_P5X", "") not in ("", "0"))
+    skeleton2d = _after(script_args(list(sys.argv)), "--skeleton2d",
+                        os.environ.get("PLANT_SKELETON2D", ""))
     try:
-        if want_p5x:
-            build_p5x(target)
+        if skeleton2d and not want_p5x:
+            build_skeleton2d(skeleton2d, clear=True)
+        elif want_p5x:
+            built = build_p5x(target)
+            if skeleton2d:
+                radius = built["extent"] * 0.0022 if built else None
+                build_skeleton2d(skeleton2d, point_radius=radius, frame=False)
         elif backends:
             build_comparison(target, backends, align=align)
         else:

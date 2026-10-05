@@ -19,6 +19,11 @@
 #
 #   ./scripts/view_in_blender.sh runs/plant_9 --p5x
 #
+# The skeleton built in 2D and fused in 3D (scripts/skeleton_2d.py), over the
+# P5x scene so the two skeletons can be toggled against each other:
+#
+#   ./scripts/view_in_blender.sh runs/plant_9 --p5x --skeleton2d runs/<specimen>_skeleton2d
+#
 # Blender inside WSL is the awkward option here: Ubuntu 20.04 ships a
 # libwayland-client too old for recent Blender builds, and Mesa 21.2's d3d12
 # driver predates the OpenGL 4.3 that Blender needs, so the GUI falls back and
@@ -87,6 +92,12 @@ main() {
             # looks exactly like P5x not working.
             --p5x)
                 SCRIPT_ARGS+=("$1"); shift ;;
+            # The 2D-built skeleton (scripts/skeleton_2d.py): its folder or
+            # skeleton.json, translated like the workdir. With --p5x it is
+            # drawn over the P5x scene; alone, it is drawn by itself.
+            --skeleton2d)
+                SCRIPT_ARGS+=("$1" "$(to_windows_path "$(cd "$(dirname "$2")" && pwd)/$(basename "$2")")")
+                shift 2 ;;
             *) BLENDER_ARGS+=("$1"); shift ;;
         esac
     done

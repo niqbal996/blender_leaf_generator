@@ -43,6 +43,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from pose_estimator.leaf import resample_by_arclength, smooth_polyline
 
@@ -106,7 +107,8 @@ def find_crown(points: np.ndarray, assignment: np.ndarray,
 
 def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
           k: int = 12, max_edge_voxels: float = 3.0,
-          samples: int = 32, smooth_iterations: int = 24) -> dict:
+          samples: int = 32, smooth_iterations: int = 24,
+          architecture: Optional[str] = None) -> dict:
     """Crown, and per leaf a tip, a midrib and the petiole that carries it.
 
     `voxel` sets the only length scale: the longest edge the graph may use is
@@ -153,6 +155,7 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
     distance, predecessor = dijkstra(graph, indices=start, return_predecessors=True)
 
     leaves, unreachable, dropped_because = [], [], {}
+    traced = []                              # (leaf_id, members, attachment, midrib nodes, tip)
     for leaf_id in sorted({int(v) for v in np.unique(labels) if v >= 0}):
         members = np.flatnonzero(labels == leaf_id)
         reach = distance[members]
@@ -170,18 +173,51 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
         # which is which.
         attachment = int(members[np.nanargmin(np.where(np.isfinite(reach), reach, np.inf))])
 
-        inside = _within_leaf(graph, members, attachment)
+        inside = _within_leaf(graph, members, attachment, distance)
         if inside is None:
             unreachable.append(leaf_id)
             dropped_because[leaf_id] = "the leaf is a single isolated point"
             continue
         midrib_nodes, tip_local = inside
+        traced.append((leaf_id, attachment, midrib_nodes, tip_local, len(members)))
 
-        # The petiole is what carried us to the attachment. Nodes of this same
-        # leaf are dropped from it so a blade the path grazed on the way does
-        # not get counted twice.
+    # The stem, once, and each petiole only from where its leaf's path leaves
+    # it. Drawing each leaf's whole crown-to-leaf path as its "petiole", as
+    # this used to, drew the stem once per leaf: a bundle of lines from the
+    # crown to every leaf. Which plants *have* a stem is P5's --architecture,
+    # not something to infer: a rosette's leaves meet at the crown and keep
+    # their whole paths as petioles; otherwise the stem climbs from the crown
+    # to the highest stem tissue the crown reaches.
+    stem_nodes = (np.zeros(0, int) if architecture == "rosette"
+                  else _stem_path(predecessor, distance, labels, local))
+    on_stem = set(int(n) for n in stem_nodes)
+    stem = (_tidy(local[stem_nodes], samples, smooth_iterations) if len(stem_nodes) >= 2
+            else np.zeros((0, 3)))
+
+    # A carved stem is thick, and inside it the shortest-path tree splits
+    # into side-by-side lanes: a leaf reached through a neighbouring lane
+    # leaves the trunk low and climbs *inside* the stem, which drew as
+    # parallel lines up the stem. So a petiole is trimmed geometrically too:
+    # it starts at the last point of its path that is still within the stem's
+    # own thickness, measured on the lower stem rather than set from the grid.
+    stem_radius = _stem_radius(local, labels, stem)
+    stem_tree = cKDTree(_densify(stem)) if len(stem) >= 2 else None
+
+    for leaf_id, attachment, midrib_nodes, tip_local, n_members in traced:
+        # The petiole: from where this leaf's path leaves the stem to the
+        # leaf. Nodes of this same leaf are dropped from it so a blade the
+        # path grazed on the way does not get counted twice.
         approach = _walk_back(predecessor, attachment)
-        petiole_nodes = approach[labels[approach] != leaf_id]
+        shared = 0
+        while shared < len(approach) and int(approach[shared]) in on_stem:
+            shared += 1
+        start_at = max(shared - 1, 0)
+        if stem_tree is not None and stem_radius > 0:
+            inside = np.flatnonzero(stem_tree.query(local[approach])[0] <= stem_radius)
+            if len(inside):
+                start_at = max(start_at, int(inside[-1]))
+        branch = approach[start_at:]
+        petiole_nodes = branch[labels[branch] != leaf_id]
 
         midrib = _tidy(local[midrib_nodes], samples, smooth_iterations)
         petiole = (_tidy(local[petiole_nodes], max(samples // 2, 4), smooth_iterations)
@@ -190,7 +226,7 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
         tip = local[tip_local]
         leaves.append({
             "id": leaf_id,
-            "points": int(len(members)),
+            "points": int(n_members),
             "tip": [float(v) for v in tip],
             "base": [float(v) for v in base],
             "midrib": midrib.round(6).tolist(),
@@ -201,12 +237,61 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
             "height": float(tip[2]),
         })
 
-    return {"crown": [float(v) for v in crown], "leaves": leaves,
+    return {"crown": [float(v) for v in crown], "stem": stem.round(6).tolist(), "leaves": leaves,
             "unreachable": unreachable, "crown_moved_to_largest_component": moved,
             "graph_components": int(n_parts), "dropped_because": dropped_because}
 
 
-def _within_leaf(graph, members: np.ndarray, attachment: int):
+def _densify(line: np.ndarray, per_segment: int = 8) -> np.ndarray:
+    line = np.asarray(line, float)
+    if len(line) < 2:
+        return line
+    t = np.linspace(0.0, 1.0, per_segment, endpoint=False)
+    pieces = [a + (b - a) * t[:, None] for a, b in zip(line[:-1], line[1:])]
+    return np.vstack(pieces + [line[-1:]])
+
+
+def _stem_radius(points: np.ndarray, labels: np.ndarray, stem: np.ndarray) -> float:
+    """How thick the stem is in this cloud, measured where it is surely stem.
+
+    The lower third of the trunk carries no petioles yet, so the stem tissue
+    around it is stem alone: 1.5x the 90th-percentile distance of that tissue
+    from the trunk line covers its thickness without reaching the leaves.
+    """
+    if len(stem) < 2:
+        return 0.0
+    dense = _densify(stem)
+    low = dense[: max(len(dense) // 3, 2)]
+    tissue = points[labels == SKELETON]
+    if not len(tissue):
+        return 0.0
+    near_low, _ = cKDTree(low).query(tissue)
+    near_all, _ = cKDTree(dense).query(tissue)
+    z_top = low[:, 2].max()
+    around = tissue[(near_low <= near_all + 1e-12) & (tissue[:, 2] <= z_top)]
+    if len(around) < 10:
+        return 0.0
+    d, _ = cKDTree(low).query(around)
+    return 1.5 * float(np.percentile(d, 90))
+
+
+def _stem_path(predecessor: np.ndarray, distance: np.ndarray, labels: np.ndarray,
+               points: np.ndarray) -> np.ndarray:
+    """Crown to the highest stem tissue the crown reaches, along the tree.
+
+    Height is the plant frame's z, which P5 has already made "up". A path
+    rather than a topological trunk: in a carved stem -- a thick tube -- the
+    tree splits into parallel lanes and no single lane carries the leaves.
+    """
+    candidates = np.flatnonzero((labels == SKELETON) & np.isfinite(distance))
+    if not len(candidates):
+        return np.zeros(0, int)
+    apex = int(candidates[np.argmax(points[candidates, 2])])
+    return _walk_back(predecessor, apex)
+
+
+def _within_leaf(graph, members: np.ndarray, attachment: int,
+                 distance: Optional[np.ndarray] = None):
     """(midrib node indices, tip) traced *inside* one leaf's own tissue.
 
     This is the whole correction. Taking the tip as the member furthest from
@@ -235,13 +320,27 @@ def _within_leaf(graph, members: np.ndarray, attachment: int):
     # so the blade is taken from the largest piece and re-entered at whichever
     # of its points the crown reaches first -- the same repair the crown
     # itself gets, for the same reason.
+    #
+    # It applies whenever the attachment is not on the blade's largest piece,
+    # not only when it is a one-point island: a two-point fragment at the
+    # petiole confined the search to itself and put the "tip" at the stem end
+    # (10 of 37 leaves on gaensefuss_1). And the re-entry point used to be the
+    # piece's first point in index order -- arbitrary -- not the crown-nearest
+    # one this comment always promised.
     n_parts, part = connected_components(sub, directed=False)
-    if n_parts > 1 and int((part == part[start]).sum()) < 2:
+    if n_parts > 1:
         sizes = np.bincount(part)
-        biggest = np.flatnonzero(part == int(np.argmax(sizes)))
-        if len(biggest) < 2:
-            return None
-        start = int(biggest[0])
+        largest = int(np.argmax(sizes))
+        if part[start] != largest and sizes[largest] > sizes[part[start]]:
+            biggest = np.flatnonzero(part == largest)
+            if len(biggest) < 2:
+                return None
+            if distance is not None and np.isfinite(distance[members[biggest]]).any():
+                d = np.where(np.isfinite(distance[members[biggest]]),
+                             distance[members[biggest]], np.inf)
+                start = int(biggest[int(np.argmin(d))])
+            else:
+                start = int(biggest[0])
 
     inner, predecessor = dijkstra(sub, indices=start, return_predecessors=True)
     if not np.isfinite(inner).any():
