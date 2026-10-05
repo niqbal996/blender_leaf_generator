@@ -44,20 +44,63 @@ def _link(target: Path, link: Path) -> None:
     link.symlink_to(os.path.relpath(target.resolve(), link.parent.resolve()))
 
 
-def build(workdir: Path, passes, out: Path, force: bool = False) -> dict:
+def _deregister(rec, image_id: int) -> None:
+    """Version-agnostic: pycolmap >= 3.12 groups images into frames and only
+    deregisters a frame; older releases deregister the image itself."""
+    if hasattr(rec, "deregister_frame"):
+        rec.deregister_frame(rec.image(image_id).frame_id)
+    else:
+        rec.deregister_image(image_id)
+
+
+def filtered_model(workdir: Path, keep: set):
+    """The P3 model with every view outside `keep` deregistered, in memory."""
     import pycolmap
 
+    rec = pycolmap.Reconstruction(str(workdir / "p3" / "sparse" / "best"))
+    before = (rec.num_reg_images(), rec.num_points3D())
+    for image_id in list(rec.reg_image_ids()):
+        if Path(rec.images[image_id].name).stem not in keep:
+            _deregister(rec, image_id)
+    return rec, before
+
+
+def _check_written(path: Path, keep: set) -> None:
+    """Reload what was written: exactly the chosen views, and no 3D point
+    still observed from a dropped one. Write/read semantics for unregistered
+    images differ between pycolmap releases, so this is checked, not assumed."""
+    import pycolmap
+
+    rec = pycolmap.Reconstruction(str(path))
+    names = {Path(rec.images[i].name).stem for i in rec.reg_image_ids()}
+    stray = names - keep
+    reg = set(rec.reg_image_ids())
+    dangling = sum(1 for p in rec.points3D.values()
+                   if any(e.image_id not in reg for e in p.track.elements))
+    if stray or dangling:
+        raise SystemExit(f"{path}: the written model still has {len(stray)} views from other "
+                         f"passes and {dangling} points observed from them -- this pycolmap "
+                         f"({pycolmap.__version__}) does not drop deregistered views on write")
+
+
+def build(workdir: Path, passes, out: Path, force: bool = False) -> dict:
     passes = sorted(set(int(p) for p in passes))
-    if out.exists() and any(out.iterdir()):
-        if not force:
-            raise SystemExit(f"{out} exists and is not empty -- pass --force to rebuild it "
-                             "(its p4..p6 outputs are deleted with it)")
-        shutil.rmtree(out)
     sources = {k: int(v) for k, v in json.loads((workdir / "p1" / "sources.json").read_text()).items()}
     chosen = sorted(f for f, p in sources.items() if p in passes)
     if not chosen:
         raise SystemExit(f"no frames of passes {passes} in {workdir / 'p1' / 'sources.json'}")
     keep = set(chosen)
+
+    # The model first and in memory, so a failure here leaves nothing on disk.
+    rec, before = filtered_model(workdir, keep)
+
+    if out.exists() and any(out.iterdir()):
+        if (out / "derived_from.json").exists() and not force:
+            raise SystemExit(f"{out} is a finished build -- pass --force to rebuild it "
+                             "(its p4..p6 and p5x outputs are deleted with it)")
+        if not (out / "derived_from.json").exists():
+            print(f"  {out} is an unfinished build (no derived_from.json); replacing it")
+        shutil.rmtree(out)
 
     # --- p1 ---
     p1, q1 = workdir / "p1", out / "p1"
@@ -93,14 +136,9 @@ def build(workdir: Path, passes, out: Path, force: bool = False) -> dict:
         shutil.copy2(meta, q2 / meta.name)
 
     # --- p3: same poses, other passes deregistered ---
-    rec = pycolmap.Reconstruction(str(workdir / "p3" / "sparse" / "best"))
-    before = (rec.num_reg_images(), rec.num_points3D())
-    for image_id in list(rec.reg_image_ids()):
-        image = rec.image(image_id)
-        if Path(image.name).stem not in keep:
-            rec.deregister_frame(image.frame_id)
     (out / "p3" / "sparse" / "best").mkdir(parents=True)
     rec.write(str(out / "p3" / "sparse" / "best"))
+    _check_written(out / "p3" / "sparse" / "best", keep)
     shutil.copy2(workdir / "p3" / "poses.json", out / "p3" / "poses.json")
 
     record = {"source": str(workdir.resolve()), "passes": passes, "frames": len(chosen),
