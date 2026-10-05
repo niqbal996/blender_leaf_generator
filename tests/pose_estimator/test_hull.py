@@ -207,3 +207,53 @@ def test_a_box_that_cuts_the_object_is_grown_rather_than_clipping_it():
     )
 
     assert np.abs(points).max(axis=0).min() >= SPHERE_RADIUS * 0.95, "the box clipped the hull"
+
+
+# --------------------------------------------------------------------------
+# --passes: the per-pass breakdown that tests the static-scene assumption.
+# --------------------------------------------------------------------------
+
+
+def _two_passes(shift):
+    """Pass 0 and pass 1 orbit the same sphere; in pass 1 it has moved by `shift`."""
+    rng = np.random.default_rng(1)
+    surface = rng.normal(size=(40000, 3))
+    surface = surface / np.linalg.norm(surface, axis=1)[:, None] * SPHERE_RADIUS
+    first = _object_views(surface, n_views=16, height=0.2)
+    second = _object_views(surface + np.asarray(shift), n_views=16, height=0.6)
+    cameras, pass_of = [], {}
+    for p, views in enumerate((first, second)):
+        for camera in views:
+            camera.name = f"frame_{len(cameras):04d}.jpg"
+            pass_of[f"frame_{len(cameras):04d}"] = p
+            cameras.append(camera)
+    return cameras, pass_of
+
+
+def _carve_and_score(cameras, pass_of, tmp_path):
+    from pose_estimator.cli.hull import _evaluate
+
+    points, voxel, _ = carve(cameras, np.array([-1.0, -1.0, -1.0]), np.array([1.0, 1.0, 1.0]),
+                             resolution=64, min_inside_fraction=0.86)
+    return _evaluate(cameras, points, voxel, tmp_path, pass_of)["per_pass"]
+
+
+def test_a_static_object_keeps_each_pass_filled_however_many_passes_carve(tmp_path):
+    cameras, pass_of = _two_passes(shift=(0.0, 0.0, 0.0))
+    alone = _carve_and_score([c for c in cameras if pass_of[c.name[:-4]] == 0],
+                             pass_of, tmp_path)["0"]["recall"]
+    together = _carve_and_score(cameras, pass_of, tmp_path)["0"]["recall"]
+    assert alone > 0.9
+    assert together > alone - 0.05, "more views of a static object must not eat its silhouette"
+
+
+def test_an_object_that_moved_between_passes_loses_silhouette_when_carved_together(tmp_path):
+    """gaensefuss_1: the plant drooped and its holder shifted between passes."""
+    cameras, pass_of = _two_passes(shift=(0.12, 0.0, 0.0))
+    alone = _carve_and_score([c for c in cameras if pass_of[c.name[:-4]] == 0],
+                             pass_of, tmp_path)["0"]["recall"]
+    together = _carve_and_score(cameras, pass_of, tmp_path)["0"]["recall"]
+    assert alone > 0.9
+    # The static case loses < 5 points; a sphere shifted by 40% of its radius
+    # still overlaps itself a lot and measures ~12 points. 8 sits between.
+    assert together < alone - 0.08, "the per-pass breakdown must expose the inconsistency"

@@ -39,10 +39,11 @@ and is reported as such.
 **What this cannot do.** It inherits P2's 2D mistakes without appeal. A leaf
 the `leaf` prompt lost on a frame contributes no vote there, which the other
 views absorb; but a leaf that fragments into two ids across the rotation
-arrives here as two leaves, and nothing downstream can merge them. That is
-the measurement to check first -- `p2/prompts.json` records how many frames
-each id survived, and on a bushy specimen (gaensefuss_1: 43 ids for perhaps
-18 leaves) the fragmentation is the dominant error, not the projection.
+arrives here as two leaves unless another pass's id bridges them in 3D.
+On gaensefuss_1 that fragmentation turned out to be moderate -- 43-45 ids
+per pass for a plant the flat lay counts at 34 leaves -- and the dominant
+error was the cross-pass merge chaining *distinct* leaves together; see
+`merge_across_passes`.
 
 Reads:
     p2/masks/leaf_instances/<id>/*.png   the 2D ids, from --backend sam3
@@ -99,6 +100,13 @@ ROOT_RGB = (240, 140, 40)
 # checked rather than assumed.
 MAX_VOTED_CLASSES = 127
 
+# Two ids of one pass that SAM3 shows on the same frame overlapping less than
+# this share of the smaller are two objects, not one object twice. Measured on
+# gaensefuss_1: of 2700 same-pass pairs ever on screen together, 2689 overlap
+# by ~0 -- SAM3's simultaneous instances are disjoint -- so the bar only has to
+# keep a genuine duplicate (an NMS miss) from being read as two leaves.
+DUPLICATE_OVERLAP = 0.5
+
 
 def leaf_palette(n: int) -> np.ndarray:
     """One saturated, well-separated RGB per leaf.
@@ -139,15 +147,23 @@ def usable_instances(leaf_root: Path, min_frames: int) -> List[Path]:
 
 def build_label_map(leaf_dirs: Sequence[Path], stem_dir: Optional[Path],
                     root_dir: Optional[Path], stem: str,
-                    shape, stem_class: int, root_class: int) -> Optional[np.ndarray]:
+                    shape, stem_class: int, root_class: int,
+                    co_visible: Optional[Dict[tuple, int]] = None) -> Optional[np.ndarray]:
     """One frame's 2D map in the form `cast_votes` already reads.
 
     Same contract as a P4c class map -- -1 where nothing is claimed, otherwise
     a class index -- so the fusion below is the one that has been validated
     against synthetic maps, not a second implementation of it.
+
+    `co_visible`, if given, is incremented for every pair of leaf indices this
+    frame shows as two separate masks -- the evidence `merge_across_passes`
+    uses to refuse joining them. It is gathered here because this is where
+    every mask is read anyway.
     """
     out = np.full(shape, -1, np.int16)
     found = False
+    areas: Dict[int, int] = {}
+    shared: Dict[tuple, int] = {}
     for index, folder in enumerate(leaf_dirs):
         path = folder / f"{stem}.png"
         if not path.exists():
@@ -155,8 +171,22 @@ def build_label_map(leaf_dirs: Sequence[Path], stem_dir: Optional[Path],
         raw = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if raw is None:
             continue
-        out[raw > 127] = index
+        claim = raw > 127
+        if co_visible is not None:
+            under = out[claim]
+            under = under[under >= 0]
+            for other, n in zip(*np.unique(under, return_counts=True)):
+                shared[(int(other), index)] = int(n)
+            areas[index] = int(claim.sum())
+        out[claim] = index
         found = True
+
+    if co_visible is not None:
+        present = sorted(i for i, a in areas.items() if a > 0)
+        for a_index, a in enumerate(present):
+            for b in present[a_index + 1:]:
+                if shared.get((a, b), 0) < DUPLICATE_OVERLAP * min(areas[a], areas[b]):
+                    co_visible[(a, b)] = co_visible.get((a, b), 0) + 1
 
     # The stem and root are painted after the leaves: where a leaf instance
     # and the stem residual disagree the residual is the narrower claim, and
@@ -191,27 +221,25 @@ def group_by_pass(leaf_dirs: Sequence[Path]) -> Dict[str, List[Path]]:
     return out
 
 
-class _Union:
-    """Union-find over (pass, local leaf index) pairs."""
+def cannot_link_pairs(co_visible: Dict[str, Dict[tuple, int]],
+                      min_frames: int) -> set:
+    """{frozenset of two (pass, index) keys} that SAM3 says are two objects.
 
-    def __init__(self):
-        self.parent: Dict[tuple, tuple] = {}
-
-    def find(self, item):
-        self.parent.setdefault(item, item)
-        while self.parent[item] != item:
-            self.parent[item] = self.parent[self.parent[item]]
-            item = self.parent[item]
-        return item
-
-    def union(self, a, b):
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.parent[rb] = ra
+    `co_visible[prefix][(a, b)]` counts the frames on which that pass showed
+    ids a and b as separate masks. One shared frame could be a tracker
+    hiccup; `min_frames` of them is SAM3 stating, repeatedly, that these are
+    different things. 0 turns the constraint off.
+    """
+    if min_frames <= 0:
+        return set()
+    return {frozenset(((prefix, a), (prefix, b)))
+            for prefix, table in co_visible.items()
+            for (a, b), n in table.items() if n >= min_frames}
 
 
 def merge_across_passes(per_pass: Dict[str, np.ndarray], counts: Dict[str, int],
-                        overlap_fraction: float) -> Dict[tuple, int]:
+                        overlap_fraction: float, cannot_link: Optional[set] = None,
+                        stats: Optional[dict] = None) -> Dict[tuple, int]:
     """Match each pass's leaf labels to the other passes', by 3D overlap.
 
     Every pass labels the *same* cloud, so the correspondence the 2D tracker
@@ -220,16 +248,26 @@ def merge_across_passes(per_pass: Dict[str, np.ndarray], counts: Dict[str, int],
     that claim the same points are the same leaf. This is the step that keeps
     a three-pass capture from reporting every leaf three times.
 
+    **Links are taken strongest first, and one SAM3 contradicts is refused.**
+    This used to be a union-find over every link above `overlap_fraction`,
+    and a union-find is transitive: a small id that touches two leaves joins
+    them, and on a crown every small id touches several. Measured on
+    gaensefuss_1 (34 leaves on the flat lay), each pass alone carried 33-37
+    ids winning >= 40 points, and the union-find chained them into 17 -- one
+    "leaf" of 26 ids held 10 from pass 0 alone, 8 of them on screen at once as
+    separate masks. `cannot_link` (see `cannot_link_pairs`) is that statement
+    from SAM3: a merge that would put two such ids in one leaf is skipped,
+    and the weaker link that wanted it simply does not happen. Same votes,
+    same threshold: 17 -> 33 leaves, with blade lengths that rank-match the
+    flat lay at the camera-derived scale. With no constraints the result is
+    exactly the union-find's: the same links, merged in a different order.
+
+    `stats`, if given, receives the number of links refused.
+
     Returns {(pass, local index) -> merged leaf id}.
     """
-    union = _Union()
-    # Every leaf that won any points is entered first, merged or not. Seeding
-    # only from the pairs that matched drops the leaf that one elevation sees
-    # and the others do not -- it gets no group, and `_combine_passes` then
-    # reads it as unlabelled and deletes it.
-    for key, size in counts.items():
-        if size > 0:
-            union.find(key)
+    cannot_link = cannot_link or set()
+    links = []
     passes = sorted(per_pass)
     for a_index, first in enumerate(passes):
         for second in passes[a_index + 1:]:
@@ -242,13 +280,38 @@ def merge_across_passes(per_pass: Dict[str, np.ndarray], counts: Dict[str, int],
             pairs, overlap = np.unique(
                 np.stack([left[both], right[both]], axis=1), axis=0, return_counts=True)
             for (a, b), n in zip(pairs, overlap):
-                smaller = min(counts.get((first, int(a)), 0), counts.get((second, int(b)), 0))
+                ka, kb = (first, int(a)), (second, int(b))
+                smaller = min(counts.get(ka, 0), counts.get(kb, 0))
                 if smaller and n >= overlap_fraction * smaller:
-                    union.union((first, int(a)), (second, int(b)))
+                    links.append((n / smaller, int(n), ka, kb))
+    # Strongest share first, larger absolute overlap breaking ties, then the
+    # keys themselves so the result never depends on dict order.
+    links.sort(key=lambda link: (-link[0], -link[1], link[2], link[3]))
 
+    # Every leaf that won any points is entered first, merged or not. Seeding
+    # only from the pairs that matched drops the leaf that one elevation sees
+    # and the others do not -- it gets no group, and `_combine_passes` then
+    # reads it as unlabelled and deletes it.
+    members = {key: {key} for key, size in counts.items() if size > 0}
+    owner = {key: key for key in members}
+    refused = 0
+    for _share, _n, ka, kb in links:
+        ra, rb = owner[ka], owner[kb]
+        if ra == rb:
+            continue
+        if cannot_link and any(frozenset((x, y)) in cannot_link
+                               for x in members[ra] for y in members[rb]):
+            refused += 1
+            continue
+        for key in members[rb]:
+            owner[key] = ra
+        members[ra] |= members.pop(rb)
+
+    if stats is not None:
+        stats["links_refused"] = refused
     roots, merged = {}, {}
-    for key in sorted(union.parent):
-        root = union.find(key)
+    for key in sorted(owner):
+        root = owner[key]
         if root not in roots:
             roots[root] = len(roots)
         merged[key] = roots[root]
@@ -307,6 +370,7 @@ def run(
     cloud: Optional[Path] = None,
     source: str = "auto",
     merge_overlap: float = 0.30,
+    covisible_frames: int = 2,
 ) -> dict:
     import pycolmap
 
@@ -395,10 +459,12 @@ def run(
     # leaves arguing over the same class index.
     per_pass: Dict[str, np.ndarray] = {}
     leaf_counts: Dict[tuple, int] = {}
+    co_visible: Dict[str, Dict[tuple, int]] = {}
     used = 0
     for prefix, dirs in sorted(by_pass.items()):
         stem_class, root_class = len(dirs), len(dirs) + 1
         tally = accumulate_votes(len(points), len(dirs) + 2)
+        co_visible[prefix] = {}
         seen_here = 0
         # Only this pass's own frames. The stem and root masks exist for every
         # frame in the workdir, so a frame from another pass still produces a
@@ -415,7 +481,8 @@ def run(
             label_map = build_label_map(dirs, stem_dir, root_dir,
                                         Path(image.name).stem,
                                         (camera.height, camera.width),
-                                        stem_class, root_class)
+                                        stem_class, root_class,
+                                        co_visible=co_visible[prefix])
             if label_map is None:
                 continue
             _rgb, index_map = render_points(points, photo_rgb, camera)
@@ -442,11 +509,18 @@ def run(
             f"{sparse_model} do not match the mask filenames in {p2 / 'masks'}")
 
     total_views = sum(len(frames_of_pass.get(prefix, image_ids)) for prefix in by_pass)
-    merged = merge_across_passes(per_pass, leaf_counts, merge_overlap)
+    cannot_link = cannot_link_pairs(co_visible, covisible_frames)
+    merge_stats: dict = {}
+    merged = merge_across_passes(per_pass, leaf_counts, merge_overlap,
+                                 cannot_link=cannot_link, stats=merge_stats)
     if len(by_pass) > 1:
         n_groups = len(set(merged.values())) if merged else 0
         print(f"  {len(leaf_counts)} per-pass ids merged into {n_groups} leaves by 3D overlap "
               f"(>= {merge_overlap:.0%} of the smaller)")
+        if covisible_frames > 0:
+            print(f"    {len(cannot_link)} same-pass pairs on screen together as separate masks "
+                  f"on >= {covisible_frames} frames; {merge_stats['links_refused']} merge(s) "
+                  "refused for joining such a pair")
 
     assignment = _combine_passes(per_pass, merged, len(points))
 
@@ -499,7 +573,13 @@ def run(
     surviving = sorted({int(v) for v in np.unique(assignment) if v >= 0})
     report = _write_outputs(p5x, points, assignment, surviving, leaf_dirs,
                             photo_rgb, used, total_views, dropped, min_points,
-                            skeleton=skeleton)
+                            skeleton=skeleton,
+                            merge={"overlap_fraction": merge_overlap,
+                                   "covisible_frames": covisible_frames,
+                                   "per_pass_ids": len(leaf_counts),
+                                   "groups": len(set(merged.values())) if merged else 0,
+                                   "cannot_link_pairs": len(cannot_link),
+                                   "links_refused": merge_stats.get("links_refused", 0)})
 
     print_checks("P5x", report)
     print(f"\n  {len(surviving)} leaf instance(s) in 3D, "
@@ -567,7 +647,7 @@ def _plant_frame(workdir: Path, geometry_backend: str):
 
 def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
                    photo_rgb, views_used, views_total, dropped, min_points,
-                   skeleton=None) -> dict:
+                   skeleton=None, merge=None) -> dict:
     palette = leaf_palette(max(len(leaf_dirs), 1))
 
     rgb = np.zeros((len(points), 3), np.uint8)
@@ -648,6 +728,7 @@ def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
         "crown": skeleton["crown"],
         "num_leaves_2d": len(leaf_dirs),
         "num_leaves_3d": len(surviving),
+        "merge": merge or {},
         "points_per_leaf": per_leaf,
         "skeleton_points": n_skeleton,
         "root_points": int((assignment == ROOT).sum()),
@@ -673,6 +754,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                              "they claim this fraction of the smaller one's points. Each pass "
                              "is an independent SAM3 session, so its ids mean nothing to the "
                              "others and the match has to be made in 3D")
+    parser.add_argument("--covisible-frames", type=int, default=2,
+                        help="refuse a merge that would join two ids of one pass that SAM3 "
+                             "showed as separate masks on at least this many frames -- SAM3 "
+                             "saying they are two objects. 0 turns it off, which is the old "
+                             "transitive merge that chained a crown into one leaf")
     parser.add_argument("--no-normal-weighting", action="store_true",
                         help="count every view equally instead of weighting by how "
                              "broad-side the surface is to it. Only for comparison: an "
@@ -692,7 +778,7 @@ def main(argv: Optional[list] = None) -> None:
     run(workdir=args.workdir, min_frames=args.min_frames, min_points=args.min_points,
         normal_weighting=not args.no_normal_weighting,
         geometry_backend=args.geometry_backend, cloud=args.cloud, source=args.source,
-        merge_overlap=args.merge_overlap)
+        merge_overlap=args.merge_overlap, covisible_frames=args.covisible_frames)
 
 
 if __name__ == "__main__":
