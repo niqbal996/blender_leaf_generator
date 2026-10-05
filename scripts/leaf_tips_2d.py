@@ -224,7 +224,8 @@ class Rays:
     """World-space rays for a set of 2D observations, distortion included."""
 
     def __init__(self, run: Run, frames, uvs):
-        self.R, self.t, self.C, self.d, self.cam = [], [], [], [], []
+        self.R, self.t, self.C, self.d, self.cam_id = [], [], [], [], []
+        self.cameras = {}
         for frame, uv in zip(frames, uvs):
             im = run.image_of[frame]
             cam = run.rec.cameras[im.camera_id]
@@ -237,7 +238,9 @@ class Rays:
             self.t.append(t)
             self.C.append(-R.T @ t)
             self.d.append(d / np.linalg.norm(d))
-            self.cam.append(cam)
+            self.cam_id.append(im.camera_id)
+            self.cameras[im.camera_id] = cam
+        self.cam_id = np.asarray(self.cam_id)
         self.R, self.t = np.array(self.R), np.array(self.t)
         self.C, self.d = np.array(self.C), np.array(self.d)
         self.uv = np.asarray(uvs, float)
@@ -246,8 +249,12 @@ class Rays:
         cam_xyz = np.einsum("nij,j->ni", self.R, X) + self.t
         out = np.full((len(cam_xyz), 2), np.inf)
         front = cam_xyz[:, 2] > 1e-9
-        for i in np.flatnonzero(front):
-            out[i] = self.cam[i].img_from_cam(cam_xyz[i:i + 1])[0]
+        # one call per camera, not per view: a capture usually has one camera,
+        # and RANSAC projects every view for every candidate pair
+        for cid, cam in self.cameras.items():
+            sel = front & (self.cam_id == cid)
+            if sel.any():
+                out[sel] = cam.img_from_cam(cam_xyz[sel])
         return out
 
     def errors(self, X: np.ndarray) -> np.ndarray:
