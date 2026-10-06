@@ -11,6 +11,14 @@ the baseline cloud and its downstream labels stay intact:
     hull.json           carve settings + acceptance checks
     diag/               hull reprojected over input frames
 
+``--passes 0`` carves from the views of those capture passes only, and writes
+to <workdir>/p4/experiments/passes_0 so the baseline hull is untouched. It
+exists to test the static-scene assumption: carving with more views of a
+*static* plant never removes the plant itself, so each pass's silhouettes stay
+filled. If pass 0's silhouettes are filled by a pass-0 hull but not by the
+all-pass hull, the passes disagree -- the plant moved between them, or their
+poses do. hull.json's `per_pass` breakdown is that comparison.
+
 The hull is a *bound*, not the final surface -- silhouettes cannot see
 concavities, so a cupped leaf carves flat. Its job is to be the deterministic
 constraint that later stages get rejected against, replacing the old
@@ -20,7 +28,7 @@ pipeline's hand-tuned per-plant opacity/density thresholds.
 import argparse
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -29,6 +37,7 @@ from pose_estimator.hull import (
     bounds_from_points,
     carve,
     load_carve_cameras,
+    plant_points,
     to_mesh,
     write_hull_3d_plot,
     write_ply_mesh,
@@ -46,6 +55,7 @@ def run(
     min_judged_fraction: float = 0.5,
     geometry_backend: str = "colmap",
     out_dir: Optional[Path] = None,
+    passes: Optional[Sequence[int]] = None,
 ) -> dict:
     import pycolmap
 
@@ -57,7 +67,11 @@ def run(
     # has inspected the comparison and deliberately promotes one.
     p4_dir = out_dir or (workdir / "p4" if geometry_backend == "colmap"
                          else workdir / "p4" / "experiments" / geometry_backend)
+    if passes and out_dir is None:
+        p4_dir = (workdir / "p4" / "experiments" if geometry_backend == "colmap" else p4_dir) \
+            / f"passes_{'_'.join(str(p) for p in sorted(passes))}"
     p4_dir.mkdir(parents=True, exist_ok=True)
+    pass_of = _pass_of_frame(workdir)
 
     print(f"Loading poses from {p3_sparse}...")
     reconstruction = pycolmap.Reconstruction(str(p3_sparse))
@@ -66,6 +80,13 @@ def run(
     cameras = load_carve_cameras(reconstruction, plant_masks, dilate_px=dilate_px,
                                  occluder_dir=occluder_dir)
     print(f"  {len(cameras)} views with silhouettes (masks dilated {dilate_px}px)")
+    if passes:
+        if not pass_of:
+            raise SystemExit(f"--passes needs {workdir / 'p1' / 'sources.json'} to know which "
+                             "frame belongs to which capture pass, and it is missing")
+        cameras = [c for c in cameras if pass_of.get(Path(c.name).stem) in set(passes)]
+        print(f"  --passes {' '.join(map(str, passes))}: carving from {len(cameras)} of those "
+              f"views only -> {p4_dir}")
     if occluder_dir is None:
         print("  no holder masks -- carving without occlusion handling; anything the")
         print("  tool hides for most of the orbit will be carved away")
@@ -77,8 +98,16 @@ def run(
         raise RuntimeError(f"Only {len(cameras)} usable views -- carving needs many more than that")
 
     sparse_xyz = np.array([p.xyz for p in reconstruction.points3D.values()])
-    bounds_min, bounds_max = bounds_from_points(sparse_xyz)
-    print(f"  initial volume {np.round(bounds_max - bounds_min, 3).tolist()} (COLMAP units)")
+    # Sized to the plant, not the whole cloud -- see `plant_points`.
+    on_plant = plant_points(reconstruction, plant_masks)
+    if len(on_plant) >= 50:
+        bounds_min, bounds_max = bounds_from_points(on_plant)
+        print(f"  initial volume {np.round(bounds_max - bounds_min, 3).tolist()} (COLMAP units), "
+              f"from {len(on_plant)} sparse points on the plant masks")
+    else:
+        bounds_min, bounds_max = bounds_from_points(sparse_xyz)
+        print(f"  initial volume {np.round(bounds_max - bounds_min, 3).tolist()} (COLMAP units), "
+              f"from the whole sparse cloud -- only {len(on_plant)} points fall on the plant masks")
 
     print(f"Carving to {resolution}^3 (voxel must be in-silhouette in >={min_inside_fraction:.0%} of views)...")
     points, voxel, _ = carve(
@@ -106,7 +135,7 @@ def run(
             orbit = json.load(f).get("orbit")
     write_hull_3d_plot(p4_dir / "diag" / "hull_3d.png", points, sparse_xyz, orbit)
 
-    report = _evaluate(cameras, points, voxel, p4_dir)
+    report = _evaluate(cameras, points, voxel, p4_dir, pass_of)
     report.update(
         {
             "resolution": resolution,
@@ -125,6 +154,7 @@ def run(
             "extent": extent.tolist(),
             "geometry_backend": geometry_backend,
             "geometry_model": str(p3_sparse),
+            "passes": sorted(passes) if passes else None,
         }
     )
     with open(p4_dir / "hull.json", "w") as f:
@@ -148,7 +178,14 @@ def _write_points_ply(path: Path, points: np.ndarray) -> None:
         f.write(points.astype("<f4").tobytes())
 
 
-def _evaluate(cameras, points: np.ndarray, voxel: float, p4_dir: Path) -> dict:
+def _pass_of_frame(workdir: Path) -> Dict[str, int]:
+    """{frame stem: capture pass}, from P1's record; empty for a single-pass run."""
+    sources = workdir / "p1" / "sources.json"
+    return {k: int(v) for k, v in json.loads(sources.read_text()).items()} if sources.exists() else {}
+
+
+def _evaluate(cameras, points: np.ndarray, voxel: float, p4_dir: Path,
+              pass_of: Optional[Dict[str, int]] = None) -> dict:
     """Reproject the hull into every view and compare with the input silhouette.
 
     This is the check the plan asks for in P4, and it is the first genuinely
@@ -209,6 +246,23 @@ def _evaluate(cameras, points: np.ndarray, voxel: float, p4_dir: Path) -> dict:
 
     mean_iou = float(np.mean(ious))
     mean_recall = float(np.mean(recalls))
+
+    # Per capture pass, so a hull carved from one pass and the all-pass hull
+    # can be compared on the same silhouettes -- see the module docstring.
+    per_pass: Dict[str, dict] = {}
+    for index, camera in enumerate(cameras):
+        p = (pass_of or {}).get(Path(camera.name).stem)
+        if p is None:
+            continue
+        entry = per_pass.setdefault(str(p), {"views": 0, "iou": [], "recall": []})
+        entry["views"] += 1
+        entry["iou"].append(ious[index])
+        entry["recall"].append(recalls[index])
+    for p, entry in per_pass.items():
+        entry["iou"] = float(np.mean(entry["iou"]))
+        entry["recall"] = float(np.mean(entry["recall"]))
+        print(f"  pass {p}: {entry['views']} views, hull-vs-mask IoU {entry['iou']:.3f}, "
+              f"silhouette recall {entry['recall']:.1%}")
     checks = {
         "hull_reprojects_onto_masks": {
             "pass": mean_iou >= 0.75,
@@ -222,6 +276,7 @@ def _evaluate(cameras, points: np.ndarray, voxel: float, p4_dir: Path) -> dict:
     return {
         "reprojection_iou": {"mean": mean_iou, "min": float(np.min(ious))},
         "silhouette_recall": {"mean": mean_recall, "min": float(np.min(recalls))},
+        "per_pass": per_pass,
         "checks": checks,
         "all_passed": all(c["pass"] for c in checks.values()),
     }
@@ -251,6 +306,12 @@ def main(argv: Optional[list] = None) -> None:
         help="Dilate silhouettes before carving. Biases the hull outward, which is the right "
         "direction of error for an upper bound.",
     )
+    parser.add_argument(
+        "--passes", type=int, nargs="+",
+        help="carve from these capture passes only (numbers as in p1/sources.json), into "
+        "p4/experiments/passes_<n> unless --out-dir says otherwise. For testing whether the "
+        "passes agree on one static plant; compare hull.json's per_pass block with the baseline's.",
+    )
     args = parser.parse_args(argv)
 
     run(
@@ -260,6 +321,7 @@ def main(argv: Optional[list] = None) -> None:
         dilate_px=args.dilate_px,
         geometry_backend=args.geometry_backend,
         out_dir=args.out_dir,
+        passes=args.passes,
     )
 
 

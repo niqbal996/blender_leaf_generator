@@ -109,13 +109,21 @@ def rotating_region_mask(
 
 
 def _fill_holes(mask: np.ndarray) -> np.ndarray:
-    """Fill interior holes of a binary mask via border flood fill."""
+    """Fill interior holes of a binary mask via border flood fill.
+
+    The flood starts from a one-pixel background ring padded around the
+    frame, not from pixel (0, 0). Seeded at a corner that is itself
+    foreground -- e.g. room visible past the backdrop's edge, which sweeps and
+    so reads as moving -- the flood fills nothing and every background pixel
+    counts as a "hole": the mask becomes the whole frame and the
+    camera-mounted backdrop is handed to SfM.
+    """
     mask = (mask > 0).astype(np.uint8) * 255
     h, w = mask.shape
-    flood = mask.copy()
-    scratch = np.zeros((h + 2, w + 2), np.uint8)
+    flood = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    scratch = np.zeros((h + 4, w + 4), np.uint8)
     cv2.floodFill(flood, scratch, (0, 0), 255)
-    return mask | cv2.bitwise_not(flood)
+    return mask | cv2.bitwise_not(flood[1:-1, 1:-1])
 
 
 def rotating_masks_per_source(

@@ -4,8 +4,12 @@
 # Copy to one of, most general first (each overrides the last):
 #   ~/.config/blender_leaf_generator/pipeline.conf   per user -- put the token here
 #   ./pipeline.conf                                  per checkout
-#   <dataset>/../pipeline.conf                       per capture session
+#   any directory above the dataset, e.g.
+#     <root>/pipeline.conf                           every session under it
+#     <root>/<session>/pipeline.conf                 per capture session
+#     <session>/plant_data/pipeline.conf
 #   <dataset>/pipeline.conf                          per specimen
+# Every one that exists is read, top-down; --dry-run lists which.
 #
 # Keys are the long options with dashes as underscores. An unknown key is an
 # error rather than a silent no-op, so a typo here cannot cost you a run.

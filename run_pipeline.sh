@@ -6,9 +6,11 @@
 #   ./run_pipeline.sh /data/2026-09-01/sugarbeet_4
 #
 # which takes its pass*/ subdirectories as the capture passes, in natural
-# order, and works in <dataset>/plant. A flat directory of JPEGs is one pass.
-# --photos/--video/--workdir still override, and are still how you point at a
-# layout that is not this one.
+# order, and works in <dataset>/plant. With no pass*/ directories, videos
+# lying in the dataset directory are the passes, one per file; failing those,
+# a flat directory of JPEGs is one pass. --photos/--video/--workdir still
+# override, and are still how you point at a layout that is not this one.
+# To run many datasets, see batch_run_plants.sh.
 #
 # Settings that hold across runs -- bank paths, architecture, the HF token --
 # go in a pipeline.conf of key=value lines rather than in every command:
@@ -19,9 +21,10 @@
 #   low_texture  = 1
 #
 # Read from ~/.config/blender_leaf_generator/pipeline.conf, ./pipeline.conf,
-# <dataset>/../pipeline.conf and <dataset>/pipeline.conf, in that order --
-# each overriding the last, and any flag overriding all of them. --config
-# <file> uses just that file. See pipeline.conf.example.
+# and then a pipeline.conf in every directory from / down to the dataset --
+# e.g. <root>/, <root>/<session>/, <session>/plant_data/, <dataset>/ -- in
+# that order, each overriding the last, and any flag overriding all of them.
+# --config <file> uses just that file. See pipeline.conf.example.
 #
 # Put the HF token in the user-level file or in $HF_TOKEN, not on the command
 # line: an argument is visible in `ps` to every user on the machine and lands
@@ -404,22 +407,44 @@ resolve_dataset() {
     [[ -d "$root" ]] || { echo "no such dataset directory: $root" >&2; exit 1; }
     root="${root%/}"
 
-    local passes=()
+    local passes=() videos=() photos=()
     while IFS= read -r dir; do passes+=("$dir"); done < <(
         find "$root" -mindepth 1 -maxdepth 1 -type d -name 'pass*' | sort -V)
+    # Videos copied straight off the card are one pass per file, in capture
+    # order (gf_1, sugarbeet_5: DSC_0189.MOV DSC_0190.MOV ...).
+    while IFS= read -r f; do videos+=("$f"); done < <(
+        find "$root" -maxdepth 1 -type f \( -iname '*.mov' -o -iname '*.mp4' \) | sort -V)
+    while IFS= read -r f; do photos+=("$f"); done < <(
+        find "$root" -maxdepth 1 -type f -iname '*.jpg')
 
-    if [[ ${#passes[@]} -eq 0 ]] && compgen -G "$root"/*.[jJ][pP][gG] > /dev/null; then
-        # A flat directory of photos is one pass, which is how thistle3 is laid out.
-        passes=("$root")
+    # pass*/ directories, then videos, then a flat directory of photos as one
+    # pass (how thistle3 is laid out). Videos beat loose photos because the
+    # photo beside a set of videos is a reference still -- weed_3 has one
+    # DSC_0172.JPG next to three videos, and was once read as a 1-photo pass.
+    local ignored=()
+    if [[ -z "${SET[photos]:-}" && -z "${SET[video]:-}" ]]; then
+        if [[ ${#passes[@]} -gt 0 ]]; then
+            PHOTOS=("${passes[@]}")
+            [[ ${#videos[@]} -eq 0 ]] || ignored+=("${#videos[@]} video(s)")
+            [[ ${#photos[@]} -eq 0 ]] || ignored+=("${#photos[@]} loose photo(s)")
+        elif [[ ${#videos[@]} -gt 0 ]]; then
+            VIDEOS=("${videos[@]}")
+            [[ ${#photos[@]} -eq 0 ]] || ignored+=("${#photos[@]} loose photo(s)")
+        elif [[ ${#photos[@]} -gt 0 ]]; then
+            PHOTOS=("$root")
+        fi
     fi
-
-    if [[ ${#passes[@]} -gt 0 && -z "${SET[photos]:-}" && -z "${SET[video]:-}" ]]; then
-        PHOTOS=("${passes[@]}")
+    if [[ ${#ignored[@]} -gt 0 ]]; then
+        local what; what="$(printf '%s and ' "${ignored[@]}")"
+        echo "  note: $(basename "$root"): ignoring ${what% and } beside the" \
+             "$([[ ${#VIDEOS[@]} -gt 0 ]] && echo videos || echo pass dirs)" \
+             "(--photos/--video to choose otherwise)" >&2
     fi
     [[ -n "${SET[workdir]:-}" ]] || WORKDIR="$root/plant"
 
-    if [[ ${#passes[@]} -eq 0 && ! -d "$WORKDIR/p1/frames" ]]; then
-        echo "$root has no pass*/ subdirectories, no *.JPG of its own, and no" >&2
+    if [[ ${#passes[@]} -eq 0 && ${#videos[@]} -eq 0 && ${#photos[@]} -eq 0 \
+          && ! -d "$WORKDIR/p1/frames" ]]; then
+        echo "$root has no pass*/ subdirectories, no videos or *.JPG of its own, and no" >&2
         echo "  frames already at $WORKDIR/p1/frames -- is it a dataset directory?" >&2
         exit 1
     fi
@@ -429,9 +454,13 @@ resolve_dataset() {
 # belong in a file rather than in every command. Least specific first, so a
 # per-dataset file overrides a per-session one, and a flag overrides both.
 load_config() {
-    local file key value
+    local file key value real
     for file in "$@"; do
         [[ -f "$file" ]] || continue
+        # ./pipeline.conf is also an ancestor's when run from the data tree.
+        real="$(realpath "$file")"
+        [[ -z "${CONF_SEEN[$real]:-}" ]] || continue
+        CONF_SEEN[$real]=1
         LOADED_CONF+=("$file")
         local line_no=0
         while IFS= read -r line || [[ -n "$line" ]]; do
@@ -487,6 +516,7 @@ load_config() {
 }
 
 LOADED_CONF=()
+declare -A CONF_SEEN=()
 [[ -z "$DATASET" ]] || resolve_dataset "$DATASET"
 
 if [[ ${#CONF_FILES[@]} -gt 0 ]]; then
@@ -495,11 +525,23 @@ else
     CANDIDATES=("$HOME/.config/blender_leaf_generator/pipeline.conf" "$PWD/pipeline.conf")
     # With --workdir there is no $DATASET to hang the per-session and
     # per-specimen files off -- but the workdir is <dataset>/plant by
-    # convention, so the same two files are findable from it. Without this a
+    # convention, so the same files are findable from it. Without this a
     # pipeline.conf beside the dataset was silently ignored on exactly the
     # runs that resume with --skip-to, which is most of them.
     CONF_BASE="${DATASET:-$([[ -n "$WORKDIR" ]] && dirname "${WORKDIR%/}")}"
-    [[ -z "$CONF_BASE" ]] || CANDIDATES+=("$(dirname "${CONF_BASE%/}")/pipeline.conf" "${CONF_BASE%/}/pipeline.conf")
+    # Every directory from / down to the dataset, least specific first.
+    # Looking only one level up was enough while specimens sat directly in a
+    # session directory; <session>/plant_data/<specimen> puts the session's
+    # file two levels up, where it was silently skipped.
+    if [[ -n "$CONF_BASE" ]]; then
+        ANCESTORS=()
+        dir="$(realpath -m "$CONF_BASE")"
+        while [[ "$dir" != / ]]; do
+            ANCESTORS=("$dir/pipeline.conf" ${ANCESTORS[@]+"${ANCESTORS[@]}"})
+            dir="$(dirname "$dir")"
+        done
+        CANDIDATES+=(${ANCESTORS[@]+"${ANCESTORS[@]}"})
+    fi
     load_config "${CANDIDATES[@]}"
 fi
 
@@ -909,6 +951,33 @@ if [[ -n "${MISSING// /}" ]]; then
     exit 1
 fi
 
+# pycolmap is imported lazily, so the check above proves only that it is
+# installed. A CUDA build whose runtime will not load -- or use_gpu on a CPU
+# build -- otherwise fails at P3, after P1/P2 have already spent their time.
+if [[ " $REQUIRED " == *" pycolmap "* ]]; then
+    COLMAP_STATE="$("$PY" - <<'PYCHECK' 2>&1
+try:
+    import pycolmap
+except Exception as exc:
+    cause = exc.__cause__ or exc     # the real loader error, not pycolmap's rewrap
+    print(f"{type(cause).__name__}: {cause}")
+else:
+    print(int(bool(getattr(pycolmap, "has_cuda", False))))
+PYCHECK
+)"
+    case "$COLMAP_STATE" in
+        0|1) ;;
+        *)  echo "ERROR: pycolmap is installed but does not import: $COLMAP_STATE" >&2
+            echo "  pycolmap-cuda:  python scripts/link_pycolmap_cuda.py   (or re-run ./setup_env.sh)" >&2
+            exit 1 ;;
+    esac
+    if [[ "$USE_GPU" == 1 && "$COLMAP_STATE" != 1 ]]; then
+        echo "ERROR: use_gpu is on, but this pycolmap is a CPU build (pycolmap.has_cuda is False)" >&2
+        echo "  install pycolmap-cuda with ./setup_env.sh, or set use_gpu = 0" >&2
+        exit 1
+    fi
+fi
+
 # P4b's CUDA toolchain, checked now rather than after COLMAP. gsplat ships no
 # prebuilt wheels, so it JIT-compiles on first render -- and if nvcc is too
 # old or missing, that surfaces 40 minutes into a run, immediately after the
@@ -990,7 +1059,9 @@ should_run() {
 phase() {
     local colour="$C_BOLD"
     [[ "$1" == *SKIPPED* ]] && colour="$C_BOLD$C_ORANGE"
-    printf '\n%s=== %s ===%s\n' "$colour" "$1" "$C_OFF"
+    # Timestamped, so pipeline.log shows what each phase cost -- which is
+    # what to compare when several specimens share a GPU.
+    printf '\n%s=== %s ===%s  %s\n' "$colour" "$1" "$C_OFF" "$(date '+%H:%M:%S')"
 }
 
 # Where this branch's later phases read and write. The baseline keeps the
@@ -1280,7 +1351,7 @@ if should_run p6; then
     fi
 fi
 
-phase "done  ($(date '+%H:%M:%S'))"
+phase "done"
 cat <<EOF
 Open in Blender:
   ./scripts/view_in_blender.sh $WORKDIR$([[ "$GEOMETRY_BACKEND" == "colmap" ]] || echo " --geometry-backend $GEOMETRY_BACKEND")

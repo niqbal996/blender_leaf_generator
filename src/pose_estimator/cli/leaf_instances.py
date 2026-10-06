@@ -39,10 +39,11 @@ and is reported as such.
 **What this cannot do.** It inherits P2's 2D mistakes without appeal. A leaf
 the `leaf` prompt lost on a frame contributes no vote there, which the other
 views absorb; but a leaf that fragments into two ids across the rotation
-arrives here as two leaves, and nothing downstream can merge them. That is
-the measurement to check first -- `p2/prompts.json` records how many frames
-each id survived, and on a bushy specimen (gaensefuss_1: 43 ids for perhaps
-18 leaves) the fragmentation is the dominant error, not the projection.
+arrives here as two leaves unless another pass's id bridges them in 3D.
+On gaensefuss_1 that fragmentation turned out to be moderate -- 43-45 ids
+per pass for a plant the flat lay counts at 34 leaves -- and the dominant
+error was the cross-pass merge chaining *distinct* leaves together; see
+`merge_across_passes`.
 
 Reads:
     p2/masks/leaf_instances/<id>/*.png   the 2D ids, from --backend sam3
@@ -79,8 +80,11 @@ from pose_estimator.semantic import (
     estimate_normals,
     finalise_votes,
     render_points,
+    surface_scale,
     view_weights,
+    visible_only,
 )
+from pose_estimator.leaf_skeleton import trace
 from pose_estimator.cli.report import print_checks
 
 # Sentinels in instances.npy, chosen so a leaf index stays a plain 0-based
@@ -97,6 +101,13 @@ ROOT_RGB = (240, 140, 40)
 # count, but a fragmented run can produce more ids than leaves, so it is
 # checked rather than assumed.
 MAX_VOTED_CLASSES = 127
+
+# Two ids of one pass that SAM3 shows on the same frame overlapping less than
+# this share of the smaller are two objects, not one object twice. Measured on
+# gaensefuss_1: of 2700 same-pass pairs ever on screen together, 2689 overlap
+# by ~0 -- SAM3's simultaneous instances are disjoint -- so the bar only has to
+# keep a genuine duplicate (an NMS miss) from being read as two leaves.
+DUPLICATE_OVERLAP = 0.5
 
 
 def leaf_palette(n: int) -> np.ndarray:
@@ -138,15 +149,23 @@ def usable_instances(leaf_root: Path, min_frames: int) -> List[Path]:
 
 def build_label_map(leaf_dirs: Sequence[Path], stem_dir: Optional[Path],
                     root_dir: Optional[Path], stem: str,
-                    shape, stem_class: int, root_class: int) -> Optional[np.ndarray]:
+                    shape, stem_class: int, root_class: int,
+                    co_visible: Optional[Dict[tuple, int]] = None) -> Optional[np.ndarray]:
     """One frame's 2D map in the form `cast_votes` already reads.
 
     Same contract as a P4c class map -- -1 where nothing is claimed, otherwise
     a class index -- so the fusion below is the one that has been validated
     against synthetic maps, not a second implementation of it.
+
+    `co_visible`, if given, is incremented for every pair of leaf indices this
+    frame shows as two separate masks -- the evidence `merge_across_passes`
+    uses to refuse joining them. It is gathered here because this is where
+    every mask is read anyway.
     """
     out = np.full(shape, -1, np.int16)
     found = False
+    areas: Dict[int, int] = {}
+    shared: Dict[tuple, int] = {}
     for index, folder in enumerate(leaf_dirs):
         path = folder / f"{stem}.png"
         if not path.exists():
@@ -154,8 +173,22 @@ def build_label_map(leaf_dirs: Sequence[Path], stem_dir: Optional[Path],
         raw = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if raw is None:
             continue
-        out[raw > 127] = index
+        claim = raw > 127
+        if co_visible is not None:
+            under = out[claim]
+            under = under[under >= 0]
+            for other, n in zip(*np.unique(under, return_counts=True)):
+                shared[(int(other), index)] = int(n)
+            areas[index] = int(claim.sum())
+        out[claim] = index
         found = True
+
+    if co_visible is not None:
+        present = sorted(i for i, a in areas.items() if a > 0)
+        for a_index, a in enumerate(present):
+            for b in present[a_index + 1:]:
+                if shared.get((a, b), 0) < DUPLICATE_OVERLAP * min(areas[a], areas[b]):
+                    co_visible[(a, b)] = co_visible.get((a, b), 0) + 1
 
     # The stem and root are painted after the leaves: where a leaf instance
     # and the stem residual disagree the residual is the narrower claim, and
@@ -190,27 +223,25 @@ def group_by_pass(leaf_dirs: Sequence[Path]) -> Dict[str, List[Path]]:
     return out
 
 
-class _Union:
-    """Union-find over (pass, local leaf index) pairs."""
+def cannot_link_pairs(co_visible: Dict[str, Dict[tuple, int]],
+                      min_frames: int) -> set:
+    """{frozenset of two (pass, index) keys} that SAM3 says are two objects.
 
-    def __init__(self):
-        self.parent: Dict[tuple, tuple] = {}
-
-    def find(self, item):
-        self.parent.setdefault(item, item)
-        while self.parent[item] != item:
-            self.parent[item] = self.parent[self.parent[item]]
-            item = self.parent[item]
-        return item
-
-    def union(self, a, b):
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.parent[rb] = ra
+    `co_visible[prefix][(a, b)]` counts the frames on which that pass showed
+    ids a and b as separate masks. One shared frame could be a tracker
+    hiccup; `min_frames` of them is SAM3 stating, repeatedly, that these are
+    different things. 0 turns the constraint off.
+    """
+    if min_frames <= 0:
+        return set()
+    return {frozenset(((prefix, a), (prefix, b)))
+            for prefix, table in co_visible.items()
+            for (a, b), n in table.items() if n >= min_frames}
 
 
 def merge_across_passes(per_pass: Dict[str, np.ndarray], counts: Dict[str, int],
-                        overlap_fraction: float) -> Dict[tuple, int]:
+                        overlap_fraction: float, cannot_link: Optional[set] = None,
+                        stats: Optional[dict] = None) -> Dict[tuple, int]:
     """Match each pass's leaf labels to the other passes', by 3D overlap.
 
     Every pass labels the *same* cloud, so the correspondence the 2D tracker
@@ -219,16 +250,26 @@ def merge_across_passes(per_pass: Dict[str, np.ndarray], counts: Dict[str, int],
     that claim the same points are the same leaf. This is the step that keeps
     a three-pass capture from reporting every leaf three times.
 
+    **Links are taken strongest first, and one SAM3 contradicts is refused.**
+    This used to be a union-find over every link above `overlap_fraction`,
+    and a union-find is transitive: a small id that touches two leaves joins
+    them, and on a crown every small id touches several. Measured on
+    gaensefuss_1 (34 leaves on the flat lay), each pass alone carried 33-37
+    ids winning >= 40 points, and the union-find chained them into 17 -- one
+    "leaf" of 26 ids held 10 from pass 0 alone, 8 of them on screen at once as
+    separate masks. `cannot_link` (see `cannot_link_pairs`) is that statement
+    from SAM3: a merge that would put two such ids in one leaf is skipped,
+    and the weaker link that wanted it simply does not happen. Same votes,
+    same threshold: 17 -> 33 leaves, with blade lengths that rank-match the
+    flat lay at the camera-derived scale. With no constraints the result is
+    exactly the union-find's: the same links, merged in a different order.
+
+    `stats`, if given, receives the number of links refused.
+
     Returns {(pass, local index) -> merged leaf id}.
     """
-    union = _Union()
-    # Every leaf that won any points is entered first, merged or not. Seeding
-    # only from the pairs that matched drops the leaf that one elevation sees
-    # and the others do not -- it gets no group, and `_combine_passes` then
-    # reads it as unlabelled and deletes it.
-    for key, size in counts.items():
-        if size > 0:
-            union.find(key)
+    cannot_link = cannot_link or set()
+    links = []
     passes = sorted(per_pass)
     for a_index, first in enumerate(passes):
         for second in passes[a_index + 1:]:
@@ -241,13 +282,38 @@ def merge_across_passes(per_pass: Dict[str, np.ndarray], counts: Dict[str, int],
             pairs, overlap = np.unique(
                 np.stack([left[both], right[both]], axis=1), axis=0, return_counts=True)
             for (a, b), n in zip(pairs, overlap):
-                smaller = min(counts.get((first, int(a)), 0), counts.get((second, int(b)), 0))
+                ka, kb = (first, int(a)), (second, int(b))
+                smaller = min(counts.get(ka, 0), counts.get(kb, 0))
                 if smaller and n >= overlap_fraction * smaller:
-                    union.union((first, int(a)), (second, int(b)))
+                    links.append((n / smaller, int(n), ka, kb))
+    # Strongest share first, larger absolute overlap breaking ties, then the
+    # keys themselves so the result never depends on dict order.
+    links.sort(key=lambda link: (-link[0], -link[1], link[2], link[3]))
 
+    # Every leaf that won any points is entered first, merged or not. Seeding
+    # only from the pairs that matched drops the leaf that one elevation sees
+    # and the others do not -- it gets no group, and `_combine_passes` then
+    # reads it as unlabelled and deletes it.
+    members = {key: {key} for key, size in counts.items() if size > 0}
+    owner = {key: key for key in members}
+    refused = 0
+    for _share, _n, ka, kb in links:
+        ra, rb = owner[ka], owner[kb]
+        if ra == rb:
+            continue
+        if cannot_link and any(frozenset((x, y)) in cannot_link
+                               for x in members[ra] for y in members[rb]):
+            refused += 1
+            continue
+        for key in members[rb]:
+            owner[key] = ra
+        members[ra] |= members.pop(rb)
+
+    if stats is not None:
+        stats["links_refused"] = refused
     roots, merged = {}, {}
-    for key in sorted(union.parent):
-        root = union.find(key)
+    for key in sorted(owner):
+        root = owner[key]
         if root not in roots:
             roots[root] = len(roots)
         merged[key] = roots[root]
@@ -306,6 +372,8 @@ def run(
     cloud: Optional[Path] = None,
     source: str = "auto",
     merge_overlap: float = 0.30,
+    covisible_frames: int = 2,
+    occlusion_test: bool = True,
 ) -> dict:
     import pycolmap
 
@@ -336,6 +404,16 @@ def run(
             "its own ids starting at zero, so those folders each hold several unrelated\n"
             "leaves merged together and cannot be projected. Re-run P2:\n"
             f"    pose-segment --workdir {workdir} --backend sam3 --reuse-frames")
+    # prefix -> the frame stems that pass captured. "pass2_" is capture pass 2
+    # in p1/sources.json, which is how a view is matched to the session whose
+    # ids describe it.
+    frames_of_pass: Dict[str, set] = {}
+    for prefix in by_pass:
+        if not prefix:
+            continue
+        index = int(prefix[len("pass"):].rstrip("_"))
+        frames_of_pass[prefix] = {stem for stem, p in sources.items() if p == index}
+
     print(f"  {len(leaf_dirs)} leaf instance(s) with >= {min_frames} frames "
           f"across {len(by_pass)} capture pass(es)"
           + (", stem residual" if stem_dir else ", NO stem masks")
@@ -374,6 +452,16 @@ def run(
     else:
         photo_rgb = np.full((len(points), 3), 160, np.uint8)
 
+    # Occlusion: a point votes only in views where it is the visible surface.
+    # Both scales are measured on this cloud -- see `visible_only`.
+    spacing = tolerance = 0.0
+    hidden = [0, 0]                         # pixels dropped as hidden, pixels drawn
+    if occlusion_test:
+        spacing, thickness = surface_scale(points)
+        tolerance = 2.0 * thickness
+        print(f"  occlusion test on: point spacing {spacing:.5f}, sheet thickness "
+              f"{thickness:.5f}; a point votes only within {tolerance:.5f} of the visible surface")
+
     sparse_model, _ = cloud_source.geometry(workdir, geometry_backend)
     reconstruction = pycolmap.Reconstruction(str(sparse_model))
     image_ids = sorted(reconstruction.reg_image_ids())
@@ -384,21 +472,38 @@ def run(
     # leaves arguing over the same class index.
     per_pass: Dict[str, np.ndarray] = {}
     leaf_counts: Dict[tuple, int] = {}
+    co_visible: Dict[str, Dict[tuple, int]] = {}
     used = 0
     for prefix, dirs in sorted(by_pass.items()):
         stem_class, root_class = len(dirs), len(dirs) + 1
         tally = accumulate_votes(len(points), len(dirs) + 2)
+        co_visible[prefix] = {}
         seen_here = 0
+        # Only this pass's own frames. The stem and root masks exist for every
+        # frame in the workdir, so a frame from another pass still produces a
+        # label map -- one with no leaf ids on it, because this pass has none
+        # there. Letting those vote means a leaf that only pass 1 can see
+        # collects skeleton votes from passes 0 and 2, and the majority in
+        # `_combine_passes` then calls a leaf the stem.
+        mine = frames_of_pass.get(prefix)
         for image_id in image_ids:
             image = reconstruction.images[image_id]
+            if mine is not None and Path(image.name).stem not in mine:
+                continue
             camera = camera_from_colmap(image, reconstruction.cameras[image.camera_id])
             label_map = build_label_map(dirs, stem_dir, root_dir,
                                         Path(image.name).stem,
                                         (camera.height, camera.width),
-                                        stem_class, root_class)
+                                        stem_class, root_class,
+                                        co_visible=co_visible[prefix])
             if label_map is None:
                 continue
             _rgb, index_map = render_points(points, photo_rgb, camera)
+            if occlusion_test:
+                drawn = int((index_map >= 0).sum())
+                index_map = visible_only(points, camera, index_map, spacing, tolerance)
+                hidden[0] += drawn - int((index_map >= 0).sum())
+                hidden[1] += drawn
             weights = view_weights(points, normals, camera) if normals is not None else None
             cast_votes(tally, index_map, label_map, weights)
             seen_here += 1
@@ -421,27 +526,88 @@ def run(
             "none of the registered views had a leaf-instance mask -- the frame names in "
             f"{sparse_model} do not match the mask filenames in {p2 / 'masks'}")
 
-    merged = merge_across_passes(per_pass, leaf_counts, merge_overlap)
+    if occlusion_test and hidden[1]:
+        print(f"  occlusion test dropped {hidden[0] / hidden[1]:.1%} of rendered pixels: points "
+              "hidden behind the visible surface, which would have voted for what is in front")
+
+    total_views = sum(len(frames_of_pass.get(prefix, image_ids)) for prefix in by_pass)
+    cannot_link = cannot_link_pairs(co_visible, covisible_frames)
+    merge_stats: dict = {}
+    merged = merge_across_passes(per_pass, leaf_counts, merge_overlap,
+                                 cannot_link=cannot_link, stats=merge_stats)
     if len(by_pass) > 1:
         n_groups = len(set(merged.values())) if merged else 0
         print(f"  {len(leaf_counts)} per-pass ids merged into {n_groups} leaves by 3D overlap "
               f"(>= {merge_overlap:.0%} of the smaller)")
+        if covisible_frames > 0:
+            print(f"    {len(cannot_link)} same-pass pairs on screen together as separate masks "
+                  f"on >= {covisible_frames} frames; {merge_stats['links_refused']} merge(s) "
+                  "refused for joining such a pair")
 
     assignment = _combine_passes(per_pass, merged, len(points))
 
     # A leaf that won only a handful of points is not a leaf in 3D whatever it
     # was in 2D; its points are more usefully skeleton than a spurious organ.
     dropped = 0
-    for index in range(n_leaves):
+    for index in sorted({int(v) for v in np.unique(assignment) if v >= 0}):
         mask = assignment == index
         if 0 < int(mask.sum()) < min_points:
             assignment[mask] = SKELETON
             dropped += 1
 
+    # --- upright, and in the same frame P5 draws in ---
+    #
+    # The cloud is in the reconstruction's own frame, where "up" is wherever
+    # COLMAP's first camera happened to look -- which is why an unrotated P5x
+    # scene lies on its side in Blender. P5 already solves the upright plant
+    # frame and records it, so it is read rather than solved again: two scenes
+    # built from one capture must not disagree about which way the plant grew.
+    frame = _plant_frame(workdir, geometry_backend)
+    if frame is not None:
+        origin, rotation = frame
+        points = (points - origin) @ rotation.T
+        print("  rotated into P5's upright plant frame (origin on the clamp line)")
+    else:
+        print("  WARNING: no p5/stem_graph.json, so the cloud is drawn in the raw")
+        print("    reconstruction frame and will not stand upright. Run pose-structure,")
+        print("    or accept an arbitrarily oriented scene.")
+
+    # --- the skeleton, traced through tissue whose identity is already known ---
+    voxel, voxel_origin = cloud_source.voxel_size(workdir, geometry_backend, points)
+    architecture = _architecture(workdir, geometry_backend)
+    skeleton = trace(points, assignment, voxel, architecture=architecture)
+    skeleton["architecture"] = architecture
+    if skeleton.get("crown_moved_to_largest_component"):
+        moved = skeleton["crown_moved_to_largest_component"]
+        print(f"  the crown fell on a {moved['from_component_size']}-point island, so it was "
+              f"moved to the foot of the {moved['to_component_size']}-point plant body")
+    if skeleton.get("graph_components", 1) > 1:
+        print(f"  the cloud is {skeleton['graph_components']} disconnected pieces -- the clamp "
+              "cuts the root off, and a thin petiole can be carved through")
+    if skeleton["unreachable"]:
+        print(f"  {len(skeleton['unreachable'])} leaf/leaves never reach the crown through "
+              f"the cloud: {skeleton['unreachable']}")
+        print("    their bridge to the plant was carved away, so they get no midrib.")
+    if skeleton["leaves"]:
+        heights = [leaf["height"] for leaf in skeleton["leaves"]]
+        print(f"  traced {len(skeleton['leaves'])} midribs from the crown; "
+              f"tips span z {min(heights):.3f}..{max(heights):.3f} ({voxel_origin} voxel "
+              f"{voxel:.5f})")
+
     surviving = sorted({int(v) for v in np.unique(assignment) if v >= 0})
     report = _write_outputs(p5x, points, assignment, surviving, leaf_dirs,
-                            photo_rgb, used, len(image_ids) * len(by_pass),
-                            dropped, min_points)
+                            photo_rgb, used, total_views, dropped, min_points,
+                            skeleton=skeleton,
+                            merge={"overlap_fraction": merge_overlap,
+                                   "covisible_frames": covisible_frames,
+                                   "per_pass_ids": len(leaf_counts),
+                                   "groups": len(set(merged.values())) if merged else 0,
+                                   "cannot_link_pairs": len(cannot_link),
+                                   "links_refused": merge_stats.get("links_refused", 0)},
+                            visibility={"occlusion_test": occlusion_test,
+                                        "point_spacing": spacing, "depth_tolerance": tolerance,
+                                        "hidden_pixels_dropped": (hidden[0] / hidden[1]
+                                                                  if hidden[1] else 0.0)})
 
     print_checks("P5x", report)
     print(f"\n  {len(surviving)} leaf instance(s) in 3D, "
@@ -453,8 +619,75 @@ def run(
     return report
 
 
+def _architecture(workdir: Path, geometry_backend: str) -> Optional[str]:
+    """P5's --architecture, read from its output like the plant frame is: it
+    decides whether the plant has a stem the petioles branch off, or leaves
+    that meet at a crown (rosette)."""
+    p5 = (workdir / "p5" if geometry_backend in (None, "", cloud_source.BASELINE)
+          else workdir / "p5" / "experiments" / geometry_backend)
+    path = p5 / "instancing.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text()).get("architecture")
+
+
+def _write_curves(path: Path, polylines, colours) -> None:
+    """Polylines as a PLY edge list -- real curves, not a cloud of samples.
+
+    A midrib drawn as points looks like thin tissue that happened to be
+    labelled; drawn as a line it reads as the measurement it is, and Blender
+    can bevel it into a tube. `edge` elements are the standard way to say so
+    and the repo's own reader ignores them, so the file stays loadable
+    everywhere it was before.
+    """
+    usable = [(np.asarray(line, float), colour)
+              for line, colour in zip(polylines, colours) if len(np.asarray(line)) >= 2]
+    if not usable:
+        return
+    vertices, edges, rgb = [], [], []
+    for line, colour in usable:
+        start = len(vertices)
+        vertices.extend(line)
+        rgb.extend([colour] * len(line))
+        edges.extend((start + i, start + i + 1) for i in range(len(line) - 1))
+
+    with open(path, "w") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {len(vertices)}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        f.write(f"element edge {len(edges)}\n")
+        f.write("property int vertex1\nproperty int vertex2\n")
+        f.write("end_header\n")
+        for (x, y, z), colour in zip(vertices, rgb):
+            f.write(f"{x} {y} {z} {int(colour[0])} {int(colour[1])} {int(colour[2])}\n")
+        for a, b in edges:
+            f.write(f"{a} {b}\n")
+
+
+def _plant_frame(workdir: Path, geometry_backend: str):
+    """(origin, rotation) from P5's stem graph, or None if it has not run.
+
+    Read, not re-solved. `solve_plant_frame` needs the sparse model, the orbit
+    and the holder masks, and re-deriving it here would give a second answer
+    to a question the workdir has already answered -- two scenes of one
+    capture disagreeing about which way is up is worse than one that is not
+    upright at all.
+    """
+    p5 = (workdir / "p5" if geometry_backend in (None, "", cloud_source.BASELINE)
+          else workdir / "p5" / "experiments" / geometry_backend)
+    graph_path = p5 / "stem_graph.json"
+    if not graph_path.exists():
+        return None
+    frame = json.loads(graph_path.read_text()).get("plant_frame")
+    if not frame:
+        return None
+    return np.asarray(frame["origin"], float), np.asarray(frame["rotation"], float)
+
+
 def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
-                   photo_rgb, views_used, views_total, dropped, min_points) -> dict:
+                   photo_rgb, views_used, views_total, dropped, min_points,
+                   skeleton=None, merge=None, visibility=None) -> dict:
     palette = leaf_palette(max(len(leaf_dirs), 1))
 
     rgb = np.zeros((len(points), 3), np.uint8)
@@ -489,6 +722,16 @@ def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
     dump(p5x / "segmented.ply", assignment != UNSEEN, rgb, with_label=True)
     np.save(p5x / "instances.npy", assignment)
 
+    # The skeleton as curves, one polyline per leaf, so Blender can draw the
+    # midribs as curves rather than as another cloud of points.
+    skeleton = skeleton or {"crown": None, "leaves": [], "unreachable": []}
+    with open(p5x / "skeleton.json", "w") as f:
+        json.dump(skeleton, f, indent=2)
+    _write_curves(p5x / "midribs.ply", [leaf["midrib"] for leaf in skeleton["leaves"]],
+                  [palette[leaf["id"] % len(palette)] for leaf in skeleton["leaves"]])
+    _write_curves(p5x / "petioles.ply", [leaf["petiole"] for leaf in skeleton["leaves"]],
+                  [SKELETON_RGB] * len(skeleton["leaves"]))
+
     per_leaf = {str(i): int((assignment == i).sum()) for i in surviving}
     unseen = int((assignment == UNSEEN).sum())
     checks = {
@@ -520,8 +763,13 @@ def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
     }
     report = {
         "num_points": int(len(points)),
+        "midribs_traced": len(skeleton["leaves"]),
+        "leaves_not_reaching_the_crown": skeleton["unreachable"],
+        "crown": skeleton["crown"],
         "num_leaves_2d": len(leaf_dirs),
         "num_leaves_3d": len(surviving),
+        "merge": merge or {},
+        "visibility": visibility or {},
         "points_per_leaf": per_leaf,
         "skeleton_points": n_skeleton,
         "root_points": int((assignment == ROOT).sum()),
@@ -547,6 +795,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                              "they claim this fraction of the smaller one's points. Each pass "
                              "is an independent SAM3 session, so its ids mean nothing to the "
                              "others and the match has to be made in 3D")
+    parser.add_argument("--covisible-frames", type=int, default=2,
+                        help="refuse a merge that would join two ids of one pass that SAM3 "
+                             "showed as separate masks on at least this many frames -- SAM3 "
+                             "saying they are two objects. 0 turns it off, which is the old "
+                             "transitive merge that chained a crown into one leaf")
+    parser.add_argument("--no-occlusion-test", action="store_true",
+                        help="let a point vote in views where it is hidden behind another "
+                             "surface, as before. Only for comparison: on gaensefuss_1 a quarter "
+                             "of rendered pixels were such hidden points")
     parser.add_argument("--no-normal-weighting", action="store_true",
                         help="count every view equally instead of weighting by how "
                              "broad-side the surface is to it. Only for comparison: an "
@@ -565,8 +822,9 @@ def main(argv: Optional[list] = None) -> None:
     args = parser.parse_args(argv)
     run(workdir=args.workdir, min_frames=args.min_frames, min_points=args.min_points,
         normal_weighting=not args.no_normal_weighting,
+        occlusion_test=not args.no_occlusion_test,
         geometry_backend=args.geometry_backend, cloud=args.cloud, source=args.source,
-        merge_overlap=args.merge_overlap)
+        merge_overlap=args.merge_overlap, covisible_frames=args.covisible_frames)
 
 
 if __name__ == "__main__":

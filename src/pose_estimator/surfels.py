@@ -360,6 +360,7 @@ def render_surface_points(
     hull_voxel: float,
     alpha_threshold: float = 0.5,
     hull_dilation_voxels: float = 2.0,
+    mask_dilation_px: Optional[float] = None,
     device: str = "cuda",
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
     """Back-project rendered depth into a carved surface point cloud.
@@ -373,6 +374,22 @@ def render_surface_points(
     manual opacity/scale thresholds: floaters are removed because an
     independent, deterministic bound says they are outside the object, not
     because someone picked a cutoff that happened to work on one plant.
+
+    **How far outside the hull a point may sit is a physical length, not a
+    voxel count.** Pass `mask_dilation_px` -- the dilation P4a carved with,
+    which `p4/hull.json` records -- and the tolerance becomes that dilation
+    projected back to the point's own depth, which is where the hull's
+    boundary error actually comes from. Expressing it as a multiple of the
+    final voxel instead ties it to the grid, and subdividing the grid does
+    not make the hull more accurate: measured on gaensefuss_1, going from
+    256 to 512 silently halved this tolerance from 2.15 mm to 1.08 mm and
+    the share of back-projected points thrown away rose from 26% to 41%.
+    The physical value is 1.03 mm at either resolution.
+
+    The floor is half a voxel diagonal, because `hull_points` are voxel
+    *centres*: a point lying exactly on the hull's surface is already up to
+    sqrt(3)/2 of a voxel from the nearest centre, and punishing that would be
+    punishing the discretisation rather than the geometry.
     """
     import torch
     import torch.nn.functional as F
@@ -381,6 +398,7 @@ def render_surface_points(
 
     hull_tree = cKDTree(hull_points)
     reject_radius = hull_dilation_voxels * hull_voxel
+    quantisation_floor = 0.8660254 * hull_voxel
 
     all_points, all_normals = [], []
     kept_total = raw_total = 0
@@ -443,7 +461,15 @@ def render_surface_points(
             raw_total += len(world_np)
 
             distance, _ = hull_tree.query(world_np)
-            inside = distance <= reject_radius
+            if mask_dilation_px is None:
+                inside = distance <= reject_radius
+            else:
+                # The same angular slack the hull was carved with, measured at
+                # each point's own depth -- so a point far from the camera,
+                # where a pixel covers more world, is judged as leniently as
+                # the geometry demands and no more.
+                slack = mask_dilation_px * z.cpu().numpy() / float(fx)
+                inside = distance <= np.maximum(slack, quantisation_floor)
             kept_total += int(inside.sum())
 
             all_points.append(world_np[inside])

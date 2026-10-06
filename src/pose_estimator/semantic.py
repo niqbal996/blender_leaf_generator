@@ -120,21 +120,37 @@ def render_points(
     visible = in_front & (x >= -splat_radius) & (x < camera.width + splat_radius) \
         & (y >= -splat_radius) & (y < camera.height + splat_radius)
 
-    order = np.argsort(-depth[visible])  # far first
-    idx = np.nonzero(visible)[0][order]
+    idx = np.nonzero(visible)[0]
     xs, ys = x[idx], y[idx]
 
     index_map = np.full((camera.height, camera.width), -1, np.int32)
     rgb = np.zeros((camera.height, camera.width, 3), np.uint8)
 
+    # Every pixel of every disc first, then the nearest point per pixel. This
+    # used to paint far-to-near *within each disc offset*, offset by offset --
+    # so a far point's disc pixel written in a later offset overwrote a near
+    # point's pixel from an earlier one, and the depth test only held for
+    # 1-pixel discs. On gaensefuss_1 pass 0 that let 25% of rendered pixels
+    # carry a point hidden behind the visible surface, voting for whatever the
+    # photograph showed in front of it.
+    pixels, owners = [], []
     for dy in range(-splat_radius, splat_radius + 1):
         for dx in range(-splat_radius, splat_radius + 1):
             if dx * dx + dy * dy > splat_radius * splat_radius:
                 continue
             px, py = xs + dx, ys + dy
             keep = (px >= 0) & (px < camera.width) & (py >= 0) & (py < camera.height)
-            index_map[py[keep], px[keep]] = idx[keep]
-            rgb[py[keep], px[keep]] = colors[idx[keep]]
+            pixels.append(py[keep] * camera.width + px[keep])
+            owners.append(idx[keep])
+    if not pixels:
+        return rgb, index_map
+    pixels = np.concatenate(pixels)
+    owners = np.concatenate(owners)
+    order = np.lexsort((depth[owners], pixels))          # by pixel, then nearest first
+    pixels, owners = pixels[order], owners[order]
+    first = np.r_[True, pixels[1:] != pixels[:-1]]
+    index_map.reshape(-1)[pixels[first]] = owners[first]
+    rgb.reshape(-1, 3)[pixels[first]] = colors[owners[first]]
 
     return rgb, index_map
 
@@ -149,6 +165,63 @@ def camera_from_colmap(image, camera) -> ViewCamera:
         width=int(camera.width),
         height=int(camera.height),
     )
+
+
+def surface_scale(points: np.ndarray, k: int = 16) -> Tuple[float, float]:
+    """(point spacing, sheet thickness) of a surface cloud, both measured.
+
+    Spacing is the median nearest-neighbour distance; thickness is the median
+    of 2 sigma of each point's neighbourhood along its least-variance axis --
+    how far apart the two faces of a carved leaf sit. They set the occlusion
+    test below, so it follows the cloud it is given rather than a grid size.
+    """
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(points)
+    spacing = float(np.median(tree.query(points, k=2)[0][:, 1]))
+    _, neighbours = tree.query(points, k=min(k, len(points)))
+    patches = points[neighbours] - points[neighbours].mean(axis=1, keepdims=True)
+    cov = np.einsum("nki,nkj->nij", patches, patches) / max(patches.shape[1] - 1, 1)
+    least = np.linalg.eigvalsh(cov)[:, 0]
+    thickness = float(np.median(2.0 * np.sqrt(np.maximum(least, 0.0))))
+    return spacing, thickness
+
+
+def visible_only(points: np.ndarray, camera: ViewCamera, index_map: np.ndarray,
+                 spacing: float, tolerance: float) -> np.ndarray:
+    """`index_map` with every pixel whose point is hidden behind the surface removed.
+
+    `render_points` draws each point as a small disc, nearest last. Where the
+    discs of the front surface leave gaps -- and at radius 2 they do, the
+    cloud's spacing projects to 3-4 px -- a point *behind* shows through and
+    collects the label of whatever the photograph has in front of it.
+    Measured on gaensefuss_1 pass 0: 25% of rendered pixels carried a point
+    more than 1.5 voxels behind the visible surface, 19% more than 3 -- a
+    different leaf or the far side of the plant voting for what it cannot see.
+
+    The test renders the nearest surface again with discs as wide as the
+    cloud's own spacing, so neighbouring points close the surface, and keeps a
+    pixel only if its point lies within `tolerance` of that surface. Both
+    faces of one leaf pass; a leaf behind it does not.
+    """
+    R = camera.world_to_camera[:3, :3]
+    t = camera.world_to_camera[:3, 3]
+    depth = (points @ R.T + t)[:, 2]
+    front = depth > 1e-6
+    if not front.any():
+        return index_map
+    cover = int(np.ceil(spacing * camera.K[0, 0] / float(np.median(depth[front]))))
+    _rgb, nearest = render_points(points, np.zeros((len(points), 3), np.uint8), camera,
+                                  splat_radius=max(cover, 1))
+    surface = np.full(index_map.shape, np.inf)
+    hit = nearest >= 0
+    surface[hit] = depth[nearest[hit]]
+    out = index_map.copy()
+    drawn = out >= 0
+    behind = np.zeros_like(drawn)
+    behind[drawn] = depth[out[drawn]] > surface[drawn] + tolerance
+    out[behind] = -1
+    return out
 
 
 # --------------------------------------------------------------------------

@@ -179,3 +179,89 @@ def test_segmented_ply_carries_the_leaf_labels(tmp_path):
     assert set(np.unique(label)) == {0, 1, SKELETON, ROOT}
     assert int((label == 0).sum()) == 80
     assert int((label == SKELETON).sum()) == 90
+
+
+# --------------------------------------------------------------------------
+# The merge must not chain leaves SAM3 itself showed as separate objects.
+# --------------------------------------------------------------------------
+
+from pose_estimator.cli.leaf_instances import build_label_map, cannot_link_pairs
+
+
+def _crown():
+    """Two pass-0 leaves side by side, and a pass-1 id that straddles both.
+
+    The straddler overlaps leaf 0 on 30 of its points and leaf 1 on 20 --
+    above the 30% bar for both. That is a crown: a small id whose 3D votes
+    land on two neighbouring blades.
+    """
+    left = np.full(100, UNSEEN, np.int32)
+    right = np.full(100, UNSEEN, np.int32)
+    left[:40] = 0
+    left[40:80] = 1
+    right[10:40] = 0
+    right[40:60] = 0
+    counts = {("pass0_", 0): 40, ("pass0_", 1): 40, ("pass1_", 0): 50}
+    return {"pass0_": left, "pass1_": right}, counts
+
+
+def test_without_constraints_a_straddling_id_chains_two_leaves():
+    """The old transitive behaviour, kept reachable with --covisible-frames 0."""
+    per_pass, counts = _crown()
+    merged = merge_across_passes(per_pass, counts, 0.30)
+    assert merged[("pass0_", 0)] == merged[("pass0_", 1)]
+
+
+def test_two_leaves_on_screen_together_are_never_merged():
+    """gaensefuss_1: one 'leaf' of 26 ids held 8 pass-0 ids visible at once."""
+    per_pass, counts = _crown()
+    forbid = {frozenset((("pass0_", 0), ("pass0_", 1)))}
+    stats = {}
+    merged = merge_across_passes(per_pass, counts, 0.30, cannot_link=forbid, stats=stats)
+    assert merged[("pass0_", 0)] != merged[("pass0_", 1)], "SAM3 said these are two leaves"
+    assert merged[("pass1_", 0)] == merged[("pass0_", 0)], "the stronger link should win"
+    assert stats["links_refused"] == 1
+
+
+def test_the_constraint_does_not_block_an_unrelated_merge():
+    """Forbidding one pair must leave every other leaf free to merge."""
+    a = np.full(60, UNSEEN, np.int32)
+    b = np.full(60, UNSEEN, np.int32)
+    a[:30] = 1
+    b[:30] = 4
+    counts = {("pass0_", 1): 30, ("pass1_", 4): 30, ("pass0_", 7): 5}
+    forbid = {frozenset((("pass0_", 1), ("pass0_", 7)))}
+    merged = merge_across_passes({"pass0_": a, "pass1_": b}, counts, 0.30, cannot_link=forbid)
+    assert merged[("pass0_", 1)] == merged[("pass1_", 4)]
+
+
+def test_cannot_link_needs_repeated_sightings_and_zero_disables_it():
+    table = {"pass0_": {(0, 1): 5, (0, 2): 1}}
+    assert cannot_link_pairs(table, 2) == {frozenset((("pass0_", 0), ("pass0_", 1)))}
+    assert cannot_link_pairs(table, 1) == {frozenset((("pass0_", 0), ("pass0_", 1))),
+                                           frozenset((("pass0_", 0), ("pass0_", 2)))}
+    assert cannot_link_pairs(table, 0) == set()
+
+
+def test_label_map_counts_separate_masks_but_not_duplicates(tmp_path):
+    """Two disjoint masks on one frame are two objects; a mask repeated under
+    a second id (an NMS miss) is one object and must not forbid a merge."""
+    import cv2
+
+    shape = (20, 20)
+    masks = {"a": (slice(0, 10), slice(0, 10)),
+             "b": (slice(10, 20), slice(10, 20)),        # disjoint from a
+             "dup": (slice(0, 10), slice(0, 9))}         # 90% of a
+    dirs = []
+    for name, region in masks.items():
+        folder = tmp_path / name
+        folder.mkdir()
+        image = np.zeros(shape, np.uint8)
+        image[region] = 255
+        cv2.imwrite(str(folder / "frame_0000.png"), image)
+        dirs.append(folder)
+
+    co_visible = {}
+    out = build_label_map(dirs, None, None, "frame_0000", shape, 3, 4, co_visible=co_visible)
+    assert out is not None
+    assert co_visible == {(0, 1): 1, (1, 2): 1}, "a/dup overlap, so they are not a pair"

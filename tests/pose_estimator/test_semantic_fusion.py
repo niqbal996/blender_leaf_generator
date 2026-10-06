@@ -156,3 +156,74 @@ def test_class_indices_beyond_the_tally_are_ignored_not_miscounted():
     cast_votes(tally, index_map, class_map)
     assert tally["count"][3].sum() == 0
     assert tally["count"][0][0] == 1 and tally["count"][2][2] == 1
+
+
+# --------------------------------------------------------------------------
+# Occlusion: a point hidden behind another surface must not vote.
+# --------------------------------------------------------------------------
+
+from pose_estimator.semantic import render_points, surface_scale, visible_only  # noqa: E402
+
+FOCAL, SIZE = 300.0, 400
+
+
+def _camera():
+    return ViewCamera(K=np.array([[FOCAL, 0, SIZE / 2], [0, FOCAL, SIZE / 2], [0, 0, 1]]),
+                      world_to_camera=_look_at(np.array([6.0, 0, 0]), np.zeros(3)),
+                      width=SIZE, height=SIZE)
+
+
+def _blade(x, half, spacing):
+    g = np.arange(-half, half + 1e-9, spacing)
+    yy, zz = np.meshgrid(g, g)
+    return np.c_[np.full(yy.size, x), yy.ravel(), zz.ravel()]
+
+
+def _centre(img, half_px):
+    c = SIZE // 2
+    return img[c - half_px:c + half_px, c - half_px:c + half_px]
+
+
+def test_the_nearest_point_wins_every_pixel_of_its_disc():
+    """The regression: discs were painted far-to-near per offset, not overall,
+    so a far point's disc could overwrite a near point's. A front blade sampled
+    densely enough to cover its footprint must hide everything behind it."""
+    front = _blade(0.0, 0.6, 0.04)                 # 2 px apart at depth 6: discs overlap
+    back = _blade(-0.5, 1.0, 0.04)
+    points = np.vstack([front, back])
+    _rgb, index = render_points(points, np.zeros((len(points), 3), np.uint8), _camera())
+    inside = _centre(index, int(0.55 * FOCAL / 6.0))
+    assert (inside >= 0).all()
+    assert not (inside >= len(front)).any(), "a hidden point won a pixel of the front blade"
+
+
+def test_visible_only_closes_real_gaps_and_keeps_both_faces():
+    """A front blade sparser than its discs leaves real holes; the back blade
+    shows through them until the occlusion test closes the surface."""
+    front = _blade(0.0, 0.6, 0.14)                 # ~7 px apart: holes at radius 2
+    face = front + [-0.01, 0.07, 0.07]             # the blade's other face
+    back = _blade(-0.5, 1.0, 0.03)
+    points = np.vstack([front, face, back])
+    n_front = len(front) + len(face)
+    camera = _camera()
+    _rgb, index = render_points(points, np.zeros((len(points), 3), np.uint8), camera)
+    inside = _centre(index, int(0.5 * FOCAL / 6.0))
+    assert (inside >= n_front).any(), "this geometry should leak through the gaps"
+
+    kept = visible_only(points, camera, index, 0.10, 0.03)
+    inside = _centre(kept, int(0.5 * FOCAL / 6.0))
+    assert not (inside >= n_front).any(), "the back blade still votes through the front one"
+    seen = np.unique(inside[inside >= 0])
+    assert (seen < len(front)).any() and ((seen >= len(front)) & (seen < n_front)).any(), \
+        "both faces of the front blade are visible surface and must keep their votes"
+    rim = kept[SIZE // 2, :SIZE // 2 - int(0.75 * FOCAL / 6.0)]
+    assert (rim >= n_front).any(), "the uncovered part of the back blade must still vote"
+
+
+def test_surface_scale_measures_spacing_and_thickness():
+    one = _blade(0.0, 0.6, 0.04)
+    two = np.vstack([one, one + [-0.02, 0.02, 0.02]])
+    spacing, thickness = surface_scale(two)
+    assert 0.02 < spacing < 0.05
+    assert 0.005 < thickness < 0.05
+    assert surface_scale(one)[1] < 1e-6, "a single plane has no thickness"
