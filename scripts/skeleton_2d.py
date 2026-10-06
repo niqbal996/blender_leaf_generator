@@ -3,7 +3,7 @@
 
     python scripts/skeleton_2d.py --workdir <ds>/plant_pass0 \
         --masks runs/<specimen>_vis/masks.npz --other-passes <ds>/plant \
-        --out runs/<specimen>_skeleton2d
+        --flat-lay runs/<specimen>_leaves --out runs/<specimen>_skeleton2d
 
 Diagnostic prototype -- reads a finished run, writes into --out only.
 
@@ -53,10 +53,48 @@ SAMPLES_2D = 24          # points along each 2D midrib
 SAMPLES_3D = 40          # points along each 3D curve when it is compared with 2D
 MIN_INLIERS = 3          # views that must agree on a tip (and on a base)
 MAX_FIT_VIEWS = 12
-MM_PER_UNIT = 112.8      # camera-derived for this P3 solve (6.8 px/mm at the plant)
+# mm per reconstruction unit. Structure from motion has no scale of its own and
+# every P3 solve has a different one, so main() sets this per run (set_scale):
+# --mm-per-unit, the AprilTags in the scene (--tag-mm), or fitted against the
+# flat lay. 112.8 was gaensefuss_1's solve; nothing uses it once main() runs.
+MM_PER_UNIT = 112.8
+# Where the flat-lay fit starts: camera-to-crown distance on the boom rig. From
+# sugarbeet_x_1 pass 2: 8 mm tags at ~110 px in 6000 px frames, f ~8200 px.
+# A seed only -- it sets the first fit's merge thresholds, not the answer.
+RIG_CAMERA_MM = 600.0
 # One leaf's tip estimates spread a few mm with the view; SAM3 id swaps
 # measured 13-40 mm. Pieces closer than this are one leaf.
 SAME_LEAF_TIP = 10.0 / MM_PER_UNIT
+SCALE_TOL = 0.02         # flat-lay scale fit has converged when it moves less than this
+
+
+def set_scale(mm_per_unit: float) -> None:
+    """Every millimetre threshold in this file follows MM_PER_UNIT."""
+    global MM_PER_UNIT, SAME_LEAF_TIP
+    MM_PER_UNIT = float(mm_per_unit)
+    SAME_LEAF_TIP = 10.0 / MM_PER_UNIT
+
+
+def rig_scale(run: Run) -> float:
+    """mm per unit if the cameras sit RIG_CAMERA_MM from the crown."""
+    crown = run.to_world(run.skeleton["crown"])
+    dist = []
+    for im in run.image_of.values():
+        pose = im.cam_from_world()
+        R, t = pose.rotation.matrix(), np.asarray(pose.translation)
+        dist.append(np.linalg.norm(-R.T @ t - crown))
+    return RIG_CAMERA_MM / float(np.median(dist))
+
+
+def flat_lay_scale(lengths_units, blades_mm) -> float:
+    """mm per unit that best maps the n longest 3D midribs onto the n longest
+    flat-lay blades, by rank (score_against_flatlay.py's fit)."""
+    n = min(len(lengths_units), len(blades_mm))
+    if n == 0:
+        raise ValueError("no leaves to fit a scale against the flat lay")
+    three = np.sort(np.asarray(lengths_units, float))[::-1][:n]
+    truth = np.sort(np.asarray(blades_mm, float))[::-1][:n]
+    return float((truth * three).sum() / (three * three).sum())
 
 
 # --------------------------------------------------------------------------
@@ -342,7 +380,7 @@ def _fit_leaf(run: Run, obs, rng, stem):
             "fit_px": float(np.median(err)) if len(err) else float("nan")}
 
 
-def reconstruct(run: Run, leaves2d, stems2d, frames, rng, merge_tol: float = 6.0 / MM_PER_UNIT,
+def reconstruct(run: Run, leaves2d, stems2d, frames, rng, merge_tol: float | None = None,
                 has_stem: bool = True):
     """Leaves and the stem, from the 2D evidence of `frames` only.
 
@@ -358,6 +396,8 @@ def reconstruct(run: Run, leaves2d, stems2d, frames, rng, merge_tol: float = 6.0
        leaves whose tips sit within 6 mm in different passes would merge;
     4. every leaf refitted on all of its observations.
     """
+    if merge_tol is None:
+        merge_tol = 6.0 / MM_PER_UNIT
     crown = run.to_world(run.skeleton["crown"])
     st = [(f, s) for f, s in stems2d.items() if f in frames]
     stem = None
@@ -537,14 +577,31 @@ def main():
                     help="override P5's (p5/instancing.json); rosette = no stem, petioles to "
                          "the crown")
     ap.add_argument("--other-passes", type=Path, help="full run, to draw on frames not used")
-    ap.add_argument("--flat-lay", type=Path, help="leaf-pose output dir with leaves.json")
+    ap.add_argument("--flat-lay", type=Path,
+                    help="leaf-pose output dir with leaves.json (run with --marker-mm so blades "
+                         "are in mm); without --mm-per-unit the scale is fitted against it")
+    ap.add_argument("--mm-per-unit", type=float,
+                    help="mm per reconstruction unit of this P3 solve, from an independent "
+                         "measurement. Overrides --tag-mm and the flat-lay fit")
+    ap.add_argument("--tag-mm", type=float,
+                    help="printed side of the AprilTags in the turntable scene, mm: the scale "
+                         "from them (tag_scale.py, over every frame of the solve). Falls back "
+                         "to the flat-lay fit when no tag passes its checks")
     ap.add_argument("--retrace-p5x", action="store_true",
                     help="re-trace P5x's skeleton with the current leaf_skeleton.trace for the "
                          "comparison figure, instead of reading p5x/skeleton.json")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
+    if args.mm_per_unit is None and args.tag_mm is None and args.flat_lay is None:
+        ap.error("no scale: pass --mm-per-unit, --tag-mm, or --flat-lay to fit one. Every P3 "
+                 "solve has its own units, so a constant from another run gives wrong mm "
+                 "and merges")
     args.out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(0)
+    blades = None
+    if args.flat_lay:
+        gt = json.loads((args.flat_lay / "leaves.json").read_text())["leaves"]
+        blades = sorted((l["blade_length"] for l in gt if l["area"] > 5), reverse=True)
 
     from pose_estimator import cloud_source
     from pose_estimator.cli.leaf_instances import _architecture
@@ -569,6 +626,50 @@ def main():
         life[str(t)].add(str(f))
     leaves2d, stems2d = extract_2d(run, masks, set(frames), junk, args.out / "evidence_2d.json")
 
+    # 0. the scale, before anything that thresholds in mm. Fitted against the
+    # flat lay it is circular -- the merges it sets decide which midribs the fit
+    # sees -- so it is iterated to a fixed point from the rig's camera distance.
+    midrib_units = lambda ls: [float(np.linalg.norm(np.diff(l["midrib"], axis=0), axis=1).sum())
+                               for l in ls.values()]
+    full = None
+    tags = None
+    if args.mm_per_unit is None and args.tag_mm is not None:
+        from tag_scale import tag_scale
+        tags = tag_scale(run, args.tag_mm)
+        (args.out / "tag_scale.json").write_text(json.dumps(tags, indent=1))
+        for tag, row in tags["tags"].items():
+            print(f"  tag {tag}: in {row['frames_detected']} frames"
+                  + (f", rejected: {row['rejected']}" if "rejected" in row
+                     else f", square {row['square']:.3f}"))
+        if tags["mm_per_unit"] is None and args.flat_lay is None:
+            raise SystemExit("  no tag gave a scale and there is no --flat-lay to fall back on")
+    if args.mm_per_unit is not None:
+        set_scale(args.mm_per_unit)
+        scale_source = "--mm-per-unit"
+        print(f"  scale {MM_PER_UNIT:.2f} mm/unit (given)")
+    elif tags is not None and tags["mm_per_unit"] is not None:
+        set_scale(tags["mm_per_unit"])
+        scale_source = f"AprilTags, {tags['edges_used']} edges, spread {tags['spread']:.1%}"
+        print(f"  scale {MM_PER_UNIT:.2f} mm/unit ({scale_source})")
+    else:
+        scale_source = "flat lay, rank-matched" + (" (no tag passed)" if tags else "")
+        set_scale(rig_scale(run))
+        print(f"  scale seed {MM_PER_UNIT:.2f} mm/unit (cameras ~{RIG_CAMERA_MM:.0f} mm "
+              f"from the crown)")
+        for it in range(6):
+            full = reconstruct(run, leaves2d, stems2d, set(frames), rng, has_stem=has_stem)
+            fitted_scale = flat_lay_scale(midrib_units(full[0]), blades)
+            moved = abs(fitted_scale / MM_PER_UNIT - 1)
+            print(f"  scale fit {it}: {MM_PER_UNIT:7.2f} -> {fitted_scale:7.2f} mm/unit "
+                  f"({len(full[0])} leaves vs {len(blades)} on the flat lay)")
+            set_scale(fitted_scale)
+            if moved < SCALE_TOL:
+                break
+        else:
+            scale_source += " (did not converge)"
+            full = None
+            print("  WARNING: the scale fit did not settle; lengths in mm are unreliable")
+
     # 1. honesty first: fit on even frames, measure on the odd ones it never saw
     even = {f for i, f in enumerate(frames) if i % 2 == 0}
     odd = set(frames) - even
@@ -591,8 +692,11 @@ def main():
           f"({len(held)} leaf views)")
 
     # 2. the skeleton itself, from every frame of the pass
-    leaves, failed, stem, crown, n_pieces = reconstruct(run, leaves2d, stems2d, set(frames), rng,
-                                                        has_stem=has_stem)
+    # (the converged fit's last reconstruction, when there is one: its merges
+    # were made within SCALE_TOL of the final scale)
+    leaves, failed, stem, crown, n_pieces = full or reconstruct(run, leaves2d, stems2d,
+                                                                set(frames), rng,
+                                                                has_stem=has_stem)
     rules = defaultdict(int)
     for leaf in leaves.values():
         leaf["petiole"], leaf["petiole_rule"] = petiole(leaf, stem, crown)
@@ -608,10 +712,16 @@ def main():
     lengths = sorted((float(np.linalg.norm(np.diff(l["midrib"], axis=0), axis=1).sum())
                       * MM_PER_UNIT for l in leaves.values()), reverse=True)
     scores = {"held_out_px": float(np.median(held)), "fitted_px": float(np.median(fitted)),
-              "leaves": len(leaves), "failed": failed, "midrib_mm": lengths}
-    if args.flat_lay:
-        gt = json.loads((args.flat_lay / "leaves.json").read_text())["leaves"]
-        blades = sorted((l["blade_length"] for l in gt if l["area"] > 5), reverse=True)
+              "leaves": len(leaves), "failed": failed, "midrib_mm": lengths,
+              "mm_per_unit": MM_PER_UNIT, "scale_source": scale_source}
+    if blades is not None and lengths and not scale_source.startswith("flat lay"):
+        # what the flat lay would have said: agreement with an independent scale
+        # is evidence that both the tags and the rank matching are right
+        check = flat_lay_scale([v / MM_PER_UNIT for v in lengths], blades)
+        scores["flat_lay_fitted_mm_per_unit"] = check
+        print(f"\n  scale cross-check: flat-lay fit says {check:.2f} mm/unit, "
+              f"used {MM_PER_UNIT:.2f} ({check / MM_PER_UNIT - 1:+.1%})")
+    if blades is not None:
         n = min(len(blades), len(lengths))
         print("\n  midrib lengths (mm) ranked against the flat lay's blades:")
         for i in range(0, n, 10):
