@@ -49,6 +49,9 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components, dijkstra
 from scipy.spatial import cKDTree
 
+from pose_estimator import stem_tree
+from pose_estimator.plant_profiles import normalise_architecture
+
 
 # Above this elevation of the crown-to-tip line, a leaf is treated as one of
 # the upright "heart" leaves at the centre of a rosette. Measured on
@@ -88,7 +91,6 @@ class Instancing:
     distance_from_tip: np.ndarray      # (N,) geodesic distance to the winning tip
     dropped: List[int] = field(default_factory=list)   # groups cut by min_points
     base: object = None                # BaseRegion, whenever the geometry was consulted
-    heart: Optional[np.ndarray] = None  # top of the stem, where an upright plant's leaves start
     architecture: str = "caulescent"   # what the depth field was actually started from
 
     def to_dict(self) -> dict:
@@ -121,8 +123,11 @@ class LabelledStructure:
     midrib_support: List[dict] = field(default_factory=list)
     root_points: Optional[np.ndarray] = None
     instancing: Optional[Instancing] = None
-    crown: Optional[np.ndarray] = None   # foot of the stem, just above the root
-    heart: Optional[np.ndarray] = None   # top of the stem, where the leaves start
+    crown: Optional[np.ndarray] = None   # a rosette's crown
+    heart: Optional[np.ndarray] = None   # always None now; kept so old readers still load
+    # The stem tree (`stem_tree.build`) as P5x writes it: main stem, branches,
+    # leaf stalks. Empty for a rosette or a plant with no stem tissue.
+    stem_axes: List[dict] = field(default_factory=list)
 
     @property
     def num_leaves(self) -> int:
@@ -592,16 +597,23 @@ def instance_by_tips(
     min_tip_depth: float = 0.0,
     min_persistence_ratio: Optional[float] = None,
     architecture: str = "caulescent",
-    heart: Optional[np.ndarray] = None,
 ) -> Instancing:
     """Split leaf tissue into leaves, keeping every intermediate.
 
     `architecture` decides where the depth field starts, and is told rather
-    than inferred. "caulescent" seeds from stem tissue, as always. "rosette"
-    ignores stem labels and locates the crown geometrically -- a thistle or a
-    sugar beet has no stem to seed from, and the old behaviour there was 0
-    contact points, 0 tips, 0 leaves.
+    than inferred. "caulescent" (or its plainer name "upright") seeds from
+    every leaf point touching stem tissue. "rosette" ignores stem labels and
+    locates the crown geometrically -- a thistle or a sugar beet has no stem
+    to seed from, and the old behaviour there was 0 contact points, 0 tips,
+    0 leaves.
+
+    "upright" once seeded from the top of the stem only. On a branching plant
+    (vogelmeere) each leaf pair hangs off its own side branch, so the leaf
+    tissue is several islands and only the one at the stem top was reached:
+    9.5% of the leaf points, 2 leaves. Seeding from all stem contact reaches
+    every island.
     """
+    architecture = normalise_architecture(architecture)
     n = len(leaf_points)
     if n == 0:
         empty = np.zeros(0)
@@ -612,38 +624,17 @@ def instance_by_tips(
 
     graph = leaf_graph(leaf_points, k_neighbors)
 
-    # Which architecture this is comes from --architecture, not from a guess.
-    # It is known when the capture is made, and an earlier version that
-    # inferred it flipped thistle1's verdict purely because P4c had started
-    # labelling the crown "stem".
-    # Which architecture this is comes from --architecture, not from a guess.
-    # It is known when the capture is made, and an earlier version that
-    # inferred it flipped thistle1's verdict purely because P4c had started
-    # labelling the crown "stem".
+    # Which architecture this is comes from --architecture or the plant
+    # profile, not from a guess at the geometry. It is known when the capture
+    # is made, and an earlier version that inferred it flipped thistle1's
+    # verdict purely because P4c had started labelling the crown "stem".
     #
-    # Seeding the upright path from the crown as well was tried and is wrong:
-    # for an upright plant "depth" has to mean distance *out from the stem*,
-    # not distance from the base, or a leaf low on the stem measures as
-    # shallow and is rejected as a bump. On the two-leaf test plant that
-    # dropped the lower blade and returned one tip for two leaves.
+    # Seeding from the crown as well was tried and is wrong: for a stemmed
+    # plant "depth" has to mean distance *out from the stem*, not distance
+    # from the base, or a leaf low on the stem measures as shallow and is
+    # rejected as a bump. On the two-leaf test plant that dropped the lower
+    # blade and returned one tip for two leaves.
     base = None
-    if architecture == "upright" and heart is not None:
-        # An upright plant: crown at the foot of the stem, heart at its top,
-        # leaves radiating from the heart. Depth is measured from the heart,
-        # which is the same statement a rosette makes about its crown -- and
-        # the reason the old seeding failed here was that it started from
-        # every leaf point touching the stem instead, 2,930 of them on weed_3,
-        # which leaves the tree too shallow for ownership to mean anything.
-        reach = np.linalg.norm(leaf_points - np.asarray(heart, float), axis=1)
-        contact = np.nonzero(reach <= contact_radius)[0]
-        if not len(contact):
-            # No blade within touching distance: take the nearest one, so the
-            # depth field still starts at the top of the stem, not nowhere.
-            contact = np.array([int(np.argmin(reach))], np.int64)
-        depth = dijkstra(graph, directed=False, indices=contact, min_only=True)
-    else:
-        heart = None
-
     if architecture == "rosette":
         base = _crown_base(leaf_points, stem_points, graph, k_neighbors)
         if base is None or not len(base.nodes):
@@ -654,11 +645,9 @@ def instance_by_tips(
                 "are wrong rather than the plant is.")
         contact = base.nodes
         depth = dijkstra(graph, directed=False, indices=contact, min_only=True)
-    elif heart is None:
-        # "caulescent": leaves distributed along the stem, so depth is measured
-        # out from the stem itself. Distinct from "upright", where they all
-        # start at the top of it -- seeding an along-the-stem plant from the
-        # heart makes its lower leaves look shallow and merges them away.
+    else:
+        # "caulescent": leaves distributed along the stem and its branches, so
+        # depth is measured out from the stem itself.
         depth, contact = depth_from_stem(leaf_points, stem_points, graph, contact_radius)
         if not len(contact):
             # Nothing seeds the depth field, so every step after this one is
@@ -689,7 +678,7 @@ def instance_by_tips(
     # tissue hanging straight off a seed node has no tip beyond it and no
     # owning parent to inherit from, and how much of the plant that is depends
     # entirely on how large the seed region is: a rosette seeds from a crown of
-    # a dozen nodes and hardly any tissue lands here, an upright plant seeds
+    # a dozen nodes and hardly any tissue lands here, a stemmed plant seeds
     # from every leaf point touching the stem -- 2,930 of them on weed_3 --
     # which makes the tree shallow and leaves 93% of the plant unowned, four
     # instances holding 2,008 points of 27,595 and every midrib of length zero.
@@ -697,14 +686,10 @@ def instance_by_tips(
     # Crown and trunk tissue is *not* filled in: it has two or more leaves
     # beyond it and genuinely belongs to none of them, which is the
     # distinction the subtree walk exists to make.
-    # Only on the upright path. A rosette seeds from a crown of a dozen nodes,
+    # Only on the stemmed path. A rosette seeds from a crown of a dozen nodes,
     # so its tree is deep, almost nothing lands here, and what does is crown
     # tissue that should stay unowned -- filling it in moved 1,100 points into
     # thistle3's leaves that the subtree walk had correctly left out.
-    # Only where the seed region is large enough to flatten the tree, which is
-    # the along-the-stem case. A rosette seeds from a crown and an upright
-    # plant from its heart; both are small, and their trees are deep enough
-    # that what lands here is trunk tissue that should stay unowned.
     unresolved = (owner < 0) & ~trunk if architecture == "caulescent" else np.zeros(n, bool)
     if unresolved.any() and len(tips):
         reach = np.full((len(tips), n), np.inf)
@@ -748,7 +733,6 @@ def instance_by_tips(
         owner=np.where(owner >= 0, remap[owner], -1),
         distance_from_tip=distance_from_tip,
         dropped=dropped,
-        heart=None if heart is None else np.asarray(heart, float),
     )
 
 
@@ -1130,6 +1114,24 @@ def drop_stations_in_empty_space(
 # --------------------------------------------------------------------------
 
 
+def trunk_of(stem_axes: Sequence[dict], per_segment: int = 8) -> np.ndarray:
+    """The stem and its branches as one dense set of nodes, leaf stalks left out.
+
+    What "distance from the stem" means on a branching plant: a leaf's reach
+    is measured from whichever stem or branch is nearest. Stalks are left out
+    because they belong to their leaf -- measured from its own stalk, a leaf's
+    tip would be judged from inside the leaf.
+    """
+    lines = [np.asarray(a["points"], float) for a in stem_axes
+             if a.get("kind") != "petiole" and len(a["points"]) >= 1]
+    if not lines:
+        return np.zeros((0, 3))
+    t = np.linspace(0.0, 1.0, per_segment, endpoint=False)
+    dense = [np.vstack([p + (q - p) * t[:, None] for p, q in zip(l[:-1], l[1:])] + [l[-1:]])
+             if len(l) >= 2 else l for l in lines]
+    return np.vstack(dense)
+
+
 def distance_to_polyline(points: np.ndarray, polyline: np.ndarray) -> np.ndarray:
     """Distance from each point to the nearest *node* of a polyline.
 
@@ -1173,45 +1175,6 @@ def _base_in_main_body(points, graph, find_base):
     base.nodes = index[base.nodes]
     base.extremities = index[base.extremities]
     return base
-
-
-def stem_line_from_root(root_points, stem_points, voxel: float):
-    """The stem line of an upright plant: crown at its foot, heart at its top.
-
-    Stated plainly, and this is the whole rule:
-
-    * Walk up out of the root cloud until you reach the stem cloud. The first
-      stem tissue you meet is the **crown** -- the start of the stem line.
-      That walk is the same one a rosette makes (`crown_from_root`); the only
-      difference is that here it lands on stem rather than on a blade.
-    * The highest stem point along z is the **heart** -- the end of the stem
-      line, and where an upright plant's leaves start.
-
-    Both ends are *measured off the labelled cloud*, so neither can double
-    back the way a traced trunk did on weed_3 (z -0.055 -> 0.160 -> 0.088).
-
-    Outliers are dropped by keeping the largest connected blob of stem, for
-    the same reason `crown_from_root` does it to the root: stray specks
-    wearing the stem label sit up among the leaves, and a bare `max(z)` would
-    follow them there.
-
-    Returns (crown, heart), or None when there is no stem cloud to walk.
-    """
-    if stem_points is None or len(stem_points) == 0:
-        return None
-    body = _largest_cluster(stem_points, voxel * 4.0)
-    if body is None or len(body) == 0:
-        return None
-
-    heart = body[int(np.argmax(body[:, 2]))]
-
-    # The crown, by the walk up out of the root. Without a root there is
-    # nothing to walk out of, so the bottom of the stem stands in for it --
-    # the same point, just without the evidence that it sits above a root.
-    crown = crown_from_root(root_points, body, voxel)
-    if crown is None:
-        crown = body[int(np.argmin(body[:, 2]))]
-    return np.asarray(crown, float), np.asarray(heart, float)
 
 
 def _crown_base(leaf_points, stem_points, graph, k_neighbors):
@@ -1557,7 +1520,9 @@ def build_from_labels(
     A rosette reaches this function with no stem tissue and no root tissue --
     its roots are below the clamp and outside the P2 plant mask -- so the
     anchor for the shoot tree comes from the derived crown instead.
+    "upright" is accepted as a plainer name for "caulescent".
     """
+    architecture = normalise_architecture(architecture)
     leaf_ids_in_order = [i for i, n in enumerate(class_order) if "leaf" in n]
     stem_ids = [i for i, n in enumerate(class_order) if n in ("stem", "petiole", "branch")]
     root_ids = [i for i, n in enumerate(class_order) if n == "root"]
@@ -1596,15 +1561,6 @@ def build_from_labels(
     stem_points = points[np.isin(labels, stem_ids)]
     root_points = points[np.isin(labels, root_ids)] if root_ids else None
 
-    # An upright plant's stem line is measured off the labelled cloud before
-    # anything else, because the heart is where its leaf depth is measured
-    # from. See `stem_line_from_root`.
-    crown = heart = None
-    if architecture == "upright":
-        line = stem_line_from_root(root_points, stem_points, voxel)
-        if line is not None:
-            crown, heart = line
-
     instancing = instance_by_tips(
         leaf_points, stem_points,
         contact_radius=voxel * contact_voxels,
@@ -1613,7 +1569,6 @@ def build_from_labels(
         min_tip_depth=voxel * min_tip_depth_voxels,
         min_persistence_ratio=min_persistence_ratio,
         architecture=architecture,
-        heart=heart,
     )
 
     # --- the shoot as one tree, so a midrib can run past the blade to the stem ---
@@ -1646,14 +1601,7 @@ def build_from_labels(
     # -- on runs/thistle1 a 3-node zigzag spanning 4% of the plant, which is
     # noise, and drawn as a tube in Blender it reads as an elbow of pipe that
     # no thistle has.
-    # An upright plant's stem is exactly the crown-to-heart segment measured
-    # above. `fixed_stem` keeps the tip refinement below from replacing it
-    # with a re-traced trunk -- that trace is what produced weed_3's zigzag,
-    # and re-running it after the tips move produces the same zigzag again.
-    fixed_stem = crown is not None and heart is not None
-    if fixed_stem:
-        stem_path = np.vstack([crown.reshape(1, 3), heart.reshape(1, 3)])
-
+    crown = None
     rosette = architecture == "rosette"
     if rosette and instancing.base is not None:
         # Prefer the root->shoot walk: it names the anatomical base directly.
@@ -1670,6 +1618,26 @@ def build_from_labels(
             crown = instancing.base.center
         stem_path = np.asarray(crown, float).reshape(1, 3)
 
+    # The stem as a tree, built from the stem points exactly as P5x builds it
+    # (`stem_tree`), so the two scenes draw the same stem (vogelmeere,
+    # 2026-10-07). Its stem and branches -- not the leaf stalks -- are what a
+    # tip is measured out from below: a leaf on a side branch reaches out from
+    # that branch, not from the main stem.
+    stem_axes: List[dict] = []
+    stem_lines: List[np.ndarray] = []
+    trunk_nodes = stem_path
+    if not rosette and len(stem_points) >= 10:
+        foot = stem_points[stem_points[:, 2] <= np.quantile(stem_points[:, 2], 0.02)].mean(axis=0)
+        tree = stem_tree.build(stem_points, foot, voxel * 3.0)
+        if tree is not None and tree.axes:
+            owned = instancing.owner >= 0
+            stem_tree.classify_petioles(tree, leaf_points[owned], instancing.owner[owned],
+                                        voxel * 3.0)
+            stem_lines = tree.polylines()
+            stem_axes = [axis.to_dict(line, i)
+                         for i, (axis, line) in enumerate(zip(tree.axes, stem_lines))]
+            trunk_nodes = trunk_of(stem_axes) if len(trunk_of(stem_axes)) else stem_path
+
     # Persistence says how many leaves there are, and does that well. Where the
     # tip *is* is a different question, and geodesic depth answers it badly: on
     # a sheet the point furthest from the contact region measured through the
@@ -1681,7 +1649,7 @@ def build_from_labels(
     # A leaf's tip is simply the part of it that gets furthest from the stem,
     # so once the trunk is known each instance re-picks its own tip that way.
     if len(stem_path) >= 1 and (instancing.owner >= 0).any():
-        refined = _tips_furthest_from_stem(leaf_points, instancing.owner, stem_path,
+        refined = _tips_furthest_from_stem(leaf_points, instancing.owner, trunk_nodes,
                                            min_reach=voxel * 2.0)
         if refined:
             instancing.accepted_tips = np.array(
@@ -1694,14 +1662,12 @@ def build_from_labels(
             new_path, attach_nodes, paths = trunk_and_attachments(
                 shoot, predecessor, base_distance, shoot_tips, merge_radius=voxel * 4.0,
                 smooth_tolerance=voxel * 1.5)
-            if not rosette and not fixed_stem:
+            if not rosette:
                 stem_path = new_path
 
     # Carry the stem down to where the root begins, so the two organs meet
-    # instead of stopping a gap apart. Not on the upright path: there the
-    # stem line is defined as starting at the crown, and the crown was
-    # already found by walking up out of the root.
-    if anchor is not None and len(stem_path) > 1 and not fixed_stem:
+    # instead of stopping a gap apart.
+    if anchor is not None and len(stem_path) > 1:
         if np.linalg.norm(stem_path[0] - anchor) > voxel:
             stem_path = np.vstack([anchor, stem_path])
 
@@ -1830,9 +1796,15 @@ def build_from_labels(
         tips.append(tip)
         attachments.append(shoot[attach_nodes[instance]])
 
+    # What is written and drawn as "the stem" is the tree's main axis: the
+    # traced trunk is a shortest path through leaf and stem tissue together,
+    # and cut across the stem cloud rather than following it.
+    if stem_lines and len(stem_lines[0]) >= 2:
+        stem_path = stem_lines[0]
+
     return LabelledStructure(
         stem_path=stem_path, leaf_ids=instancing.owner, leaf_points=leaf_points,
         attachments=attachments, tips=tips, axes=axes, midrib_support=midrib_support,
         root_points=root_points, instancing=instancing,
-        crown=crown, heart=heart,
+        crown=crown, stem_axes=stem_axes,
     )

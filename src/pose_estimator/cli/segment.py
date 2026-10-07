@@ -78,6 +78,7 @@ def run(
     sam3_model: str = "facebook/sam3",
     sam3_plant_prompts: Optional[list] = None,
     sam3_holder_prompts: Optional[list] = None,
+    sam3_stem_prompts: Optional[list] = None,
     sam3_root_prompts: Optional[list] = None,
     sam3_crop_prompt: Optional[str] = None,
     sam3_crop_stride: int = 1,
@@ -178,6 +179,7 @@ def run(
             use_roi=use_roi, roi_padding=roi_padding, device=device,
             model_name=sam3_model, plant_prompts=sam3_plant_prompts,
             holder_prompts=sam3_holder_prompts, root_prompts=sam3_root_prompts,
+            stem_prompts=sam3_stem_prompts,
             crop_prompt=sam3_crop_prompt, crop_stride=sam3_crop_stride,
             save_instances=not sam3_no_instances,
         )
@@ -312,7 +314,7 @@ def run(
 
 def _run_sam3(workdir, frames_dir, p2_dir, sources, use_roi, roi_padding, device,
               model_name, plant_prompts, holder_prompts, root_prompts,
-              crop_prompt, crop_stride, save_instances) -> dict:
+              crop_prompt, crop_stride, save_instances, stem_prompts=None) -> dict:
     """P2 via SAM3 text prompts. Same artifacts, same QC, no clicking.
 
     Split out of `run` rather than threaded through it because the two
@@ -329,6 +331,8 @@ def _run_sam3(workdir, frames_dir, p2_dir, sources, use_roi, roi_padding, device
         # An explicit empty list is a real choice -- "this capture has no
         # exposed root" -- so only `None` falls back to the default.
         root=list(root_prompts) if root_prompts is not None else Sam3Prompts().root,
+        # Likewise: an empty list turns the separate stem session off.
+        stem=list(stem_prompts) if stem_prompts is not None else Sam3Prompts().stem,
         crop=crop_prompt or DEFAULT_CROP_PROMPT,
     )
 
@@ -669,6 +673,12 @@ def main(argv: Optional[list] = None) -> None:
              "frames, not the plant crop, which clips the handles -- 'pliers' matched 3/15 "
              "frames on the crop and 15/15 on full frames of the same capture.")
     parser.add_argument(
+        "--sam3-stem-prompts", nargs="*", metavar="PHRASE",
+        help="noun phrases for the stem, run as a SAM3 session of their own (default: "
+             "stem) and unioned into masks/stem; the same mask trims each leaf instance "
+             "to its blade. In the plant session 'stem' cannot claim a stalk a leaf track "
+             "has slid onto. Pass with no values to turn it off.")
+    parser.add_argument(
         "--sam3-root-prompts", nargs="*", metavar="PHRASE",
         help="noun phrases for the exposed root (default: root). Pass with no values to "
              "skip the root entirely on a capture that has none.")
@@ -721,6 +731,7 @@ def main(argv: Optional[list] = None) -> None:
         sam3_model=args.sam3_model,
         sam3_plant_prompts=args.sam3_plant_prompts,
         sam3_holder_prompts=args.sam3_holder_prompts,
+        sam3_stem_prompts=args.sam3_stem_prompts,
         sam3_root_prompts=args.sam3_root_prompts,
         sam3_crop_prompt=args.sam3_crop_prompt,
         sam3_crop_stride=args.sam3_crop_stride,

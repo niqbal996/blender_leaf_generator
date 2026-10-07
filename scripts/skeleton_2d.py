@@ -46,6 +46,7 @@ from scipy.spatial import cKDTree
 from skimage.graph import MCP_Geometric, route_through_array
 
 from compare_runs import junk_masks, track_colour
+from pose_estimator import plant_profiles
 from leaf_tips_2d import BORDER_PX, TOUCH_PX, TOUCH_WEIGHT, Rays, frame_boxes, ransac_point
 from p5x_views import Run, crop_box, unpack
 
@@ -160,11 +161,39 @@ def petiole_node(plant, stem, stem_line, base_rc, offset, window=260):
     return [float(c + xs + offset[0]), float(r + ys + offset[1])]
 
 
-def extract_2d(run: Run, masks, frames, junk, cache: Path):
-    """Per mask: tip, base, midrib (full-frame x,y). Per frame: stem path and apex."""
+def stem_contact(stem: np.ndarray, rc, radius: float) -> int:
+    """Stem-mask pixels within `radius` of one end of a leaf mask (full-frame row, col)."""
+    r0, c0, rad = int(rc[0]), int(rc[1]), int(np.ceil(radius))
+    h, w = stem.shape
+    ys, ye, xs, xe = max(0, r0 - rad), min(h, r0 + rad + 1), max(0, c0 - rad), min(w, c0 + rad + 1)
+    window = stem[ys:ye, xs:xe]
+    yy, xx = np.mgrid[ys:ye, xs:xe]
+    return int((window & ((yy - r0) ** 2 + (xx - c0) ** 2 <= radius ** 2)).sum())
+
+
+def extract_2d(run: Run, masks, frames, junk, cache: Path, base_rule: str = "foot"):
+    """Per mask: tip, base, midrib (full-frame x,y). Per frame: stem path and apex.
+
+    `base_rule` (the plant profile's) decides which end of a mask is the base:
+      "foot"          the end nearer the plant's foot, walking through the plant
+                      mask (gaensefuss)
+      "stem_contact"  the end with stem-mask pixels around it -- where the
+                      petiole goes in. On a bushy plant overlapping blades are
+                      shortcuts through the plant mask and the foot rule flips:
+                      on vogelmeere 6 of 10 duplicate leaves were one blade with
+                      tip and base swapped. Falls back to "foot" where neither
+                      end clearly touches stem.
+    The cache records the rule it was built with and is rebuilt for another.
+    """
+    p2_written = run.workdir / "p2" / "prompts.json"
     if cache.exists():
         data = json.loads(cache.read_text())
-        return data["leaves"], data["stems"]
+        stale = p2_written.exists() and p2_written.stat().st_mtime > cache.stat().st_mtime
+        if data.get("base_rule", "foot") == base_rule and not stale:
+            return data["leaves"], data["stems"]
+        print(f"  {cache.name} " + (f"predates this P2 ({p2_written})" if stale else
+              f"was built with base rule {data.get('base_rule', 'foot')}, not {base_rule}")
+              + " -- rebuilding it")
     boxes = frame_boxes(run.workdir)
     crown = run.to_world(run.skeleton["crown"])
     by_frame = defaultdict(list)
@@ -220,6 +249,15 @@ def extract_2d(run: Run, masks, frames, junk, cache: Path):
             fa = foot_dist[y0 + a[0] - py0, x0 + a[1] - px0]
             fb = foot_dist[y0 + b[0] - py0, x0 + b[1] - px0]
             tip_rc, base_rc = (a, b) if fa > fb else (b, a)
+            base_by = "foot"
+            if base_rule == "stem_contact":
+                # Around each end, a sixth of the leaf's own length.
+                reach = max(8.0, along.max() / 6.0)
+                ca = stem_contact(stem, (y0 + a[0], x0 + a[1]), reach)
+                cb = stem_contact(stem, (y0 + b[0], x0 + b[1]), reach)
+                if max(ca, cb) >= 5 and max(ca, cb) >= 1.5 * min(ca, cb):
+                    base_rc, tip_rc = (a, b) if ca > cb else (b, a)
+                    base_by = "stem"
             mid = medial_path(crop, base_rc, tip_rc)[:, ::-1] + [x0, y0]    # base -> tip, x,y
             node = petiole_node(sub, stem_sub, stem_line,
                                 (y0 + base_rc[0] - py0, x0 + base_rc[1] - px0), [px0, py0])
@@ -231,7 +269,7 @@ def extract_2d(run: Run, masks, frames, junk, cache: Path):
                 "k": int(k), "track": str(masks["track"][k]), "frame": frame, "tip": tip,
                 "base": (float(x0 + base_rc[1]), float(y0 + base_rc[0])),
                 "midrib": resample(mid, SAMPLES_2D).tolist(), "length_px": float(along.max()),
-                "node": node,
+                "node": node, "base_by": base_by,
                 "touches": bool(((around >= 0) & (around != k)).any()),
                 "clipped": bool(tip[0] - bx0 < BORDER_PX or bx1 - 1 - tip[0] < BORDER_PX
                                 or tip[1] - by0 < BORDER_PX or by1 - 1 - tip[1] < BORDER_PX)})
@@ -242,9 +280,13 @@ def extract_2d(run: Run, masks, frames, junk, cache: Path):
         ratio = row["length_px"] / max(longest[row["track"]], 1e-6)
         row["weight"] = 0.0 if row["clipped"] else ratio ** 2 * (TOUCH_WEIGHT if row["touches"]
                                                                  else 1.0)
-    cache.write_text(json.dumps({"leaves": leaves, "stems": stems}))
+    cache.write_text(json.dumps({"leaves": leaves, "stems": stems, "base_rule": base_rule}))
     print(f"  2D: {len(leaves)} leaf masks and {len(stems)} stem paths over {len(by_frame)} "
           f"frames ({time.time() - t0:.0f}s)")
+    if base_rule == "stem_contact":
+        by_stem = sum(1 for r in leaves if r["base_by"] == "stem")
+        print(f"    base found by stem contact on {by_stem} of {len(leaves)} masks, by the "
+              "foot rule on the rest")
     return leaves, stems
 
 
@@ -506,6 +548,37 @@ def petiole(leaf: dict, stem, crown=None):
     return np.vstack([dense[np.argmin(np.linalg.norm(dense - base, axis=1))], base]), "nearest"
 
 
+def petiole_on_tree(leaf: dict, trunk, stalks, max_ratio: float = 1.5):
+    """(petiole polyline, which rule placed it), from the 3D stem tree.
+
+    For a plant whose leaves sit on side branches (plant profile
+    petiole_rule "stem_tree", vogelmeere). The single-stem rule above sent
+    them across open air to the one stem it knew: 45 of 56 petioles longer
+    than their own blade, 18 attached at the clamp.
+
+    `trunk` are the stem and branch curves, `stalks` the tree's stalks that
+    end in one blade. A stalk ending at this blade's base is its petiole;
+    otherwise the petiole joins the base to the nearest stem or branch point.
+    None is drawn when nothing is within `max_ratio` blade lengths -- a
+    missing petiole is honest, a 40 mm line to the wrong branch is not.
+    """
+    tip, base = np.asarray(leaf["tip"]), np.asarray(leaf["base"])
+    blade = float(np.linalg.norm(np.diff(leaf["midrib"], axis=0), axis=1).sum()) \
+        or float(np.linalg.norm(tip - base))
+    if stalks:
+        gaps = [float(np.linalg.norm(st[-1] - base)) for st in stalks]
+        k = int(np.argmin(gaps))
+        if gaps[k] <= max(0.25 * blade, 3.0 / MM_PER_UNIT):
+            return np.vstack([stalks[k], base]), "stem-tree stalk"
+    if trunk:
+        dense = np.vstack([resample(t, max(int(len(t)) * 8, 2)) for t in trunk])
+        d = np.linalg.norm(dense - base, axis=1)
+        j = int(np.argmin(d))
+        if d[j] <= max_ratio * blade:
+            return np.vstack([dense[j], base]), "nearest stem or branch"
+    return np.zeros((0, 3)), "none within reach"
+
+
 # --------------------------------------------------------------------------
 # drawing
 # --------------------------------------------------------------------------
@@ -518,8 +591,9 @@ def _uv(cam, pose, X):
 
 def draw(img, cam, pose, stem, leaves, colours, thin=False):
     w = 1 if thin else 2
-    if stem is not None:
-        line = _uv(cam, pose, resample(stem, 80)).astype(np.int32)
+    # The stem, or the stem and its branches when it is a tree.
+    for curve in (stem if isinstance(stem, list) else [stem] if stem is not None else []):
+        line = _uv(cam, pose, resample(curve, 80)).astype(np.int32)
         cv2.polylines(img, [line], False, (0, 0, 0), 4 + w, cv2.LINE_AA)
         cv2.polylines(img, [line], False, (255, 255, 255), 2 + w, cv2.LINE_AA)
     for key, leaf in leaves.items():
@@ -590,6 +664,9 @@ def main():
     ap.add_argument("--retrace-p5x", action="store_true",
                     help="re-trace P5x's skeleton with the current leaf_skeleton.trace for the "
                          "comparison figure, instead of reading p5x/skeleton.json")
+    ap.add_argument("--profile", choices=sorted(plant_profiles.PROFILES),
+                    help="use this plant's rules (pose_estimator/plant_profiles.py) instead of "
+                         "the one the workdir's folder name picks")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
     if args.mm_per_unit is None and args.tag_mm is None and args.flat_lay is None:
@@ -608,6 +685,10 @@ def main():
     from p5x_views import cache_masks
 
     run = Run(args.workdir)
+    profile, folder = plant_profiles.profile_for(args.workdir)
+    if args.profile:
+        profile, folder = plant_profiles.PROFILES[args.profile], f"--profile {args.profile}"
+    print(f"  {plant_profiles.describe(profile, folder)}")
     if args.masks:
         z = np.load(args.masks, allow_pickle=True)
         masks = {k: z[k] for k in z.files}
@@ -624,7 +705,8 @@ def main():
     life = defaultdict(set)
     for t, f in zip(masks["track"], masks["frame"]):
         life[str(t)].add(str(f))
-    leaves2d, stems2d = extract_2d(run, masks, set(frames), junk, args.out / "evidence_2d.json")
+    leaves2d, stems2d = extract_2d(run, masks, set(frames), junk, args.out / "evidence_2d.json",
+                                   base_rule=profile.base_rule)
 
     # 0. the scale, before anything that thresholds in mm. Fitted against the
     # flat lay it is circular -- the merges it sets decide which midribs the fit
@@ -697,15 +779,42 @@ def main():
     leaves, failed, stem, crown, n_pieces = full or reconstruct(run, leaves2d, stems2d,
                                                                 set(frames), rng,
                                                                 has_stem=has_stem)
+    # The stem tree P5x traced from the stem cloud: what petioles join on a
+    # plant whose leaves sit on side branches. A skeleton.json written before
+    # the tree existed has no axes, so it is re-traced here.
+    p5x = run.skeleton
+    if args.retrace_p5x or (profile.petiole_rule == "stem_tree" and not p5x.get("axes")):
+        from pose_estimator.leaf_skeleton import trace
+        upright = (run.points - run.origin) @ run.rotation.T
+        voxel, _ = cloud_source.voxel_size(args.workdir, cloud_source.BASELINE, upright)
+        from pose_estimator.cli.leaf_instances import _architecture
+        p5x = trace(upright, run.assignment, voxel,
+                    architecture=_architecture(args.workdir, cloud_source.BASELINE))
+        print(f"  P5x skeleton re-traced with the current tracer: {len(p5x['leaves'])} midribs, "
+              f"{len(p5x.get('axes') or [])} stem-tree axes")
+    trunk, stalks = [], []
+    for axis in p5x.get("axes") or []:
+        (stalks if axis["kind"] == "petiole" else trunk).append(run.to_world(axis["points"]))
+    use_tree = profile.petiole_rule == "stem_tree" and bool(trunk)
+    if profile.petiole_rule == "stem_tree" and not trunk:
+        print("  WARNING: the profile asks for petioles on the stem tree, but P5x has no stem "
+              "tree (no stem tissue?) -- falling back to the leaf-axis rule")
+
     rules = defaultdict(int)
     for leaf in leaves.values():
-        leaf["petiole"], leaf["petiole_rule"] = petiole(leaf, stem, crown)
+        leaf["petiole"], leaf["petiole_rule"] = (petiole_on_tree(leaf, trunk, stalks) if use_tree
+                                                 else petiole(leaf, stem, crown))
         rules[leaf["petiole_rule"]] += 1
+    blade_of = lambda l: float(np.linalg.norm(np.diff(l["midrib"], axis=0), axis=1).sum())
+    pet_of = lambda l: (float(np.linalg.norm(np.diff(l["petiole"], axis=0), axis=1).sum())
+                        if len(l["petiole"]) >= 2 else 0.0)
+    too_long = sum(1 for l in leaves.values() if pet_of(l) > blade_of(l))
     n_ids = len({r["track"] for r in leaves2d})
     print(f"\n  {n_ids} SAM3 leaf ids -> {n_pieces} consistent pieces (ids split where SAM3 "
           f"swapped leaves) -> {len(leaves)} leaves in 3D after merging pieces of one leaf; "
           f"{len(failed)} ids not reconstructed")
     print("  petioles placed by: " + ", ".join(f"{k} {v}" for k, v in sorted(rules.items())))
+    print(f"  petioles longer than their own blade: {too_long} of {len(leaves)}")
     for track, why in sorted(failed.items()):
         print(f"    {track}: {why}")
 
@@ -713,7 +822,9 @@ def main():
                       * MM_PER_UNIT for l in leaves.values()), reverse=True)
     scores = {"held_out_px": float(np.median(held)), "fitted_px": float(np.median(fitted)),
               "leaves": len(leaves), "failed": failed, "midrib_mm": lengths,
-              "mm_per_unit": MM_PER_UNIT, "scale_source": scale_source}
+              "mm_per_unit": MM_PER_UNIT, "scale_source": scale_source,
+              "profile": profile.name, "petiole_rules": dict(rules),
+              "petioles_longer_than_blade": too_long}
     if blades is not None and lengths and not scale_source.startswith("flat lay"):
         # what the flat lay would have said: agreement with an independent scale
         # is evidence that both the tags and the rank matching are right
@@ -736,12 +847,17 @@ def main():
     by_id = {t: track_colour(i) for i, t in enumerate(sorted({str(t) for t in masks["track"]}))}
     colours = {name: by_id[leaves[name]["tracks"][0]] for name in leaves}
     doc = {"crown": to_plant(crown)[0].tolist(),
-           "stem": to_plant(stem).tolist() if stem is not None else [],
+           # On the stem tree the stem is P5x's main axis, already in the plant
+           # frame, and the branches come with it.
+           "stem": ((np.asarray(p5x["axes"][0]["points"]).tolist()) if use_tree
+                    else to_plant(stem).tolist() if stem is not None else []),
+           "axes": p5x.get("axes") or [] if use_tree else [],
            "leaves": [{"id": i, "track": t, "sam3_ids": leaves[t]["tracks"],
                        "tip": to_plant(leaves[t]["tip"])[0].tolist(),
                        "base": to_plant(leaves[t]["base"])[0].tolist(),
                        "midrib": to_plant(leaves[t]["midrib"]).tolist(),
                        "petiole": to_plant(leaves[t]["petiole"]).tolist(),
+                       "petiole_rule": leaves[t]["petiole_rule"],
                        "colour_bgr": list(colours[t]),
                        "midrib_mm": float(np.linalg.norm(np.diff(leaves[t]["midrib"], axis=0),
                                                          axis=1).sum() * MM_PER_UNIT),
@@ -750,11 +866,12 @@ def main():
                        "fit_px": leaves[t]["fit_px"]} for i, t in enumerate(tracks)]}
     (args.out / "skeleton.json").write_text(json.dumps(doc, indent=1))
 
-    # 4. pictures
+    # 4. pictures -- the stem tree, branches and all, where it was used
+    drawn_stem = trunk if use_tree else stem
     rec0 = run.rec
     shots = [frames[i] for i in np.linspace(2, len(frames) - 3, 4).round().astype(int)]
-    tiles = [tile(args.workdir, rec0, f, f"{f}  pass {run.sources[f]}  (fitted)", stem, leaves,
-                  colours) for f in shots]
+    tiles = [tile(args.workdir, rec0, f, f"{f}  pass {run.sources[f]}  (fitted)", drawn_stem,
+                  leaves, colours) for f in shots]
     if args.passes and not args.other_passes:
         # frames of this same workdir that the fit did not use
         rest = sorted(f for f in run.image_of if int(run.sources[f]) not in set(args.passes))
@@ -762,7 +879,7 @@ def main():
             fs = [f for f in rest if int(run.sources[f]) == p]
             f = fs[len(fs) // 3]
             tiles.append(tile(args.workdir, rec0, f, f"{f}  pass {p}  (NOT used for the fit)",
-                              stem, leaves, colours))
+                              drawn_stem, leaves, colours))
     if args.other_passes:
         rec_all = pycolmap.Reconstruction(str(args.other_passes / "p3" / "sparse" / "best"))
         src = json.loads((args.other_passes / "p1" / "sources.json").read_text())
@@ -770,22 +887,14 @@ def main():
             fs = sorted(f for f, q in src.items() if int(q) == p)
             f = fs[len(fs) // 3]
             tiles.append(tile(args.other_passes, rec_all, f,
-                              f"{f}  pass {p}  (NOT used; plant drooped since)", stem, leaves,
-                              colours))
+                              f"{f}  pass {p}  (NOT used; plant drooped since)", drawn_stem,
+                              leaves, colours))
     cv2.imwrite(str(args.out / "reprojection.jpg"), grid(tiles, 3), [cv2.IMWRITE_JPEG_QUALITY, 88])
 
-    # P5x's traced skeleton next to this one, same views
-    p5x = run.skeleton
-    if args.retrace_p5x:
-        from pose_estimator.leaf_skeleton import trace
-        upright = (run.points - run.origin) @ run.rotation.T
-        voxel, _ = cloud_source.voxel_size(args.workdir, cloud_source.BASELINE, upright)
-        from pose_estimator.cli.leaf_instances import _architecture
-        p5x = trace(upright, run.assignment, voxel,
-                    architecture=_architecture(args.workdir, cloud_source.BASELINE))
-        print(f"  P5x skeleton re-traced with the current tracer: {len(p5x['leaves'])} midribs, "
-              f"stem of {len(p5x.get('stem', []))} samples")
-    p5x_stem = run.to_world(p5x["stem"]) if len(p5x.get("stem") or []) >= 2 else None
+    # P5x's traced skeleton next to this one, same views (`p5x` from step 2)
+    p5x_stem = ([run.to_world(a["points"]) for a in p5x["axes"] if a["kind"] != "petiole"]
+                if p5x.get("axes") else
+                run.to_world(p5x["stem"]) if len(p5x.get("stem") or []) >= 2 else None)
     p5x_leaves = {}
     for leaf in p5x["leaves"]:
         p5x_leaves[leaf["id"]] = {"tip": run.to_world(leaf["tip"]),
@@ -798,7 +907,7 @@ def main():
         pairs.append(tile(args.workdir, rec0, f, f"{f}  P5x: traced through 3D labels", p5x_stem,
                           {k: v for k, v in p5x_leaves.items() if len(v["midrib"]) >= 2},
                           p5x_colours))
-        pairs.append(tile(args.workdir, rec0, f, f"{f}  new: built in 2D, fused in 3D", stem,
+        pairs.append(tile(args.workdir, rec0, f, f"{f}  new: built in 2D, fused in 3D", drawn_stem,
                           leaves, colours))
     cv2.imwrite(str(args.out / "p5x_vs_2d.jpg"), grid(pairs, 2), [cv2.IMWRITE_JPEG_QUALITY, 88])
     print(f"\n  wrote {args.out / 'reprojection.jpg'}, {args.out / 'p5x_vs_2d.jpg'}, "

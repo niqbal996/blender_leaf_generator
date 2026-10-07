@@ -302,6 +302,7 @@ one measured, live under `docs/`:
 | phase | document |
 |---|---|
 | P3 | [docs/p3-camera-geometry.md](docs/p3-camera-geometry.md) -- colmap, vggt, vggt_omega, mapanything |
+| P5x / skeleton_2d | [docs/skeleton-2d.md](docs/skeleton-2d.md) -- the skeleton built from SAM3's 2D masks, and the per-plant rules |
 
 The rest of the phases are documented in the sections below for now, and move
 into `docs/` as they grow.

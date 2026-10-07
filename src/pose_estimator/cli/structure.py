@@ -26,11 +26,11 @@ from typing import Optional
 
 import numpy as np
 
-from pose_estimator import cloud_source
+from pose_estimator import cloud_source, plant_profiles
 from pose_estimator.ply_io import read_ply_vertices, write_ply_vertices
 from pose_estimator.pose import orbit_frame
 from pose_estimator.structure import solve_plant_frame
-from pose_estimator.structure_labels import build_from_labels, tip_reach_shortfall
+from pose_estimator.structure_labels import build_from_labels, tip_reach_shortfall, trunk_of
 from pose_estimator.structure_viz import (
     write_instancing_plot,
     write_reprojected_skeleton,
@@ -58,11 +58,23 @@ def run(
     strict_midribs: bool = False,
     min_tip_depth_voxels: float = 8.0,
     min_persistence_ratio: Optional[float] = None,
-    architecture: str = "caulescent",
+    architecture: Optional[str] = None,
     geometry_backend: str = cloud_source.BASELINE,
     cloud: Optional[Path] = None,
 ) -> dict:
     import pycolmap
+
+    # Given (--architecture, pipeline.conf) wins; otherwise the plant profile
+    # the folder name picks. "upright" is the same thing as "caulescent".
+    profile, folder = plant_profiles.profile_for(workdir)
+    print(f"  {plant_profiles.describe(profile, folder)}")
+    if architecture is None:
+        architecture = profile.architecture
+    else:
+        architecture = plant_profiles.normalise_architecture(architecture)
+        if architecture != profile.architecture and folder is not None:
+            print(f"  --architecture {architecture} given, overriding the profile's "
+                  f"{profile.architecture}")
 
     # Prefer the P4b surface over the P4a hull. The hull is a solid bound --
     # 71.5% enclosed interior voxels, near-isotropic local neighbourhoods --
@@ -288,10 +300,12 @@ def _write_outputs(p5_dir: Path, structure, stem_points: np.ndarray, frame, clam
                               else "lowest point -- clamp not detectable"),
         "source": "p4c labels",
         "stem_path_xyz": structure.stem_path.tolist(),
-        # The two ends of an upright plant's stem line, named, so they can be
-        # drawn and argued with rather than inferred from the polyline.
+        # The whole stem tree -- main stem, branches, leaf stalks -- in the
+        # schema P5x writes (`stem_tree.Axis.to_dict`); axes[0] is the stem.
+        "axes": structure.stem_axes,
+        # A rosette's crown, named, so it can be drawn and argued with rather
+        # than inferred from a one-node stem path.
         "crown_xyz": _point_or_none(structure.crown, "crown"),
-        "heart_xyz": _point_or_none(structure.heart, "heart"),
         "leaves": [
             {
                 "id": i,
@@ -306,33 +320,25 @@ def _write_outputs(p5_dir: Path, structure, stem_points: np.ndarray, frame, clam
     with open(p5_dir / "stem_graph.json", "w") as f:
         json.dump(graph, f, indent=2)
 
-    # The straight chord from each tip back to the base, as a reference the
-    # midrib can be read against. A midrib should bow away from its chord by
-    # roughly the leaf's own curvature and no more; one that loops, doubles
-    # back or crosses another leaf stands out immediately next to a straight
-    # line, where on its own it just looks like a curve.
-    if structure.axes and len(structure.stem_path):
-        chords, gaps = [], []
-        base = structure.stem_path[0]
-        for axis in structure.axes:
-            axis = np.asarray(axis).reshape(-1, 3)
-            if len(axis) < 2:
-                continue
-            chord = np.linspace(axis[0], axis[-1], 24)
-            chords.append(chord)
-            arc = float(np.linalg.norm(np.diff(axis, axis=0), axis=1).sum())
-            straight = float(np.linalg.norm(axis[-1] - axis[0]))
-            gaps.append(arc / max(straight, 1e-9))
-        if chords:
-            pts = np.vstack(chords)
-            _ply(p5_dir / "chords.ply", pts,
-                 np.tile(np.array([[210, 210, 210]], np.uint8), (len(pts), 1)))
-            graph["chords_xyz"] = [c.tolist() for c in chords]
-            graph["arc_over_chord"] = [round(g, 3) for g in gaps]
-            with open(p5_dir / "stem_graph.json", "w") as f:
-                json.dump(graph, f, indent=2)
-            print("  arc/chord per leaf (1.0 = straight; a wandering midrib is >> 1): "
-                  + ", ".join(f"{g:.2f}" for g in gaps))
+    # How far each midrib wanders from the straight line between its ends, as
+    # one number per leaf: a leaf ~1.1, a midrib that loops or crosses into a
+    # neighbour >> 1 (vogelmeere's fused clumps read 3.6-3.8). The chord lines
+    # themselves used to be written and drawn too; as geometry they said
+    # nothing the number does not.
+    gaps = []
+    for axis in structure.axes:
+        axis = np.asarray(axis).reshape(-1, 3)
+        if len(axis) < 2:
+            continue
+        arc = float(np.linalg.norm(np.diff(axis, axis=0), axis=1).sum())
+        straight = float(np.linalg.norm(axis[-1] - axis[0]))
+        gaps.append(arc / max(straight, 1e-9))
+    if gaps:
+        graph["arc_over_chord"] = [round(g, 3) for g in gaps]
+        with open(p5_dir / "stem_graph.json", "w") as f:
+            json.dump(graph, f, indent=2)
+        print("  arc/chord per leaf (1.0 = straight; a wandering midrib is >> 1): "
+              + ", ".join(f"{g:.2f}" for g in gaps))
 
     np.save(p5_dir / "leaf_points.npy", structure.leaf_ids)
     np.save(p5_dir / "leaf_points_xyz.npy", structure.leaf_points)
@@ -375,20 +381,34 @@ def _stem_check(structure) -> dict:
             "detail": (f"not applicable: --architecture rosette, leaves meet at a crown "
                        f"({spread:.1%} of extent) rather than along a stem"),
         }
-    if structure.crown is not None and structure.heart is not None:
-        # The upright path measures the stem line rather than tracing it, so
-        # it is two nodes by construction and a node count says nothing. What
-        # can fail is the two ends landing on top of each other, which is what
-        # this asks instead.
-        length = float(np.linalg.norm(np.asarray(structure.heart) - np.asarray(structure.crown)))
-        return {
-            "pass": length > 0.0,
-            "detail": (f"crown to heart, measured: {length:.4f} long "
-                       f"(z {structure.crown[2]:.4f} -> {structure.heart[2]:.4f})"),
-        }
     return {
         "pass": len(structure.stem_path) >= 3,
         "detail": f"{len(structure.stem_path)} stem centreline nodes",
+    }
+
+
+def _assigned_check(structure, least: float = 0.5) -> dict:
+    """Most of the leaf tissue has to end up in some leaf.
+
+    Every other check reads only the leaves that were found, so a run that
+    found two leaves and left the rest of the plant unassigned passed all of
+    them: vogelmeere (2026-10-06), 128,333 of 133,127 leaf points in no leaf,
+    every check [PASS]. Islands of tissue the depth field never reached are
+    the usual cause -- `--architecture` wrong for the plant.
+    """
+    total = len(structure.leaf_ids)
+    if not total:
+        return {"pass": False, "detail": "no leaf tissue"}
+    share = float((structure.leaf_ids >= 0).mean())
+    unreached = ""
+    if structure.instancing is not None:
+        stats = structure.instancing.to_dict()
+        lost = stats["leaf_points"] - stats["reachable_from_stem"]
+        if lost:
+            unreached = f"; {lost} never reached from the stem"
+    return {
+        "pass": share >= least,
+        "detail": f"{share:.1%} of {total} leaf points are in a leaf (limit {least:.0%}){unreached}",
     }
 
 
@@ -414,14 +434,18 @@ def _point_or_none(value, name: str):
 def _evaluate(structure, clamp, frame, voxel: float) -> dict:
     lengths = [float(np.linalg.norm(np.diff(a, axis=0), axis=1).sum()) for a in structure.axes]
     per_leaf = [int((structure.leaf_ids == i).sum()) for i in range(structure.num_leaves)]
+    # Measured from the stem and its branches, the same lines the tips were
+    # picked against -- a check against a different line fails by construction.
+    trunk = trunk_of(structure.stem_axes)
     shortfall = tip_reach_shortfall(
         structure.leaf_points, structure.leaf_ids,
         structure.instancing.accepted_tips if structure.instancing is not None else [],
-        structure.stem_path)
+        trunk if len(trunk) else structure.stem_path)
     worst = max(shortfall) / voxel if shortfall else 0.0
 
     checks = {
         "stem_traced": _stem_check(structure),
+        "leaf_tissue_assigned": _assigned_check(structure),
         "leaves_found": {
             "pass": structure.num_leaves >= 2,
             "detail": (f"{structure.num_leaves} leaf instance(s) from "
@@ -511,13 +535,14 @@ def main(argv: Optional[list] = None) -> None:
              "check p5.json's midrib_support, which reports the coverage each leaf "
              "was judged on.")
     parser.add_argument("--architecture", choices=["upright", "rosette", "caulescent"],
-                        default="caulescent",
-                        help="What kind of plant this is. caulescent (default): an upright "
-                             "plant with a central stem; leaf depth is measured from the "
+                        default=None,
+                        help="What kind of plant this is. Default: the plant profile named "
+                             "by the specimen folder (pose_estimator/plant_profiles.py), "
+                             "caulescent when none matches. caulescent (= upright): leaves "
+                             "on a stem and its branches; leaf depth is measured from the "
                              "stem tissue. rosette: leaves radiate from a crown at ground "
                              "level with no stem at all (thistle, sugar beet); the crown is "
-                             "located geometrically and stem labels are ignored. Not "
-                             "inferred -- you know which it is when you shoot it.")
+                             "located geometrically and stem labels are ignored.")
     parser.add_argument("--min-persistence-ratio", type=float, default=None,
                         help="Override the automatic tip cut with a fixed persistence "
                              "ratio. By default the cut is read off this plant: the "
@@ -531,8 +556,6 @@ def main(argv: Optional[list] = None) -> None:
         contact_voxels=args.contact_voxels, min_leaf_points=args.min_leaf_points,
         min_tip_depth_voxels=args.min_tip_depth_voxels,
         min_persistence_ratio=args.min_persistence_ratio,
-        # "caulescent" is the old name for "upright", kept as an alias so
-        # existing commands and scripts keep working.
         architecture=args.architecture,
         strict_midribs=args.strict_midribs,
         geometry_backend=args.geometry_backend, cloud=args.cloud)

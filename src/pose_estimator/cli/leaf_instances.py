@@ -70,7 +70,7 @@ from typing import Dict, List, Optional, Sequence
 import cv2
 import numpy as np
 
-from pose_estimator import cloud_source
+from pose_estimator import cloud_source, plant_profiles
 from pose_estimator.ply_io import read_ply_vertices, write_ply_vertices
 from pose_estimator.semantic import (
     accumulate_votes,
@@ -320,6 +320,168 @@ def merge_across_passes(per_pass: Dict[str, np.ndarray], counts: Dict[str, int],
     return merged
 
 
+# A piece of a leaf rather than a leaf: at least this share of its points lie
+# on a larger leaf's surface. Measured on vogelmeere (2026-10-07), with the
+# occlusion test's own surface tolerance: the four ids that are a strip of
+# another leaf's blade score 0.87-1.00; the next, separate pieces, 0.71 and
+# below. Placed in that gap.
+FRAGMENT_CONTACT = 0.8
+
+
+def fragment_contacts(points: np.ndarray, assignment: np.ndarray,
+                      tolerance: float) -> Dict[int, tuple]:
+    """{leaf: (larger leaf, share of its points within `tolerance` of that one's)}.
+
+    Only leaves whose share reaches FRAGMENT_CONTACT, each with the one larger
+    leaf it lies on most. Contact is necessary but not enough: on a dense shoot
+    tip a real small leaf lies against a bigger one too, so `fragment_votes`
+    asks SAM3 as well.
+    """
+    from scipy.spatial import cKDTree
+
+    ids, sizes = np.unique(assignment[assignment >= 0], return_counts=True)
+    size = dict(zip(ids.tolist(), sizes.tolist()))
+    member = {i: points[assignment == i] for i in size}
+    low = {i: p.min(axis=0) - tolerance for i, p in member.items()}
+    high = {i: p.max(axis=0) + tolerance for i, p in member.items()}
+    trees: Dict[int, object] = {}
+    out: Dict[int, tuple] = {}
+    for a in size:
+        best = (None, 0.0)
+        for b in size:
+            if size[b] <= size[a] or (high[a] < low[b]).any() or (high[b] < low[a]).any():
+                continue
+            if b not in trees:
+                trees[b] = cKDTree(member[b])
+            d = trees[b].query(member[a], distance_upper_bound=tolerance)[0]
+            share = float(np.isfinite(d).mean())
+            if share > best[1]:
+                best = (b, share)
+        if best[0] is not None and best[1] >= FRAGMENT_CONTACT:
+            out[a] = (best[0], best[1])
+    return out
+
+
+def fragment_votes(points: np.ndarray, assignment: np.ndarray, pairs, reconstruction,
+                   by_pass: Dict[str, List[Path]], frames_of_pass: Dict[str, set],
+                   spacing: float, tolerance: float, min_pixels: int = 5) -> Dict[tuple, list]:
+    """{(a, b): [frames SAM3 shows them as one object, frames as two]}.
+
+    Per photo where both are visible: the SAM3 mask covering most of each. The
+    same mask is a vote for one object, different masks a vote for two.
+    Neighbouring leaves get different masks whenever both are on screen, so
+    this is what keeps a real small leaf lying on a big one apart -- vogelmeere
+    5 + 15 touch, and SAM3 drew them as one mask in 57 photos but as two in 15.
+    """
+    votes = {pair: [0, 0] for pair in pairs}
+    wanted = np.array(sorted({x for pair in pairs for x in pair}))
+    if not len(wanted):
+        return votes
+    blank = np.zeros((len(points), 3), np.uint8)
+    for image_id in sorted(reconstruction.reg_image_ids()):
+        image = reconstruction.images[image_id]
+        stem = Path(image.name).stem
+        camera = camera_from_colmap(image, reconstruction.cameras[image.camera_id])
+        _rgb, index = render_points(points, blank, camera)
+        if spacing > 0:
+            index = visible_only(points, camera, index, spacing, tolerance)
+        if not np.isin(assignment[index[index >= 0]], wanted).any():
+            continue
+        under: Dict[int, Dict[str, int]] = {}
+        for prefix, dirs in by_pass.items():
+            if prefix in frames_of_pass and stem not in frames_of_pass[prefix]:
+                continue
+            for folder in dirs:
+                path = folder / f"{stem}.png"
+                raw = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE) if path.exists() else None
+                if raw is None:
+                    continue
+                hit = index[raw > 127]
+                hit = assignment[hit[hit >= 0]]
+                values, counts = np.unique(hit[np.isin(hit, wanted)], return_counts=True)
+                for v, c in zip(values.tolist(), counts.tolist()):
+                    under.setdefault(v, {})[folder.name] = c
+        dominant = {leaf: max(t, key=t.get) for leaf, t in under.items()
+                    if max(t.values()) >= min_pixels}
+        for a, b in pairs:
+            if a in dominant and b in dominant:
+                votes[(a, b)][0 if dominant[a] == dominant[b] else 1] += 1
+    return votes
+
+
+def absorb_fragments(assignment: np.ndarray, contacts: Dict[int, tuple],
+                     votes: Dict[tuple, list], min_frames: int = 2) -> Dict[int, int]:
+    """Fold each fragment into the leaf it is a piece of. Returns {fragment: leaf}.
+
+    A fragment lies on a larger leaf (`fragment_contacts`) and SAM3 shows the
+    two as one object in most photos that see both (`fragment_votes`).
+
+    Where they come from: SAM3 hands a leaf to a new id partway through a pass.
+    On vogelmeere, pass0_24 tracked leaf 6's blade for frames 0-28; from frame
+    33 the blade was pass0_64 and pass0_24 had shrunk onto the petiole. The
+    per-point vote kept most of the blade with 24, but a strip seen broadside
+    only at the end went to 64 -- 190 points, a leaf of their own, a second tip.
+    Ids of one pass are never merged with each other (`merge_across_passes`
+    only links passes), so nothing else rejoins them.
+
+    Only ever the smaller into the larger, and only when most of the smaller
+    lies on the larger: two whole leaves cannot qualify, which is what keeps
+    this from the chaining that once merged gaensefuss_1's 34 leaves into 17.
+    """
+    absorbed: Dict[int, int] = {}
+    for a, (b, _share) in contacts.items():
+        together, apart = votes.get((a, b), [0, 0])
+        if together >= min_frames and together > apart:
+            absorbed[a] = b
+
+    def final(x: int) -> int:
+        while x in absorbed:
+            x = absorbed[x]
+        return x
+
+    absorbed = {a: final(a) for a in absorbed}
+    for a, b in absorbed.items():
+        assignment[assignment == a] = b
+    return absorbed
+
+
+def _absorb(points, assignment, reconstruction, by_pass, frames_of_pass,
+            spacing: float, tolerance: float) -> Dict[int, int]:
+    """Find fragments, ask SAM3, fold them in, and say what happened."""
+    contacts = fragment_contacts(points, assignment, tolerance)
+    if not contacts:
+        print("  no leaf lies mostly on another's surface -- nothing to absorb")
+        return {}
+    pairs = [(a, b) for a, (b, _share) in contacts.items()]
+    votes = fragment_votes(points, assignment, pairs, reconstruction, by_pass,
+                           frames_of_pass, spacing, tolerance)
+    absorbed = absorb_fragments(assignment, contacts, votes)
+    print(f"  {len(contacts)} leaf/leaves lie mostly (>= {FRAGMENT_CONTACT:.0%}) on a larger "
+          f"leaf's surface; SAM3 shows {len(absorbed)} of them as one object with it:")
+    for a, (b, share) in sorted(contacts.items()):
+        together, apart = votes[(a, b)]
+        print(f"    {a} on {b}: {share:.0%} contact, one mask in {together} photo(s), two in "
+              f"{apart} -> {'absorbed' if a in absorbed else 'kept'}")
+    return absorbed
+
+
+def frames_by_pass(workdir: Path, by_pass: Dict[str, List[Path]]) -> Dict[str, set]:
+    """prefix -> the frame stems that pass captured, from p1/sources.json.
+
+    "pass2_" is capture pass 2 there, which is how a view is matched to the
+    session whose ids describe it.
+    """
+    sources_file = workdir / "p1" / "sources.json"
+    sources = json.loads(sources_file.read_text()) if sources_file.exists() else {}
+    out: Dict[str, set] = {}
+    for prefix in by_pass:
+        if not prefix:
+            continue
+        index = int(prefix[len("pass"):].rstrip("_"))
+        out[prefix] = {stem for stem, p in sources.items() if p == index}
+    return out
+
+
 def _combine_passes(per_pass: Dict[str, np.ndarray], merged: Dict[tuple, int],
                     n_points: int) -> np.ndarray:
     """One label per point, from what each pass said about it.
@@ -374,6 +536,7 @@ def run(
     merge_overlap: float = 0.30,
     covisible_frames: int = 2,
     occlusion_test: bool = True,
+    keep_fragments: bool = False,
 ) -> dict:
     import pycolmap
 
@@ -404,15 +567,7 @@ def run(
             "its own ids starting at zero, so those folders each hold several unrelated\n"
             "leaves merged together and cannot be projected. Re-run P2:\n"
             f"    pose-segment --workdir {workdir} --backend sam3 --reuse-frames")
-    # prefix -> the frame stems that pass captured. "pass2_" is capture pass 2
-    # in p1/sources.json, which is how a view is matched to the session whose
-    # ids describe it.
-    frames_of_pass: Dict[str, set] = {}
-    for prefix in by_pass:
-        if not prefix:
-            continue
-        index = int(prefix[len("pass"):].rstrip("_"))
-        frames_of_pass[prefix] = {stem for stem, p in sources.items() if p == index}
+    frames_of_pass = frames_by_pass(workdir, by_pass)
 
     print(f"  {len(leaf_dirs)} leaf instance(s) with >= {min_frames} frames "
           f"across {len(by_pass)} capture pass(es)"
@@ -555,6 +710,15 @@ def run(
             assignment[mask] = SKELETON
             dropped += 1
 
+    # A strip of one leaf that SAM3 tracked under a second id is not a leaf.
+    absorbed: Dict[int, int] = {}
+    if not keep_fragments:
+        if not occlusion_test:
+            spacing, thickness = surface_scale(points)
+            tolerance = 2.0 * thickness
+        absorbed = _absorb(points, assignment, reconstruction, by_pass, frames_of_pass,
+                           spacing if occlusion_test else 0.0, tolerance)
+
     # --- upright, and in the same frame P5 draws in ---
     #
     # The cloud is in the reconstruction's own frame, where "up" is wherever
@@ -588,6 +752,7 @@ def run(
         print(f"  {len(skeleton['unreachable'])} leaf/leaves never reach the crown through "
               f"the cloud: {skeleton['unreachable']}")
         print("    their bridge to the plant was carved away, so they get no midrib.")
+    _print_tree(skeleton, voxel)
     if skeleton["leaves"]:
         heights = [leaf["height"] for leaf in skeleton["leaves"]]
         print(f"  traced {len(skeleton['leaves'])} midribs from the crown; "
@@ -600,6 +765,7 @@ def run(
                             skeleton=skeleton,
                             merge={"overlap_fraction": merge_overlap,
                                    "covisible_frames": covisible_frames,
+                                   "fragments_absorbed": {str(a): b for a, b in absorbed.items()},
                                    "per_pass_ids": len(leaf_counts),
                                    "groups": len(set(merged.values())) if merged else 0,
                                    "cannot_link_pairs": len(cannot_link),
@@ -627,8 +793,8 @@ def _architecture(workdir: Path, geometry_backend: str) -> Optional[str]:
           else workdir / "p5" / "experiments" / geometry_backend)
     path = p5 / "instancing.json"
     if not path.exists():
-        return None
-    return json.loads(path.read_text()).get("architecture")
+        return plant_profiles.profile_for(workdir)[0].architecture
+    return plant_profiles.normalise_architecture(json.loads(path.read_text()).get("architecture"))
 
 
 def _write_curves(path: Path, polylines, colours) -> None:
@@ -784,6 +950,127 @@ def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
     return report
 
 
+def retrace(workdir: Path, geometry_backend: str = cloud_source.BASELINE,
+            keep_fragments: bool = False) -> dict:
+    """Redo everything after the votes, from the labels P5x already wrote.
+
+    p5x/segmented.ply carries every point's leaf/stem label in P5's plant
+    frame, which is all `trace` reads. So when only the tracer changed, this
+    rewrites skeleton.json, midribs.ply and petioles.ply instead of projecting
+    every mask again (11 min on vogelmeere).
+
+    Fragments are folded in first (`absorb_fragments`, unless
+    `keep_fragments`). That asks SAM3, so it renders every view once -- about
+    2.5 min on vogelmeere locally -- and when it folds anything in it rewrites
+    instances.npy, segmented.ply, leaves.ply and instances.json to match.
+    """
+    p5x = workdir / "p5x"
+    if not keep_fragments:
+        _retrace_absorb(workdir, geometry_backend, p5x)
+    cloud = p5x / "segmented.ply"
+    if not cloud.exists():
+        raise SystemExit(f"{cloud} not found -- run pose-leaf-instances once without --retrace")
+    fields = read_ply_vertices(cloud)
+    if "label" not in fields:
+        raise SystemExit(f"{cloud} has no label column; it predates --retrace. Re-run P5x fully.")
+    points = np.stack([fields["x"], fields["y"], fields["z"]], axis=1).astype(np.float64)
+    assignment = np.asarray(fields["label"], np.int64)
+
+    voxel, voxel_origin = cloud_source.voxel_size(workdir, geometry_backend, points)
+    architecture = _architecture(workdir, geometry_backend)
+    print(f"  {plant_profiles.describe(*plant_profiles.profile_for(workdir))}")
+    print(f"  re-tracing {len(points)} points from {cloud.name}; architecture {architecture}, "
+          f"voxel {voxel:.5f} ({voxel_origin})")
+    skeleton = trace(points, assignment, voxel, architecture=architecture)
+    skeleton["architecture"] = architecture
+
+    report_path = p5x / "instances.json"
+    n_2d = json.loads(report_path.read_text()).get("num_leaves_2d", 1) if report_path.exists() else 1
+    palette = leaf_palette(max(int(n_2d), 1))
+    with open(p5x / "skeleton.json", "w") as f:
+        json.dump(skeleton, f, indent=2)
+    _write_curves(p5x / "midribs.ply", [leaf["midrib"] for leaf in skeleton["leaves"]],
+                  [palette[leaf["id"] % len(palette)] for leaf in skeleton["leaves"]])
+    _write_curves(p5x / "petioles.ply", [leaf["petiole"] for leaf in skeleton["leaves"]],
+                  [SKELETON_RGB] * len(skeleton["leaves"]))
+    _print_tree(skeleton, voxel)
+    print(f"  wrote {p5x / 'skeleton.json'}, midribs.ply, petioles.ply")
+    return skeleton
+
+
+def _retrace_absorb(workdir: Path, geometry_backend: str, p5x: Path) -> None:
+    """`absorb_fragments` on a finished P5x, rewriting its label files if it folds anything."""
+    import pycolmap
+
+    report_path = p5x / "instances.json"
+    if not (p5x / "instances.npy").exists() or not report_path.exists():
+        print("  no p5x/instances.npy -- fragments not checked")
+        return
+    report = json.loads(report_path.read_text())
+    chosen = cloud_source.resolve(workdir, geometry_backend, None, "auto")
+    fields = read_ply_vertices(chosen.path)
+    points = np.stack([fields["x"], fields["y"], fields["z"]], axis=1).astype(np.float64)
+    assignment = np.load(p5x / "instances.npy")
+    if len(assignment) != len(points):
+        print(f"  p5x/instances.npy has {len(assignment)} rows but {chosen.path.name} has "
+              f"{len(points)} -- P5x is stale; fragments not checked")
+        return
+    visibility = report.get("visibility") or {}
+    tolerance = visibility.get("depth_tolerance") or 2.0 * surface_scale(points)[1]
+    spacing = visibility.get("point_spacing", 0.0) if visibility.get("occlusion_test") else 0.0
+    by_pass = group_by_pass(usable_instances(workdir / "p2" / "masks" / "leaf_instances", 1))
+    if not by_pass:
+        print("  no p2/masks/leaf_instances to ask SAM3 with -- fragments not checked")
+        return
+    sparse_model, _ = cloud_source.geometry(workdir, geometry_backend)
+    absorbed = _absorb(points, assignment, pycolmap.Reconstruction(str(sparse_model)), by_pass,
+                       frames_by_pass(workdir, by_pass), spacing, tolerance)
+    if not absorbed:
+        return
+
+    np.save(p5x / "instances.npy", assignment)
+    palette = leaf_palette(max(int(report.get("num_leaves_2d", 1)), 1))
+    for name in ("segmented.ply", "leaves.ply"):
+        ply = read_ply_vertices(p5x / name)
+        label = np.asarray(ply["label"]).copy()
+        for a, b in absorbed.items():
+            hit = label == a
+            label[hit] = b
+            for channel, value in zip(("red", "green", "blue"), palette[b % len(palette)]):
+                ply[channel][hit] = value
+        ply["label"] = label.astype(np.int32)
+        write_ply_vertices(p5x / name, ply)
+    per_leaf = {str(i): int((assignment == i).sum())
+                for i in sorted({int(v) for v in np.unique(assignment) if v >= 0})}
+    report["points_per_leaf"] = per_leaf
+    report["num_leaves_3d"] = len(per_leaf)
+    merge = report.setdefault("merge", {})
+    merge["fragments_absorbed"] = {**merge.get("fragments_absorbed", {}),
+                                   **{str(a): b for a, b in absorbed.items()}}
+    report_path.write_text(json.dumps(report, indent=2))
+    print(f"  rewrote instances.npy, segmented.ply, leaves.ply, instances.json: "
+          f"{len(per_leaf)} leaves")
+
+
+def _print_tree(skeleton: dict, voxel: float) -> None:
+    """The stem tree and where each petiole came from, as numbers."""
+    tree = skeleton.get("stem_tree")
+    leaves = skeleton["leaves"]
+    if tree:
+        kinds = tree["axes"]
+        print(f"  stem tree: {kinds.get('branch', 0)} branch(es), {kinds.get('petiole', 0)} "
+              f"leaf stalk(s), {tree['forks']} forks, {tree['length']:.4f} long; stem radius "
+              f"{tree['radius']:.5f} ({tree['radius'] / voxel:.1f} voxels), shells "
+              f"{tree['shell']:.5f}")
+    elif skeleton.get("architecture") != "rosette":
+        print("  stem tree: none -- no stem tissue to build it from")
+    lengths = np.array([leaf["petiole_length"] for leaf in leaves]) if leaves else np.zeros(0)
+    stalks = sum(1 for leaf in leaves if leaf.get("petiole_from") == "stalk")
+    print(f"  petioles: {stalks} from a stalk of their own, {len(leaves) - stalks} from the "
+          f"path to the plant; {int((lengths == 0).sum())} of {len(leaves)} empty"
+          + (f"; median length {np.median(lengths[lengths > 0]):.4f}" if (lengths > 0).any() else ""))
+
+
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--min-frames", type=int, default=3,
                         help="ignore a 2D leaf id present on fewer frames than this. An id "
@@ -808,6 +1095,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                         help="count every view equally instead of weighting by how "
                              "broad-side the surface is to it. Only for comparison: an "
                              "edge-on camera cannot see a blade as a blade")
+    parser.add_argument("--keep-fragments", action="store_true",
+                        help="keep a leaf that lies on another leaf's surface and that SAM3 "
+                             "shows as one object with it, instead of folding it in. Such a "
+                             "piece is a strip of one leaf tracked under a second SAM3 id, "
+                             "and as its own leaf it gets a second tip")
     parser.add_argument("--geometry-backend", default=cloud_source.BASELINE)
     parser.add_argument("--cloud", type=Path, help="explicit point cloud to label")
     parser.add_argument("--source", default="auto",
@@ -819,8 +1111,16 @@ def main(argv: Optional[list] = None) -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workdir", required=True, type=Path)
     add_arguments(parser)
+    parser.add_argument("--retrace", action="store_true",
+                        help="re-trace the skeleton (stem tree, midribs, petioles) from "
+                             "p5x/segmented.ply and stop -- seconds, for when only the "
+                             "tracer changed")
     args = parser.parse_args(argv)
+    if args.retrace:
+        retrace(args.workdir, args.geometry_backend, keep_fragments=args.keep_fragments)
+        return
     run(workdir=args.workdir, min_frames=args.min_frames, min_points=args.min_points,
+        keep_fragments=args.keep_fragments,
         normal_weighting=not args.no_normal_weighting,
         occlusion_test=not args.no_occlusion_test,
         geometry_backend=args.geometry_backend, cloud=args.cloud, source=args.source,

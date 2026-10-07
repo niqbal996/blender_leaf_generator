@@ -13,7 +13,8 @@ P4b, P4c and P5 cannot tell which backend ran:
     masks/plant/frame_XXXX.png   binary 0/255, full-frame coordinates
     masks/holder/frame_XXXX.png  binary 0/255, full-frame coordinates
     masks/root/frame_XXXX.png    binary 0/255, when a root prompt matched
-    masks/stem/frame_XXXX.png    plant minus leaf, holder and root -- see below
+    masks/stem/frame_XXXX.png    plant minus leaf, holder and root, plus the stem
+                                 phrase's own session -- see below
     alpha/frame_XXXX.png         soft plant matte
     crop.json                    the tracking window
     prompts.json                 the phrases used, and what each one found
@@ -46,6 +47,16 @@ the broad phrase `plant` returns (which covered 0.88 of the reference there
 against leaf+stem's 0.81). So the stem class is what `plant` claimed and the
 leaf instances, the holder and the root did not -- the stem, the petioles and
 the crown, which is the tissue a skeleton is actually built along.
+
+The subtraction alone loses every stalk a leaf track has slid onto. SAM3
+hands a leaf to a new id partway through a pass and the old id can shrink onto
+the petiole (vogelmeere pass0_24, leaf 6's petiole from frame 27 on), and in
+the plant session "stem" cannot claim tissue "leaf" already holds. So "stem"
+also runs in a session of its own, where nothing competes for that tissue, and
+is unioned in: measured on vogelmeere frames 22-36 it claimed 85-100% of
+those stalk-bound leaf masks and none of any blade (median leaf overlap 0.0%).
+The same mask trims the leaf instances, so each leaf mask ends where its blade
+begins; a leaf mask that is mostly stalk on a frame is not written for it.
 
 It doubles as a check on the leaf prompt. A petiole is thin, so a *large*
 connected component in that residual is not a petiole: it is a leaf blade the
@@ -80,6 +91,8 @@ DEFAULT_PLANT_PROMPTS = ("leaf", "stem", "plant")
 # "metal clamp", "metal gripper" and "plant pot" were each tried and returned
 # nothing at all on two captures; they are left out rather than left in as
 # dead weight.
+# Run as a session of its own -- see the module docstring.
+DEFAULT_STEM_PROMPTS = ("stem",)
 DEFAULT_HOLDER_PROMPTS = ("pliers", "tool")
 DEFAULT_ROOT_PROMPTS = ("root",)
 # What the crop window is solved from. Deliberately the broad term: this pass
@@ -128,6 +141,11 @@ RESIDUAL_SPECK_FRACTION = 0.0008
 # few percent of the plant. One component at a fifth of it is a leaf blade the
 # leaf prompt lost on that frame -- the sugarbeet_4 frame-4 failure exactly.
 MISSED_LEAF_FRACTION = 0.20
+# A leaf mask with less than this share left once the stem session's pixels
+# are taken out is a leaf track sitting on a stalk that frame, not a blade:
+# vogelmeere's stalk-bound tracks kept 0-9%, blades lost at most a quarter
+# (their petiole).
+MIN_LEAF_LEFT_AFTER_STEM = 0.5
 
 
 @dataclass
@@ -135,13 +153,14 @@ class Sam3Prompts:
     """The phrases for one capture pass, by P2 class."""
 
     plant: List[str] = field(default_factory=lambda: list(DEFAULT_PLANT_PROMPTS))
+    stem: List[str] = field(default_factory=lambda: list(DEFAULT_STEM_PROMPTS))
     holder: List[str] = field(default_factory=lambda: list(DEFAULT_HOLDER_PROMPTS))
     root: List[str] = field(default_factory=lambda: list(DEFAULT_ROOT_PROMPTS))
     crop: str = DEFAULT_CROP_PROMPT
 
     def to_dict(self) -> dict:
-        return {"backend": "sam3", "plant": self.plant, "holder": self.holder,
-                "root": self.root, "crop": self.crop}
+        return {"backend": "sam3", "plant": self.plant, "stem": self.stem,
+                "holder": self.holder, "root": self.root, "crop": self.crop}
 
 
 # --------------------------------------------------------------------------
@@ -409,7 +428,8 @@ def segment_sequence_sam3(
     # Said before any of it starts. A pass is several full propagations, not
     # one, and the count is the difference between a long wait that is
     # understood and a long wait that looks like a failure.
-    sessions = ["plant"] + (["root"] if prompts.root else []) \
+    sessions = ["plant"] + (["stem"] if prompts.stem else []) \
+        + (["root"] if prompts.root else []) \
         + (["holder"] if prompts.holder else [])
     localising = (f"1 localisation over {len(frame_paths)} full frames + "
                   if use_roi and crop_stride == 1 else
@@ -439,6 +459,14 @@ def segment_sequence_sam3(
                                             prompts.plant, device, want_soft=True,
                                             label="plant")
 
+    # The stem on its own: in the plant session it cannot claim a stalk a leaf
+    # track has slid onto (see the module docstring).
+    stem_frames = {}
+    if prompts.stem:
+        print(f"  stem    {list(prompts.stem)}  (own session -- nothing competes for the stalks)")
+        stem_frames, _ = _run_session(processor, model, torch, cropped, prompts.stem,
+                                      device, label="stem")
+
     root_frames = {}
     if prompts.root:
         print(f"  root    {list(prompts.root)}")
@@ -460,7 +488,10 @@ def segment_sequence_sam3(
         (out_dir / sub).mkdir(parents=True, exist_ok=True)
 
     per_frame_stats, found_counts = [], {p: 0 for p in
-                                         list(prompts.plant) + list(prompts.holder) + list(prompts.root)}
+                                         list(prompts.plant) + list(prompts.stem)
+                                         + list(prompts.holder) + list(prompts.root)}
+    stalk_frames: Dict[str, List[str]] = {}         # leaf id -> frames it sat on a stalk
+    trimmed_px = 0
     instance_frames: Dict[int, List[str]] = {}
     missed_leaf_frames: List[str] = []
 
@@ -516,6 +547,19 @@ def segment_sequence_sam3(
             residual = residual & ~root_crop
         residual = _drop_specks(residual, max(MIN_RESIDUAL_AREA,
                                               int(RESIDUAL_SPECK_FRACTION * plant_crop.sum())))
+        # Checked on the subtraction alone: with the stem session in, the
+        # connected stem system is itself a large component.
+        missed = residual.copy()
+        stem_crop = np.zeros(crop_shape, bool)
+        if prompts.stem:
+            for phrase in prompts.stem:
+                found_counts[phrase] += 1 if stem_frames.get(i, {}).get(phrase) else 0
+            stem_crop = _union(stem_frames.get(i, {}), prompts.stem, crop_shape) \
+                & plant_crop & ~holder_in_crop
+            if root_crop is not None:
+                stem_crop &= ~root_crop
+            residual = residual | stem_crop
+            stats["stem_session_px"] = int(stem_crop.sum())
         (out_dir / "masks" / STEM_MASK_DIR).mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(out_dir / "masks" / STEM_MASK_DIR / f"{path.stem}.png"),
                     _paste(residual, box, full_h, full_w).astype(np.uint8) * 255)
@@ -523,7 +567,7 @@ def segment_sequence_sam3(
         # A petiole is thin. A *large* residual blob is not a petiole, it is a
         # leaf the leaf prompt missed on this frame -- which makes this number
         # the cheapest detector there is for exactly that failure.
-        biggest = _largest_component_area(residual)
+        biggest = _largest_component_area(missed)
         stats["stem_largest_component_px"] = biggest
         if plant_crop.any() and biggest > MISSED_LEAF_FRACTION * plant_crop.sum():
             missed_leaf_frames.append(path.stem)
@@ -550,11 +594,19 @@ def segment_sequence_sam3(
 
         if save_instances:
             for obj_id, mask in plant_frame.get(INSTANCE_PROMPT, {}).items():
-                folder = out_dir / "masks" / "leaf_instances" / f"{instance_prefix}{obj_id}"
+                name = f"{instance_prefix}{obj_id}"
+                # Each leaf ends where its blade begins: the stalk it took in
+                # is stem. Mostly stalk on this frame = the track sat on one.
+                blade = mask & ~stem_crop
+                if mask.any() and blade.sum() < MIN_LEAF_LEFT_AFTER_STEM * mask.sum():
+                    stalk_frames.setdefault(name, []).append(path.stem)
+                    continue
+                trimmed_px += int(mask.sum() - blade.sum())
+                folder = out_dir / "masks" / "leaf_instances" / name
                 folder.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(folder / f"{path.stem}.png"),
-                            _paste(mask, box, full_h, full_w).astype(np.uint8) * 255)
-                instance_frames.setdefault(f"{instance_prefix}{obj_id}", []).append(path.stem)
+                            _paste(blade, box, full_h, full_w).astype(np.uint8) * 255)
+                instance_frames.setdefault(name, []).append(path.stem)
 
         per_frame_stats.append(stats)
 
@@ -570,8 +622,16 @@ def segment_sequence_sam3(
     stem_areas = [s["stem_area_px"] for s in per_frame_stats]
     plant_areas = [s["plant_area_px"] for s in per_frame_stats]
     share = (100.0 * sum(stem_areas) / sum(plant_areas)) if sum(plant_areas) else 0.0
-    print(f"  masks/{STEM_MASK_DIR}: plant minus leaf/holder/root, median "
-          f"{int(np.median(stem_areas))} px, {share:.1f}% of the plant mask")
+    print(f"  masks/{STEM_MASK_DIR}: plant minus leaf/holder/root"
+          + (f", plus the stem session" if prompts.stem else "")
+          + f", median {int(np.median(stem_areas))} px, {share:.1f}% of the plant mask")
+    if prompts.stem and save_instances:
+        print(f"  leaf instances: {trimmed_px} px of stalk trimmed off blades; "
+              f"{sum(len(v) for v in stalk_frames.values())} leaf mask(s) not written because "
+              f"they lay on a stalk"
+              + (": " + ", ".join(f"{k} ({len(v)} frame{'s' if len(v) > 1 else ''})"
+                                  for k, v in sorted(stalk_frames.items())[:8])
+                 if stalk_frames else ""))
     if missed_leaf_frames:
         print(f"  WARNING: on {len(missed_leaf_frames)} frame(s) the residual holds one "
               f"component larger than {MISSED_LEAF_FRACTION:.0%} of the plant mask.")
@@ -590,6 +650,9 @@ def segment_sequence_sam3(
     payload["stem_residual"] = {
         "share_of_plant_percent": round(share, 2),
         "frames_with_a_leaf_sized_component": missed_leaf_frames,
+        "stem_session": bool(prompts.stem),
+        "leaf_pixels_trimmed_as_stalk": trimmed_px,
+        "leaf_masks_dropped_as_stalk": stalk_frames,
     }
     if instance_frames:
         payload["leaf_instances"] = {str(k): v for k, v in sorted(instance_frames.items())}

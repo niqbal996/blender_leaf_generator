@@ -45,7 +45,12 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from scipy.spatial import cKDTree
 
+from pose_estimator import stem_tree
 from pose_estimator.leaf import resample_by_arclength, smooth_polyline
+
+# A petiole path that runs through this many consecutive nodes of another leaf
+# has crossed that leaf's blade (see `trace`).
+CROSSING_NODES = 3
 
 # Sentinels shared with cli/leaf_instances.py.
 UNSEEN = -1
@@ -154,6 +159,36 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
 
     distance, predecessor = dijkstra(graph, indices=start, return_predecessors=True)
 
+    # The stem, once, and each petiole only from where its leaf's path leaves
+    # it. Drawing each leaf's whole crown-to-leaf path as its "petiole", as
+    # this used to, drew the stem once per leaf: a bundle of lines from the
+    # crown to every leaf. Which plants *have* a stem is P5's --architecture,
+    # not something to infer: a rosette's leaves meet at the crown and keep
+    # their whole paths as petioles.
+    #
+    # Otherwise the stem is the branched tree of the stem cloud (`stem_tree`):
+    # a main stem, its branches, and the stalks that end in one leaf, which
+    # are that leaf's petiole. The single crown-to-highest-stem path this
+    # replaced was one curve through a tree -- 92 mm of vogelmeere's 340 --
+    # and every leaf on a side branch measured its petiole from it.
+    tree = None
+    if architecture != "rosette":
+        tree = stem_tree.build(local[labels == SKELETON], crown, voxel * max_edge_voxels)
+    axes_out, axis_lines, petiole_axis = [], [], {}
+    if tree is not None and tree.axes:
+        stem_tree.classify_petioles(tree, local[labels >= 0], labels[labels >= 0],
+                                    voxel * max_edge_voxels)
+        axis_lines = tree.polylines()
+        axes_out = [axis.to_dict(line, i) for i, (axis, line) in enumerate(zip(tree.axes, axis_lines))]
+        for axis, line in zip(tree.axes, axis_lines):
+            if axis.kind == "petiole":
+                # A leaf whose stalk split in two keeps the longer.
+                if _length(line) > _length(petiole_axis.get(axis.leaf, np.zeros((0, 3)))):
+                    petiole_axis[axis.leaf] = line
+        stem = _tidy(axis_lines[0], samples, 0) if len(axis_lines[0]) >= 2 else axis_lines[0]
+    else:
+        stem = np.zeros((0, 3))
+
     leaves, unreachable, dropped_because = [], [], {}
     traced = []                              # (leaf_id, members, attachment, midrib nodes, tip)
     for leaf_id in sorted({int(v) for v in np.unique(labels) if v >= 0}):
@@ -181,47 +216,72 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
         midrib_nodes, tip_local = inside
         traced.append((leaf_id, attachment, midrib_nodes, tip_local, len(members)))
 
-    # The stem, once, and each petiole only from where its leaf's path leaves
-    # it. Drawing each leaf's whole crown-to-leaf path as its "petiole", as
-    # this used to, drew the stem once per leaf: a bundle of lines from the
-    # crown to every leaf. Which plants *have* a stem is P5's --architecture,
-    # not something to infer: a rosette's leaves meet at the crown and keep
-    # their whole paths as petioles; otherwise the stem climbs from the crown
-    # to the highest stem tissue the crown reaches.
-    stem_nodes = (np.zeros(0, int) if architecture == "rosette"
-                  else _stem_path(predecessor, distance, labels, local))
-    on_stem = set(int(n) for n in stem_nodes)
-    stem = (_tidy(local[stem_nodes], samples, smooth_iterations) if len(stem_nodes) >= 2
-            else np.zeros((0, 3)))
 
     # A carved stem is thick, and inside it the shortest-path tree splits
     # into side-by-side lanes: a leaf reached through a neighbouring lane
     # leaves the trunk low and climbs *inside* the stem, which drew as
-    # parallel lines up the stem. So a petiole is trimmed geometrically too:
-    # it starts at the last point of its path that is still within the stem's
-    # own thickness, measured on the lower stem rather than set from the grid.
-    stem_radius = _stem_radius(local, labels, stem)
-    stem_tree = cKDTree(_densify(stem)) if len(stem) >= 2 else None
+    # parallel lines up the stem. So a petiole without a stalk of its own
+    # starts at the last point of its path still inside a stem or branch --
+    # within 1.5x the stem's measured radius of their centre lines. That
+    # radius used to be measured around the lower trunk, which on a plant
+    # branching low takes in the branches: 51 mm on vogelmeere, every leaf
+    # base "inside the stem", and every petiole empty.
+    trunk_lines = [line for axis, line in zip(tree.axes, axis_lines) if axis.kind != "petiole"] \
+        if tree is not None else []
+    stem_finder = cKDTree(np.vstack([_densify(line) for line in trunk_lines])) if trunk_lines else None
+    stem_radius = 1.5 * tree.radius if tree is not None else 0.0
 
     for leaf_id, attachment, midrib_nodes, tip_local, n_members in traced:
-        # The petiole: from where this leaf's path leaves the stem to the
-        # leaf. Nodes of this same leaf are dropped from it so a blade the
-        # path grazed on the way does not get counted twice.
-        approach = _walk_back(predecessor, attachment)
-        shared = 0
-        while shared < len(approach) and int(approach[shared]) in on_stem:
-            shared += 1
-        start_at = max(shared - 1, 0)
-        if stem_tree is not None and stem_radius > 0:
-            inside = np.flatnonzero(stem_tree.query(local[approach])[0] <= stem_radius)
-            if len(inside):
-                start_at = max(start_at, int(inside[-1]))
-        branch = approach[start_at:]
-        petiole_nodes = branch[labels[branch] != leaf_id]
-
         midrib = _tidy(local[midrib_nodes], samples, smooth_iterations)
-        petiole = (_tidy(local[petiole_nodes], max(samples // 2, 4), smooth_iterations)
-                   if len(petiole_nodes) >= 2 else np.zeros((0, 3)))
+        stalk, cut = petiole_axis.get(leaf_id), None
+        if stalk is not None:
+            # Where the stalk ends on this leaf's midrib. SAM3's leaf mask often
+            # takes in the petiole, so the traced midrib can start back at the
+            # stem and run out along the stalk; the blade starts where the
+            # stalk ends. A stalk ending nowhere near the midrib is not this
+            # leaf's after all, and neither is one ending near the tip: that is
+            # stem tissue escorting the blade along its length, not a petiole
+            # ending where the blade begins. The path rule below decides those.
+            gaps = np.linalg.norm(midrib - stalk[-1], axis=1)
+            at = int(np.argmin(gaps))
+            if gaps[at] <= 2.0 * tree.shell and \
+                    _length(midrib[at:]) >= 0.3 * _length(midrib):
+                cut = at
+        if cut is not None:
+            if len(midrib) - cut >= 2 and _length(midrib[cut:]) > 0:
+                midrib = _tidy(midrib[cut:], samples, 0)
+            petiole = _tidy(np.vstack([stalk, midrib[:1]]), max(samples // 2, 4), 0)
+        else:
+            # No stalk of its own: the stretch of this leaf's path that leads
+            # into it. Walking back from the leaf, it ends at a stem or branch
+            # -- or where the path crossed another leaf's blade. Leaves touching
+            # a neighbour are often reached *through* it: on vogelmeere the
+            # shortest paths to leaves 8, 9 and 37 climbed leaf 6's stalk and
+            # crossed 11-12 nodes of its blade, and each drew a copy of leaf
+            # 6's petiole. A leaf reached only through a neighbour gets no
+            # petiole rather than its neighbour's.
+            #
+            # A crossing, not a graze: a run of CROSSING_NODES. Leaf clouds
+            # carry stray specks, and the good petioles there met none or 2.
+            # Another leaf's *stalk* is no evidence either way -- stalk ends
+            # sit in crowds of blades, 2-3 leaves within 1 mm, and stopping at
+            # them cut 6 good petioles. Nodes of this same leaf are dropped so
+            # a blade the path grazed on the way does not count twice.
+            approach = _walk_back(predecessor, attachment)
+            start_at = 0
+            on_trunk = np.zeros(len(approach), bool)
+            if stem_finder is not None and stem_radius > 0:
+                on_trunk = stem_finder.query(local[approach])[0] <= stem_radius
+            on_path = labels[approach]
+            stop = on_trunk | _runs(((on_path >= 0) & (on_path != leaf_id)), CROSSING_NODES)
+            last = np.flatnonzero(stop)
+            if len(last):
+                # From the stem's surface, or from just past the neighbour.
+                start_at = int(last[-1]) + (0 if on_trunk[last[-1]] else 1)
+            branch = approach[start_at:]
+            petiole_nodes = branch[labels[branch] != leaf_id]
+            petiole = (_tidy(local[petiole_nodes], max(samples // 2, 4), smooth_iterations)
+                       if len(petiole_nodes) >= 2 else np.zeros((0, 3)))
         base = midrib[0]
         tip = local[tip_local]
         leaves.append({
@@ -233,11 +293,14 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
             "petiole": petiole.round(6).tolist(),
             "midrib_length": float(_length(midrib)),
             "petiole_length": float(_length(petiole)),
+            "petiole_from": "stalk" if cut is not None else "path",
             "midrib_points": int(len(midrib_nodes)),
             "height": float(tip[2]),
         })
 
     return {"crown": [float(v) for v in crown], "stem": stem.round(6).tolist(), "leaves": leaves,
+            "axes": axes_out,
+            "stem_tree": tree.summary() if tree is not None else None,
             "unreachable": unreachable, "crown_moved_to_largest_component": moved,
             "graph_components": int(n_parts), "dropped_because": dropped_because}
 
@@ -249,45 +312,6 @@ def _densify(line: np.ndarray, per_segment: int = 8) -> np.ndarray:
     t = np.linspace(0.0, 1.0, per_segment, endpoint=False)
     pieces = [a + (b - a) * t[:, None] for a, b in zip(line[:-1], line[1:])]
     return np.vstack(pieces + [line[-1:]])
-
-
-def _stem_radius(points: np.ndarray, labels: np.ndarray, stem: np.ndarray) -> float:
-    """How thick the stem is in this cloud, measured where it is surely stem.
-
-    The lower third of the trunk carries no petioles yet, so the stem tissue
-    around it is stem alone: 1.5x the 90th-percentile distance of that tissue
-    from the trunk line covers its thickness without reaching the leaves.
-    """
-    if len(stem) < 2:
-        return 0.0
-    dense = _densify(stem)
-    low = dense[: max(len(dense) // 3, 2)]
-    tissue = points[labels == SKELETON]
-    if not len(tissue):
-        return 0.0
-    near_low, _ = cKDTree(low).query(tissue)
-    near_all, _ = cKDTree(dense).query(tissue)
-    z_top = low[:, 2].max()
-    around = tissue[(near_low <= near_all + 1e-12) & (tissue[:, 2] <= z_top)]
-    if len(around) < 10:
-        return 0.0
-    d, _ = cKDTree(low).query(around)
-    return 1.5 * float(np.percentile(d, 90))
-
-
-def _stem_path(predecessor: np.ndarray, distance: np.ndarray, labels: np.ndarray,
-               points: np.ndarray) -> np.ndarray:
-    """Crown to the highest stem tissue the crown reaches, along the tree.
-
-    Height is the plant frame's z, which P5 has already made "up". A path
-    rather than a topological trunk: in a carved stem -- a thick tube -- the
-    tree splits into parallel lanes and no single lane carries the leaves.
-    """
-    candidates = np.flatnonzero((labels == SKELETON) & np.isfinite(distance))
-    if not len(candidates):
-        return np.zeros(0, int)
-    apex = int(candidates[np.argmax(points[candidates, 2])])
-    return _walk_back(predecessor, apex)
 
 
 def _within_leaf(graph, members: np.ndarray, attachment: int,
@@ -350,6 +374,17 @@ def _within_leaf(graph, members: np.ndarray, attachment: int,
     if len(nodes) < 2:
         return None
     return members[nodes], int(members[tip])
+
+
+def _runs(flags: np.ndarray, length: int) -> np.ndarray:
+    """`flags`, keeping only the runs of at least `length` consecutive Trues."""
+    out = np.zeros(len(flags), bool)
+    run = 0
+    for i, flag in enumerate(flags):
+        run = run + 1 if flag else 0
+        if run >= length:
+            out[i - length + 1:i + 1] = True
+    return out
 
 
 def _walk_back(predecessor: np.ndarray, node: int) -> np.ndarray:

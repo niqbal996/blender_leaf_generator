@@ -74,6 +74,10 @@ import numpy as np
 WORKDIR = ""
 
 STEM_RGBA = (1.0, 1.0, 1.0, 1.0)          # deliberately not a leaf colour
+# The stem tree (P5x): branches orange and petioles pale green, so "is this
+# stalk a branch or one leaf's petiole?" can be answered by looking.
+BRANCH_RGBA = (1.0, 0.55, 0.12, 1.0)
+PETIOLE_RGBA = (0.62, 0.95, 0.50, 1.0)
 # The two ends of the stem line, drawn as balls in colours nothing else uses,
 # so "is the crown in the right place?" can be answered by looking.
 CROWN_RGBA = (1.0, 0.85, 0.10, 1.0)       # yellow: foot of the stem, above the root
@@ -691,15 +695,19 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True,
         add_sphere(stem[0], f"{prefix}plant_crown", STEM_RGBA, stem_radius * 2.5,
                    collection("plant_stem"))
 
-    chords = xform(np.array(graph.get("chords_xyz") or []).reshape(-1, 24, 3)) \
-        if graph.get("chords_xyz") else np.zeros((0, 24, 3))
-    if len(chords):
-        # Straight tip-to-base reference lines. A midrib that wanders is
-        # obvious beside one; alone it just looks like a curve.
-        chord_group = collection("plant_chords")
-        for i, chord in enumerate(chords):
-            add_curve(chord, f"{prefix}chord_{i:02d}", (0.75, 0.75, 0.75, 1.0),
-                      leaf_radius * 0.35, chord_group)
+    # The rest of the stem tree: branches, and the stalks that carry one leaf
+    # each. P5 builds the same tree from its stem points that P5x builds from
+    # its own; the main stem is plant_stem_line above. Older stem_graph.json
+    # files have no "axes" and draw as before.
+    for axis in graph.get("axes") or []:
+        line = xform(np.asarray(axis["points"], float))
+        if axis.get("kind") == "stem" or len(line) < 2:
+            continue
+        branch = axis["kind"] == "branch"
+        add_curve(line, f"{prefix}plant_{axis['kind']}_{axis['id']:02d}",
+                  BRANCH_RGBA if branch else PETIOLE_RGBA,
+                  stem_radius * (0.6 if branch else 0.35),
+                  collection("plant_branches" if branch else "plant_petioles"))
 
     midribs = collection("plant_midribs")
     tips = collection("plant_tips")
@@ -764,8 +772,8 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True,
     print("[plant] this is the P5 scene (crown -> tips -> geodesic midribs). For one")
     print("[plant] object per leaf from SAM3's own 2D ids, re-run with --p5x.")
     print(f"[plant] collections: {prefix}plant_cloud, {prefix}plant_root, "
-          f"{prefix}plant_stem_cloud, {prefix}plant_stem, {prefix}plant_midribs, "
-          f"{prefix}plant_tips")
+          f"{prefix}plant_stem_cloud, {prefix}plant_stem, {prefix}plant_branches, "
+          f"{prefix}plant_petioles, {prefix}plant_midribs, {prefix}plant_tips")
     # Bounds of what was actually drawn, not of what was loaded. `place` scales
     # the branch and moves it along the row, so the raw bounds describe a plant
     # that is no longer where this says it is -- and the comparison frames the
@@ -835,7 +843,10 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True):
                         name=f"p5x_leaf_{leaf_id:03d}")
         drawn += 1
 
-    for value, name, coll in ((SKELETON, "p5x_skeleton", "p5x_skeleton"),
+    # Label -2 is the tissue that voted "stem" -- the stem cloud, the same
+    # points P5 draws as plant_stem_cloud. It was drawn as "p5x_skeleton",
+    # which read as the skeleton itself; the skeleton is the curves below.
+    for value, name, coll in ((SKELETON, "p5x_stem_cloud", "p5x_stem_cloud"),
                               (ROOT, "p5x_root", "p5x_root")):
         keep = label == value
         if keep.any():
@@ -863,7 +874,7 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True):
                 drawn_ribs += 1
             petiole = np.asarray(leaf.get("petiole") or [], float)
             if len(petiole) >= 2:
-                add_curve(petiole, f"p5x_petiole_{leaf['id']:03d}", STEM_RGBA,
+                add_curve(petiole, f"p5x_petiole_{leaf['id']:03d}", PETIOLE_RGBA,
                           point_radius * 1.3, petioles)
             add_sphere(np.asarray(leaf["tip"], float), f"p5x_tip_{leaf['id']:03d}",
                        TIP_RGBA, point_radius * 3.0, tips)
@@ -872,6 +883,19 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True):
         stem = np.asarray(graph.get("stem") or [], float)
         if len(stem) >= 2:
             add_curve(stem, "p5x_stem", STEM_RGBA, point_radius * 2.2, _collection("p5x_stem"))
+        # The branches of the stem tree, thinner with each order. A stalk that
+        # carries one leaf is that leaf's petiole and is drawn with it above.
+        branches = [a for a in graph.get("axes") or [] if a.get("kind") == "branch"]
+        for axis in branches:
+            line = np.asarray(axis["points"], float)
+            if len(line) >= 2:
+                add_curve(line, f"p5x_branch_{axis['id']:02d}_order{axis['order']}", BRANCH_RGBA,
+                          point_radius * max(1.9 - 0.3 * axis["order"], 1.0),
+                          _collection("p5x_branches"))
+        if graph.get("stem_tree"):
+            tree = graph["stem_tree"]
+            print(f"[plant] stem tree: {len(branches)} branches, "
+                  f"{tree['axes'].get('petiole', 0)} leaf stalks, {tree['forks']} forks")
         crown = graph.get("crown")
         if crown:
             add_sphere(np.asarray(crown, float), "p5x_crown", CROWN_RGBA,
@@ -886,7 +910,7 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True):
         print("[plant] Re-run pose-leaf-instances to trace midribs and tips.")
 
     print(f"[plant] P5x: {drawn} leaves, "
-          f"{int((label == SKELETON).sum())} skeleton points, "
+          f"{int((label == SKELETON).sum())} stem-cloud points, "
           f"{int((label == ROOT).sum())} root points")
     print("[plant] each leaf is its own object under the 'p5x_leaves' collection")
     print("[plant] if everything looks grey, the viewport is in Solid shading with")
@@ -930,6 +954,14 @@ def build_skeleton2d(path, point_radius=None, frame=True, clear=False):
     stem = np.asarray(graph.get("stem") or [], float)
     if len(stem) >= 2:
         add_curve(stem, "s2d_stem", STEM_RGBA, point_radius * 2.4, _collection("s2d_stem"))
+    # On a plant profiled "stem_tree" (vogelmeere) the stem is P5x's tree and
+    # its branches come along; petioles join them rather than the main stem.
+    for axis in graph.get("axes") or []:
+        line = np.asarray(axis["points"], float)
+        if axis.get("kind") == "branch" and len(line) >= 2:
+            add_curve(line, f"s2d_branch_{axis['id']:02d}_order{axis['order']}", BRANCH_RGBA,
+                      point_radius * max(2.0 - 0.3 * axis["order"], 1.0),
+                      _collection("s2d_branches"))
     ribs, petioles, tips = (_collection("s2d_midribs"), _collection("s2d_petioles"),
                             _collection("s2d_tips"))
     for leaf in graph.get("leaves", []):

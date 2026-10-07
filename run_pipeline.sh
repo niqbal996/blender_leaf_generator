@@ -208,24 +208,24 @@
 #
 # Plant architecture. P5 splits leaves by how far into them you can travel
 # from the plant's base, so it needs a base to start from -- and which kind
-# you have is a property of the specimen, so you pass it in:
+# you have is a property of the specimen. By default it comes from the plant
+# profile the specimen folder names (src/pose_estimator/plant_profiles.py):
+# vogelmeere_21, gaensefuss_1 -> caulescent; sugarbeet_2, thistle3 -> rosette;
+# any other name -> caulescent. The profile also carries the per-plant
+# skeleton rules (how petioles are found). Pass it to override:
 #
-#   --architecture upright      (default) a central stem with leaves branching
-#                               off it; leaf depth is measured out from the
-#                               stem tissue P4c labelled. "caulescent" is the
-#                               old name for this and still works.
-#   --architecture caulescent   (deprecated alias for upright); leaf
-#                               depth is measured from the stem tissue P4c
-#                               labelled
+#   --architecture caulescent   leaves on a stem and its branches; leaf depth
+#                               is measured out from the stem tissue P4c
+#                               labelled. "upright" is the same thing.
 #   --architecture rosette      leaves radiate from a crown at ground level
 #                               and there is no stem at all (thistle, sugar
 #                               beet); the crown is located from the geometry
 #                               and stem labels are ignored
 #
 # Run a rosette as caulescent and P5 reports 0 contact points, 0 tips and 0
-# leaves: there is nothing to seed the depth field from. It is not inferred --
-# an earlier version guessed and flipped thistle1 from crown to stem purely
-# because P4c had started labelling the crown "stem".
+# leaves: there is nothing to seed the depth field from. It is not inferred
+# from the geometry -- an earlier version guessed and flipped thistle1 from
+# crown to stem purely because P4c had started labelling the crown "stem".
 #
 # GPU. P4b (gsplat) and P4c (DINOv3/SAM2) always use the GPU. P3 is the
 # exception: COLMAP's SIFT extraction runs on the CPU unless pycolmap was
