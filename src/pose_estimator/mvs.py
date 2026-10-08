@@ -77,7 +77,12 @@ def prepare(workdir: Path, out: Path, hull: np.ndarray, source_root: Optional[Pa
         cam = rec.cameras[cid]
         originals[cid] = (cam.width, cam.height)
         cam.rescale(int(round(cam.width * up)), int(round(cam.height * up)))
-    rec.delete_all_points2D_and_points3D()
+    # pycolmap-cuda 3.13.0.dev2 (the cluster's) lacks delete_all_points2D_and_points3D
+    if hasattr(rec, "delete_all_points2D_and_points3D"):
+        rec.delete_all_points2D_and_points3D()
+    else:
+        for pid in list(rec.points3D.keys()):
+            rec.delete_point3D(pid)
     rec.write(str(model_dir))
     cam0 = rec.cameras[next(iter(ups))]
     log(f"  model rescaled x{next(iter(ups.values())):.3f} to the originals "
@@ -171,6 +176,16 @@ def patch_match(out: Path, info: dict, window_radius: int = 5, iterations: int =
     pycolmap.patch_match_stereo(str(out / "dense"), options=opts)
 
 
+def _pca_normals(points: np.ndarray, k: int = 12) -> np.ndarray:
+    from scipy.spatial import cKDTree
+
+    if len(points) < 3:
+        return np.zeros_like(points)
+    _, nb = cKDTree(points).query(points, k=min(k, len(points)))
+    c = points[nb] - points[nb].mean(axis=1, keepdims=True)
+    return np.linalg.eigh(np.einsum("nki,nkj->nij", c, c))[1][:, :, 0]
+
+
 def fuse(out: Path, info: dict, hull: np.ndarray, p3_focal: float, min_num_pixels: int = 3,
          hull_slack_px: float = 6.0, log=print):
     """Steps 5-6: fused points restricted to the plant. Returns (points, normals, colours, stats)."""
@@ -184,17 +199,34 @@ def fuse(out: Path, info: dict, hull: np.ndarray, p3_focal: float, min_num_pixel
     opts.min_num_pixels = int(min_num_pixels)
     opts.bounding_box = (np.asarray(info["bbox"][0], np.float32), np.asarray(info["bbox"][1], np.float32))
     fused = out / "fused.ply"
-    pycolmap.stereo_fusion(str(fused), str(out / "dense"), input_type="geometric", options=opts,
-                           output_type="PLY")
-    f = read_ply_vertices(fused)
-    pts = np.stack([f["x"], f["y"], f["z"]], 1).astype(np.float64)
-    nrm = np.stack([f["nx"], f["ny"], f["nz"]], 1).astype(np.float64)
-    col = np.stack([f["red"], f["green"], f["blue"]], 1).astype(np.uint8)
-
+    if fused.exists():
+        fused.unlink()
+    try:                                  # pycolmap 4.x writes the PLY itself
+        result = pycolmap.stereo_fusion(str(fused), str(out / "dense"), input_type="geometric",
+                                        options=opts, output_type="PLY")
+    except TypeError:                     # 3.13 has no output_type and returns a model
+        result = pycolmap.stereo_fusion(str(fused), str(out / "dense"), input_type="geometric",
+                                        options=opts)
+    if fused.exists() and fused.is_file():
+        f = read_ply_vertices(fused)
+        pts = np.stack([f["x"], f["y"], f["z"]], 1).astype(np.float64)
+        nrm = np.stack([f["nx"], f["ny"], f["nz"]], 1).astype(np.float64)
+        col = np.stack([f["red"], f["green"], f["blue"]], 1).astype(np.uint8)
+    else:
+        # the returned model carries points and colours but no normals:
+        # local PCA, flipped to face the nearest camera below
+        ps = list(result.points3D.values())
+        pts = np.array([q.xyz for q in ps], np.float64).reshape(-1, 3)
+        col = np.array([q.color for q in ps], np.uint8).reshape(-1, 3)
+        nrm = _pca_normals(pts)
     und = pycolmap.Reconstruction(str(out / "dense" / "sparse"))
     centres = np.array([-_w2c(im)[:3, :3].T @ _w2c(im)[:3, 3] for im in und.images.values()])
     # the plant is small next to the camera distance: one depth serves the bound
     depth = float(np.median(np.linalg.norm(centres - hull.mean(0), axis=1)))
+    if len(pts):
+        # orient normals towards the nearest camera (PCA ones have no sign)
+        near = centres[cKDTree(centres).query(pts)[1]]
+        nrm *= np.where(np.einsum("ij,ij->i", nrm, near - pts) < 0, -1.0, 1.0)[:, None]
     d_hull, _ = cKDTree(hull).query(pts)
     keep = d_hull <= hull_slack_px * depth / p3_focal
     stats = {"fused": int(len(pts)), "inside_hull_bound": int(keep.sum())}
