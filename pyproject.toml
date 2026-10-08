@@ -231,6 +231,9 @@ pose-geometry = "pose_estimator.cli.geometry:main"    # P3 learned backends + co
 pose-compare-geometry = "pose_estimator.cli.compare_geometry:main" # re-score P3 experiments
 pose-hull = "pose_estimator.cli.hull:main"            # P4a
 pose-surface = "pose_estimator.cli.surface:main"      # P4b
+# fine_pc: finer clouds for the heart, next to P4a/P4b (which stay as baselines)
+pose-mvs = "pose_estimator.cli.mvs:main"              # P4m: PatchMatch MVS, full res
+pose-gs-surface = "pose_estimator.cli.gs_surface:main"  # P4g: 2DGS, full res
 pose-pick-seeds = "pose_estimator.cli.pick_seeds:main" # P4c seed picker (GUI)
 pose-classify = "pose_estimator.cli.classify:main"    # P4c stage 1
 pose-fuse = "pose_estimator.cli.fuse:main"            # P4c stage 2

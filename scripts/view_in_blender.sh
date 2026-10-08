@@ -24,6 +24,13 @@
 #
 #   ./scripts/view_in_blender.sh runs/plant_9 --p5x --skeleton2d runs/<specimen>_skeleton2d
 #
+# The geometry phases' point clouds of one plant side by side -- the P4a hull
+# and P4b surface baselines next to P4m (MVS) and P4g (2DGS) -- in the same
+# units and plant frame:
+#
+#   ./scripts/view_in_blender.sh runs/plant_9 --clouds
+#   ./scripts/view_in_blender.sh runs/plant_9 --clouds p4b,p4g
+#
 # Blender inside WSL is the awkward option here: Ubuntu 20.04 ships a
 # libwayland-client too old for recent Blender builds, and Mesa 21.2's d3d12
 # driver predates the OpenGL 4.3 that Blender needs, so the GUI falls back and
@@ -92,6 +99,11 @@ main() {
             # looks exactly like P5x not working.
             --p5x)
                 SCRIPT_ARGS+=("$1"); shift ;;
+            # The geometry phases' clouds side by side (P4a, P4b, P4m, P4g),
+            # or the comma list given: same units, same plant frame.
+            --clouds)
+                if [[ $# -ge 2 && "$2" != -* ]]; then SCRIPT_ARGS+=("$1" "$2"); shift 2
+                else SCRIPT_ARGS+=("$1" "p4a,p4b,p4m,p4g"); shift; fi ;;
             # The 2D-built skeleton (scripts/skeleton_2d.py): its folder or
             # skeleton.json, translated like the workdir. With --p5x it is
             # drawn over the P5x scene; alone, it is drawn by itself.

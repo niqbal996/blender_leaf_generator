@@ -330,7 +330,10 @@ def _matches_colour(rgb, target, tolerance=1.5 / 255.0):
 
 def add_point_cloud(xyz, rgb, radius, into, name="plant_cloud", material=None):
     mesh = bpy.data.meshes.new(f"{name}_points")
-    mesh.from_pydata([tuple(p) for p in xyz], [], [])
+    # bulk upload: from_pydata walks a Python list of tuples, which takes
+    # minutes on the multi-million-point clouds P4m/P4g write
+    mesh.vertices.add(len(xyz))
+    mesh.vertices.foreach_set("co", np.asarray(xyz, np.float32).ravel())
     mesh.update()
 
     layer = mesh.color_attributes.new(name="Color", type="FLOAT_COLOR", domain="POINT")
@@ -1158,6 +1161,90 @@ def hide_splash():
         pass          # a Blender build without the preference is not worth failing over
 
 
+# The point clouds the geometry phases write, for --clouds. P4a/P4b are the
+# baselines; P4m (MVS) and P4g (2DGS) are the fine_pc branch's attempts at
+# the heart. (path under the workdir, colour when the file carries none)
+CLOUD_VARIANTS = {
+    "p4a": ("p4/hull_points.ply", (0.55, 0.55, 0.55)),
+    "p4b": ("p4b/surface.ply", (0.45, 0.65, 0.85)),
+    "p4m": ("p4m/surface.ply", (0.85, 0.65, 0.35)),
+    "p4g": ("p4g/surface.ply", (0.40, 0.80, 0.45)),
+}
+
+
+def _cloud_spacing(workdir, name, xyz):
+    """A point radius that suits each cloud's own density."""
+    try:
+        if name == "p4a":
+            with open(Path(workdir) / "p4" / "hull.json") as f:
+                return 0.5 * float(json.load(f)["voxel_size"])
+        if name == "p4g":
+            with open(Path(workdir) / "p4g" / "p4g.json") as f:
+                return 0.6 * float(json.load(f)["extraction"]["consolidation_voxel"])
+    except (OSError, KeyError, ValueError):
+        pass
+    extent = float((xyz.max(axis=0) - xyz.min(axis=0)).max())
+    return extent * 0.0006
+
+
+def build_clouds(workdir, names, gap=1.2, max_points=4_000_000, frame=True):
+    """The geometry phases' point clouds of one plant, side by side, left to right.
+
+    All of them are in P3's units and are put in P5's upright plant frame, so
+    they are drawn at their true relative size and heading -- nothing is
+    normalised, unlike --compare, whose branches each have their own scale.
+    A cloud larger than `max_points` is subsampled for the viewport and says so.
+    """
+    _PREPARED.clear()
+    clear_startup_scene()
+    workdir = Path(workdir)
+    frame_json = workdir / "p5" / "stem_graph.json"
+    origin, rotation = np.zeros(3), np.eye(3)
+    if frame_json.exists():
+        with open(frame_json) as f:
+            pf = json.load(f)["plant_frame"]
+        origin, rotation = np.asarray(pf["origin"], float), np.asarray(pf["rotation"], float)
+    else:
+        print(f"[plant] NOTE: no {frame_json}; clouds drawn in COLMAP's frame")
+    clouds = []
+    for name in names:
+        rel, fallback = CLOUD_VARIANTS.get(name, (name, (0.8, 0.8, 0.8)))
+        path = workdir / rel
+        if not path.exists():
+            print(f"[plant] NOTE: {name}: {path} not found -- skipped")
+            continue
+        xyz, rgb, _ = read_ply(path)
+        n = len(xyz)
+        if not np.any(np.abs(rgb - 0.7) > 1e-6):
+            rgb = np.tile(fallback, (n, 1))
+        if n > max_points:
+            pick = np.random.default_rng(0).choice(n, max_points, replace=False)
+            xyz, rgb = xyz[pick], rgb[pick]
+            print(f"[plant] {name}: {n:,} points, {max_points:,} drawn")
+        clouds.append((name, (xyz - origin) @ rotation.T, rgb, n, _cloud_spacing(workdir, name, xyz)))
+    if not clouds:
+        print("[plant] ERROR: none of " + ", ".join(names) + " found under " + str(workdir))
+        return None
+    lo = np.min([c[1].min(axis=0) for c in clouds], axis=0)
+    hi = np.max([c[1].max(axis=0) for c in clouds], axis=0)
+    width = float(hi[0] - lo[0])
+    centre = (lo + hi) / 2.0
+    for index, (name, xyz, rgb, n, radius) in enumerate(clouds):
+        offset = np.array([index * width * gap, 0.0, 0.0]) - [centre[0], 0.0, 0.0]
+        coll = _collection(f"cloud_{name}")
+        add_point_cloud(xyz + offset, rgb, radius, coll, name=f"cloud_{name}")
+        add_label(f"{name}  ({n:,} pts)", (offset[0] + centre[0], centre[1], lo[2] - width * 0.12),
+                  width * 0.06, _collection("cloud_labels"), f"label_{name}")
+        print(f"[plant] {name:<4} {n:>10,} points, radius {radius:.5f}, at x={offset[0]:.3f}")
+    if frame:
+        span = np.array([width * gap * (len(clouds) - 1) + width, hi[1] - lo[1], hi[2] - lo[2]])
+        mid = np.array([width * gap * (len(clouds) - 1) / 2.0, centre[1], centre[2]])
+        frame_view(mid, float(span.max()))
+    print("[plant] left to right: " + ", ".join(c[0] for c in clouds)
+          + " -- same units and plant frame, no normalisation")
+    return clouds
+
+
 def main():
     hide_splash()
     target = resolve_workdir(list(sys.argv))
@@ -1174,8 +1261,13 @@ def main():
                 or os.environ.get("PLANT_P5X", "") not in ("", "0"))
     skeleton2d = _after(script_args(list(sys.argv)), "--skeleton2d",
                         os.environ.get("PLANT_SKELETON2D", ""))
+    clouds = _after(script_args(list(sys.argv)), "--clouds", os.environ.get("PLANT_CLOUDS", ""))
+    if "--clouds" in script_args(list(sys.argv)) and (not clouds or clouds.startswith("--")):
+        clouds = ",".join(CLOUD_VARIANTS)
     try:
-        if skeleton2d and not want_p5x:
+        if clouds:
+            build_clouds(target, [c for c in clouds.split(",") if c])
+        elif skeleton2d and not want_p5x:
             build_skeleton2d(skeleton2d, clear=True)
         elif want_p5x:
             built = build_p5x(target)
