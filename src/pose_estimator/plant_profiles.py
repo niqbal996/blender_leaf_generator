@@ -51,13 +51,20 @@ class PlantProfile:
     # meet at a crown at ground level, no stem).
     architecture: str
     # How skeleton_2d places each petiole:
-    #   "stem_tree"  follow the stem cloud's branched skeleton to the nearest
-    #                axis -- leaves on side branches (vogelmeere)
+    #   "stalk_2d"   traced in the photos: a walk along the stem mask from the
+    #                blade base to the stem tree, fitted in 3D like a midrib
+    #                (petioles_2d) -- leaves on side branches (vogelmeere)
+    #   "stem_tree"  a straight line to the nearest axis of the stem cloud's
+    #                branched skeleton, or its stalk where one ends at the blade
     #   "leaf_axis"  extend the tip->base axis until it meets the one stem
     #                (gaensefuss, agreed 2026-10-05)
-    #   "crown"      a straight line to the crown (rosettes)
+    #   "crown"      rosettes: no petiole at all, each leaf runs from the crown to
+    #                its tip (skeleton_2d decides this from the architecture)
     petiole_rule: str
     # How skeleton_2d tells a 2D leaf mask's base from its tip:
+    #   "stalk"         the base is where the trimmed stalk meets the blade, the
+    #                   tip the blade point farthest from it. For broad blades,
+    #                   whose longest path runs corner to corner (vogelmeere).
     #   "stem_contact"  the base is the end touching the stem mask. Needed on a
     #                   bushy plant, where overlapping blades make shortcuts
     #                   through the plant mask and the foot rule flips.
@@ -69,7 +76,7 @@ class PlantProfile:
 
 PROFILES = {
     "vogelmeere": PlantProfile(
-        "vogelmeere", CAULESCENT, petiole_rule="stem_tree", base_rule="stem_contact",
+        "vogelmeere", CAULESCENT, petiole_rule="stalk_2d", base_rule="stalk",
         note="chickweed: branched shoots, opposite leaves, long petioles low down"),
     "gaensefuss": PlantProfile(
         "gaensefuss", CAULESCENT, petiole_rule="leaf_axis", base_rule="foot",

@@ -63,17 +63,35 @@ MM_PER_UNIT = 112.8
 # sugarbeet_x_1 pass 2: 8 mm tags at ~110 px in 6000 px frames, f ~8200 px.
 # A seed only -- it sets the first fit's merge thresholds, not the answer.
 RIG_CAMERA_MM = 600.0
-# One leaf's tip estimates spread a few mm with the view; SAM3 id swaps
-# measured 13-40 mm. Pieces closer than this are one leaf.
-SAME_LEAF_TIP = 10.0 / MM_PER_UNIT
+# A leaf's identity is the centre of its blade, not its tip. Where a mask's
+# ends are unsure -- a broad blade whose longest path runs corner to corner, or
+# tip and base swapped -- every trace of the blade still crosses its middle.
+# On vogelmeere_x_1, 22 of 35 pairs of s2d leaves on one blade had midrib
+# centres < 3.3 mm apart; the closest two distinct blades were 3.3 mm apart.
+# Their tips were 6-25 mm apart, overlapping distinct leaves from 3.2 mm.
+#   SAME_BLADE    within one SAM3 id, two centre models this close are one
+#                 blade (SAM3 id swaps measured 13-40 mm)
+#   CENTRE_TOL    pieces whose 3D midrib centres -- or tips -- are this close,
+#                 and which never claim the same frame, are one leaf. The tip
+#                 catches what the centre misses when SAM3's mask takes in
+#                 part of the stalk in one pass or id and not the other (it
+#                 moves the centre, not the tip): 3 of the 4 extra merges on
+#                 vogelmeere_x_1 had tips 0.0-1.0 mm apart.
+#   REL_TOL       ... or this share of the shorter blade, if larger: one
+#                 blade's centre estimates spread with its size. sugarbeet_x_1
+#                 split 65-72 mm blades into pieces with centres 6.5 mm apart.
+SAME_BLADE = 6.0 / MM_PER_UNIT
+CENTRE_TOL = 3.0 / MM_PER_UNIT
+REL_TOL = 0.15
 SCALE_TOL = 0.02         # flat-lay scale fit has converged when it moves less than this
 
 
 def set_scale(mm_per_unit: float) -> None:
     """Every millimetre threshold in this file follows MM_PER_UNIT."""
-    global MM_PER_UNIT, SAME_LEAF_TIP
+    global MM_PER_UNIT, SAME_BLADE, CENTRE_TOL
     MM_PER_UNIT = float(mm_per_unit)
-    SAME_LEAF_TIP = 10.0 / MM_PER_UNIT
+    SAME_BLADE = 6.0 / MM_PER_UNIT
+    CENTRE_TOL = 3.0 / MM_PER_UNIT
 
 
 def rig_scale(run: Run) -> float:
@@ -161,6 +179,33 @@ def petiole_node(plant, stem, stem_line, base_rc, offset, window=260):
     return [float(c + xs + offset[0]), float(r + ys + offset[1])]
 
 
+def stalk_end(crop: np.ndarray, stem: np.ndarray, x0: int, y0: int, touch: int = 5):
+    """(row, col) in `crop` where the stalk goes into this blade, or None.
+
+    The blade-edge pixels touching the stem mask, and of those the one farthest
+    (through the blade) from the blade's centre: a stalk goes in at an end of
+    the blade, while a stem passing alongside touches its middle. P2's stem
+    session trims the stalk off every leaf mask, so this edge is where it was.
+    """
+    h, w = stem.shape
+    ch, cw = crop.shape
+    pad = 2 * touch
+    X0, Y0 = max(0, x0 - pad), max(0, y0 - pad)
+    X1, Y1 = min(w, x0 + cw + pad), min(h, y0 + ch + pad)
+    m = np.zeros((Y1 - Y0, X1 - X0), bool)
+    m[y0 - Y0:y0 - Y0 + ch, x0 - X0:x0 - X0 + cw] = crop
+    disc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * touch + 1, 2 * touch + 1))
+    ring = (cv2.dilate(m.astype(np.uint8), disc) > 0) & stem[Y0:Y1, X0:X1] & ~m
+    edge = m & (cv2.dilate(ring.astype(np.uint8), disc) > 0)
+    if edge.sum() < 5:
+        return None
+    dt = cv2.distanceTransform(m.astype(np.uint8), cv2.DIST_L2, 5)
+    _, from_centre = _farthest(m, [np.unravel_index(int(np.argmax(dt)), dt.shape)])
+    cand = np.argwhere(edge)
+    r, c = cand[int(np.argmax(from_centre[cand[:, 0], cand[:, 1]]))]
+    return np.array([r - (y0 - Y0), c - (x0 - X0)])
+
+
 def stem_contact(stem: np.ndarray, rc, radius: float) -> int:
     """Stem-mask pixels within `radius` of one end of a leaf mask (full-frame row, col)."""
     r0, c0, rad = int(rc[0]), int(rc[1]), int(np.ceil(radius))
@@ -183,6 +228,13 @@ def extract_2d(run: Run, masks, frames, junk, cache: Path, base_rule: str = "foo
                       on vogelmeere 6 of 10 duplicate leaves were one blade with
                       tip and base swapped. Falls back to "foot" where neither
                       end clearly touches stem.
+      "stalk"         the base is not an end of the longest path at all but
+                      where the trimmed stalk meets the blade (`stalk_end`), and
+                      the tip the blade pixel farthest from it. On a broad blade
+                      with its stalk trimmed off the longest path runs corner to
+                      corner and its ends move with the view: vogelmeere_x_1
+                      split 13 blades into 36 "leaves" that way. Falls back to
+                      "foot" on a mask with no stem contact.
     The cache records the rule it was built with and is rebuilt for another.
     """
     p2_written = run.workdir / "p2" / "prompts.json"
@@ -250,7 +302,12 @@ def extract_2d(run: Run, masks, frames, junk, cache: Path, base_rule: str = "foo
             fb = foot_dist[y0 + b[0] - py0, x0 + b[1] - px0]
             tip_rc, base_rc = (a, b) if fa > fb else (b, a)
             base_by = "foot"
-            if base_rule == "stem_contact":
+            anchored = stalk_end(crop, stem, x0, y0) if base_rule == "stalk" else None
+            if anchored is not None:
+                base_rc = anchored
+                tip_rc, along = _farthest(crop, [base_rc])
+                base_by = "stalk"
+            elif base_rule == "stem_contact":
                 # Around each end, a sixth of the leaf's own length.
                 reach = max(8.0, along.max() / 6.0)
                 ca = stem_contact(stem, (y0 + a[0], x0 + a[1]), reach)
@@ -283,9 +340,9 @@ def extract_2d(run: Run, masks, frames, junk, cache: Path, base_rule: str = "foo
     cache.write_text(json.dumps({"leaves": leaves, "stems": stems, "base_rule": base_rule}))
     print(f"  2D: {len(leaves)} leaf masks and {len(stems)} stem paths over {len(by_frame)} "
           f"frames ({time.time() - t0:.0f}s)")
-    if base_rule == "stem_contact":
-        by_stem = sum(1 for r in leaves if r["base_by"] == "stem")
-        print(f"    base found by stem contact on {by_stem} of {len(leaves)} masks, by the "
+    if base_rule in ("stem_contact", "stalk"):
+        by_stem = sum(1 for r in leaves if r["base_by"] != "foot")
+        print(f"    base found by {base_rule} on {by_stem} of {len(leaves)} masks, by the "
               "foot rule on the rest")
     return leaves, stems
 
@@ -358,56 +415,128 @@ def _spread(views, k: int):
 
 
 def _segments(run: Run, obs, rng, max_models: int = 3):
-    """A SAM3 id split into the pieces that agree on one tip.
+    """A SAM3 id split into the pieces that agree on one blade centre.
 
     SAM3 swaps ids between neighbouring leaves mid-pass: on gaensefuss_1 pass 0,
     pass0_0 follows one leaf for frames 0-8 and another 40 mm away for most of
     the rest. One RANSAC per id keeps the majority leaf and loses the other, and
     two swapped ids land on the same leaf as duplicates. So RANSAC is repeated
-    on what each model leaves over: every piece that agrees on a tip is a leaf
-    candidate of its own.
+    on what each model leaves over: every piece that agrees on a centre is a
+    leaf candidate of its own.
+
+    The centre (the 2D midrib's midpoint), not the tip: on a broad blade the
+    tip found in 2D wanders round the margin with the view and splits one
+    blade into two or three pieces, the centre does not move.
     """
-    remaining, models, tips = list(obs), [], []
+    remaining, models, centres = list(obs), [], []
     while len(remaining) >= MIN_INLIERS and len(models) < max_models:
-        rays = Rays(run, [o["frame"] for o in remaining], [o["tip"] for o in remaining])
+        rays = Rays(run, [o["frame"] for o in remaining], [o["centre"] for o in remaining])
         res = ransac_point(rays, np.array([o["weight"] for o in remaining]), rng)
         need = MIN_INLIERS if not models else MIN_INLIERS + 1
         if res is None or res["inliers"] < need:
             break
         inl = [o for o, i in zip(remaining, res["inlier_mask"]) if i]
         remaining = [o for o, i in zip(remaining, res["inlier_mask"]) if not i]
-        tip = np.asarray(res["xyz"])
-        # A second "tip" a few mm from the first is the same leaf seen from
-        # another side -- the farthest point of a silhouette moves with the
-        # view. Swaps measured 13-40 mm; a different leaf is far, not near.
-        near = [i for i, t in enumerate(tips) if np.linalg.norm(t - tip) < SAME_LEAF_TIP]
+        centre = np.asarray(res["xyz"])
+        near = [i for i, c in enumerate(centres) if np.linalg.norm(c - centre) < SAME_BLADE]
         if near:
             models[near[0]] += inl
             continue
         models.append(inl)
-        tips.append(tip)
+        centres.append(centre)
     return models
+
+
+def _oriented_ends(run: Run, obs, rng):
+    """Tip and base of one blade from 2D ends whose order per frame is unsure.
+
+    Each frame names two ends of the mask, and which is the base is a rule's
+    guess that flips from view to view (10 of vogelmeere_x_1's duplicate pairs
+    were one blade traced both ways). So the two ends are found without the
+    order: the point most frames put an end at, then the point their other
+    ends agree on. Which of the two is the base is then a vote of the frames,
+    stalk or stem contact counting double the foot rule. Frames whose ends
+    are neither (a corner-to-corner trace) drop out as outliers.
+
+    When the frames agree on one end only -- most often the base, where the
+    stalk goes in behind the blade and its contact jumps from view to view
+    (vogelmeere_x_1 pass0_27: 12 frames agree on the centre, 5 on the tip, 2 on
+    the base) -- the leaf is kept with that end fixed and the other one left
+    free ("free": its start, the agreed end mirrored through the blade centre),
+    for the midrib fit to place.
+    """
+    n = len(obs)
+    frames = [o["frame"] for o in obs]
+    w = np.array([o["weight"] for o in obs])
+    ends = Rays(run, frames + frames, [o["tip"] for o in obs] + [o["base"] for o in obs])
+    first = ransac_point(ends, np.r_[w, w], rng)
+    if first is None:
+        return None
+    at_tip, at_base = first["inlier_mask"][:n], first["inlier_mask"][n:]
+    agree = at_tip | at_base
+    if agree.sum() < MIN_INLIERS:
+        return None
+    idx = np.flatnonzero(agree)
+    other = Rays(run, [frames[i] for i in idx],
+                 [obs[i]["base"] if at_tip[i] else obs[i]["tip"] for i in idx])
+    second = ransac_point(other, w[idx], rng)
+    strength = np.array([1.0 if o.get("base_by", "foot") != "foot" else 0.5 for o in obs])
+    if second is None or second["inliers"] < MIN_INLIERS:
+        centre = ransac_point(Rays(run, [frames[i] for i in idx], [obs[i]["centre"] for i in idx]),
+                              w[idx], rng)
+        if centre is None or centre["inliers"] < MIN_INLIERS:
+            return None
+        X = np.asarray(first["xyz"])
+        x_is_base = float((w * strength)[at_base & ~at_tip].sum()) > \
+            float((w * strength)[at_tip].sum())
+        return {"fixed": X, "free": 2.0 * np.asarray(centre["xyz"]) - X,
+                "fixed_is_tip": not x_is_base, "both": agree,
+                "flipped": (at_tip if x_is_base else at_base & ~at_tip),
+                "tip_inliers": 0 if x_is_base else int(agree.sum()),
+                "base_inliers": int(agree.sum()) if x_is_base else 0}
+    both = np.zeros(n, bool)
+    both[idx[second["inlier_mask"]]] = True
+    # flipped[i]: frame i called the first point its base
+    flipped = at_base & ~at_tip
+    first_is_base = float((w * strength)[both & flipped].sum())
+    second_is_base = float((w * strength)[both & ~flipped].sum())
+    X, Y = np.asarray(first["xyz"]), np.asarray(second["xyz"])
+    n_first, n_second = int(agree.sum()), int(second["inliers"])
+    if first_is_base > second_is_base:
+        return {"tip": Y, "base": X, "tip_inliers": n_second, "base_inliers": n_first,
+                "both": both, "flipped": both & ~flipped}
+    return {"tip": X, "base": Y, "tip_inliers": n_first, "base_inliers": n_second,
+            "both": both, "flipped": both & flipped}
 
 
 def _fit_leaf(run: Run, obs, rng, stem):
     """Tip, base, node and midrib of one leaf from the observations that show it."""
-    weights = np.array([o["weight"] for o in obs])
-    res = {}
-    for key in ("tip", "base"):
-        rays = Rays(run, [o["frame"] for o in obs], [o[key] for o in obs])
-        res[key] = ransac_point(rays, weights, rng)
-        if res[key] is None or res[key]["inliers"] < MIN_INLIERS:
-            return None
-    both = res["tip"]["inlier_mask"] & res["base"]["inlier_mask"]
+    ends = _oriented_ends(run, obs, rng)
+    if ends is None:
+        return None
+    both = ends["both"]
     views = _spread([CurveView(run, o["frame"], o["midrib"], o["weight"])
                      for o, ok in zip(obs, both) if ok and o["weight"] >= 0.2], MAX_FIT_VIEWS)
-    T, B = np.asarray(res["tip"]["xyz"]), np.asarray(res["base"]["xyz"])
-    midrib = fit_curve(B, T, views)
+    if "free" in ends:
+        # one end agreed on; the midrib fit places the other
+        if len(views) < 2:
+            return None
+        midrib = fit_curve(ends["fixed"], ends["free"], views, fixed_end=False)
+        if ends["fixed_is_tip"]:
+            midrib = midrib[::-1]
+        T, B = midrib[-1], midrib[0]
+    else:
+        T, B = np.asarray(ends["tip"]), np.asarray(ends["base"])
+        midrib = fit_curve(B, T, views)
+    res = {"tip": {"inliers": ends["tip_inliers"]}, "base": {"inliers": ends["base_inliers"]}}
     err = np.concatenate([v.chamfer_px(midrib) for v in views]) if views else np.array([])
 
-    # the node: where the petiole meets the stem, triangulated, then put on the stem
+    # the node: where the petiole meets the stem, triangulated, then put on the
+    # stem -- from frames that had the base at the right end, since each 2D node
+    # was walked from that frame's own base
     node, node_inliers = None, 0
-    with_node = [o for o, ok in zip(obs, both) if ok and o.get("node") is not None]
+    with_node = [o for o, ok, f in zip(obs, both, ends["flipped"])
+                 if ok and not f and o.get("node") is not None]
     if stem is not None and len(with_node) >= MIN_INLIERS:
         rays = Rays(run, [o["frame"] for o in with_node], [o["node"] for o in with_node])
         nres = ransac_point(rays, np.array([o["weight"] for o in with_node]), rng)
@@ -417,6 +546,8 @@ def _fit_leaf(run: Run, obs, rng, stem):
             node_inliers = nres["inliers"]
     return {"tip": T, "base": B, "midrib": midrib, "node": node, "node_inliers": node_inliers,
             "frames": {o["frame"] for o, ok in zip(obs, both) if ok},
+            "flipped_views": int(ends["flipped"].sum()),
+            "free_end": ("base" if ends.get("fixed_is_tip") else "tip") if "free" in ends else None,
             "views": [v.frame for v in views], "tip_inliers": res["tip"]["inliers"],
             "base_inliers": res["base"]["inliers"], "observations": len(obs),
             "fit_px": float(np.median(err)) if len(err) else float("nan")}
@@ -427,19 +558,24 @@ def reconstruct(run: Run, leaves2d, stems2d, frames, rng, merge_tol: float | Non
     """Leaves and the stem, from the 2D evidence of `frames` only.
 
     1. the stem first, so each leaf's petiole node can be put on it;
-    2. every SAM3 id split into the pieces that agree on a tip (`_segments`);
-    3. pieces merged when they never claim the same frame and their tips are
-       within 6 mm -- and, within one pass, their bases within 8 mm too. One
-       leaf carried by swapped ids, or seen by two passes. Across passes the
-       base is not compared: whether SAM3's leaf mask takes in part of the
-       petiole changes with elevation, so one leaf's base moves between passes
-       while its tip does not (sugarbeet_1, 28-09). Within a pass the frame
-       test guards leaves seen side by side; across passes nothing can, so two
-       leaves whose tips sit within 6 mm in different passes would merge;
+    2. every SAM3 id split into the pieces that agree on a blade centre
+       (`_segments`), each piece's ends found without trusting their order
+       (`_oriented_ends`);
+    3. pieces merged when their 3D midrib centres or tips are within
+       CENTRE_TOL (or REL_TOL of the shorter blade, if larger) and the merged
+       group never claims a frame twice: one leaf
+       carried by swapped ids, or seen by two passes. The tolerance is tight
+       (3 mm, where the old tip rule needed 6) because the centre does not
+       wander with the view the way the old 2D tip did. Bases are not
+       compared: whether SAM3's mask takes in part of the petiole changes with
+       elevation (sugarbeet_1, 28-09). Within a pass the frame test guards
+       leaves seen side by side; across passes nothing can, so two leaves
+       whose centres or tips sit within CENTRE_TOL in different passes would
+       merge;
     4. every leaf refitted on all of its observations.
     """
     if merge_tol is None:
-        merge_tol = 6.0 / MM_PER_UNIT
+        merge_tol = CENTRE_TOL
     crown = run.to_world(run.skeleton["crown"])
     st = [(f, s) for f, s in stems2d.items() if f in frames]
     stem = None
@@ -456,7 +592,8 @@ def reconstruct(run: Run, leaves2d, stems2d, frames, rng, merge_tol: float | Non
         if row["frame"] in frames and row["weight"] > 0:
             prev = by_track[row["track"]].get(row["frame"])
             if prev is None or row["length_px"] > prev["length_px"]:
-                by_track[row["track"]][row["frame"]] = row
+                by_track[row["track"]][row["frame"]] = dict(
+                    row, centre=row["midrib"][len(row["midrib"]) // 2])
     pieces, failed = [], {}
     for track, rows in sorted(by_track.items()):
         models = _segments(run, list(rows.values()), rng) if len(rows) >= MIN_INLIERS else []
@@ -464,26 +601,27 @@ def reconstruct(run: Run, leaves2d, stems2d, frames, rng, merge_tol: float | Non
         fits = [(m, f) for m, f in fits if f is not None]
         if not fits:
             failed[track] = (f"only {len(rows)} usable views" if len(rows) < MIN_INLIERS
-                             else "its views do not agree on a tip and a base")
+                             else "its views do not agree on a blade, or on its two ends")
         for i, (m, f) in enumerate(fits):
             pieces.append({"name": f"{track}" + (f"#{i}" if i else ""), "tracks": {track},
                            "obs": m, "fit": f})
 
-    # merge pieces that are the same leaf
+    # merge pieces that are the same leaf: centres or tips close, no frame claimed twice
+    centre = [resample(p["fit"]["midrib"], 41)[20] for p in pieces]
+    blade = [float(np.linalg.norm(np.diff(p["fit"]["midrib"], axis=0), axis=1).sum()) for p in pieces]
+    claimed = [{o["frame"] for o in p["obs"]} for p in pieces]
     order = sorted(range(len(pieces)), key=lambda i: -pieces[i]["fit"]["tip_inliers"])
     owner = list(range(len(pieces)))
     for a_i, a in enumerate(order):
         for b in order[a_i + 1:]:
             if owner[b] != b or owner[a] != a:
                 continue
-            fa, fb = pieces[a]["fit"], pieces[b]["fit"]
-            same_pass = _pass_of(pieces[a]) == _pass_of(pieces[b])
-            if (np.linalg.norm(fa["tip"] - fb["tip"]) < merge_tol
-                    and len({o["frame"] for o in pieces[a]["obs"]}
-                            & {o["frame"] for o in pieces[b]["obs"]}) <= 1
-                    and (not same_pass
-                         or np.linalg.norm(fa["base"] - fb["base"]) < 1.33 * merge_tol)):
+            tol = max(merge_tol, REL_TOL * min(blade[a], blade[b]))
+            close = (np.linalg.norm(centre[a] - centre[b]) < tol
+                     or np.linalg.norm(pieces[a]["fit"]["tip"] - pieces[b]["fit"]["tip"]) < tol)
+            if close and len(claimed[a] & claimed[b]) <= 1:
                 owner[b] = a
+                claimed[a] |= claimed[b]
     leaves = {}
     for i, p in enumerate(pieces):
         if owner[i] != i:
@@ -504,15 +642,8 @@ def reconstruct(run: Run, leaves2d, stems2d, frames, rng, merge_tol: float | Non
     return leaves, failed, stem, crown, len(pieces)
 
 
-def _pass_of(piece: dict) -> str:
-    return sorted(piece["tracks"])[0].split("_", 1)[0]
-
-
 def petiole(leaf: dict, stem, crown=None):
     """(petiole polyline, which rule placed it).
-
-    A rosette (P5's --architecture) has no stem: its petioles meet at the
-    crown, so each runs from the blade base to the crown.
 
     The petiole continues the leaf's own axis: from the tip through the
     blade-petiole joint (the base) and on until it meets the stem. Snapping the
@@ -526,8 +657,6 @@ def petiole(leaf: dict, stem, crown=None):
     to the node triangulated from the photos, then to the nearest stem point.
     """
     if stem is None:
-        if crown is not None:
-            return np.vstack([np.asarray(crown), np.asarray(leaf["base"])]), "to the crown (rosette)"
         return np.zeros((0, 3)), "none"
     tip, base = np.asarray(leaf["tip"]), np.asarray(leaf["base"])
     chord = base - tip
@@ -577,6 +706,102 @@ def petiole_on_tree(leaf: dict, trunk, stalks, max_ratio: float = 1.5):
         if d[j] <= max_ratio * blade:
             return np.vstack([dense[j], base]), "nearest stem or branch"
     return np.zeros((0, 3)), "none within reach"
+
+
+def petioles_2d(run: Run, leaves: dict, parents, stalks) -> dict:
+    """{leaf key: (petiole polyline, which rule placed it)}, each petiole traced in the photos.
+
+    The straight rules above draw a petiole as a line from the blade base to
+    a stem point. P5x follows tissue instead -- the stem tree's stalk, or the
+    shortest path through the cloud -- but the cloud is the weak link where
+    leaves crowd: on vogelmeere_x_1, 43% of the midribs of leaves with a close
+    neighbour lie off its surface. The stalk is clean in 2D, though: P2's stem
+    session draws it in every frame. So, in each view of the leaf:
+
+      the 3D base and the parent axes (stem and branches) are projected;
+      a walk from the base, cheap on stem-mask pixels and dear on other plant
+      pixels (petiole_node's costs), runs to the first axis pixel it reaches;
+
+    the views vote on where in 3D the petiole joins (hits within CENTRE_TOL
+    agree), and the petiole is the 3D curve whose projections lie on the
+    agreeing views' 2D walks (fit_curve, as for the midribs), from that point
+    to the base. A stem-tree stalk that ends at the blade base is used as it
+    is -- it is tissue too. A leaf whose views agree on no joint keeps the
+    straight line to the nearest axis point, and says so.
+
+    `parents` are 3D polylines: the stem and its branches, or the one stem.
+    A rosette has no petioles at all (main()).
+    """
+    out = {}
+    lines = [np.atleast_2d(np.asarray(p, float)) for p in parents]
+    dense = np.vstack([resample(p, max(len(p) * 8, 2)) for p in lines])
+    todo = defaultdict(list)
+    for key, leaf in leaves.items():
+        base = np.asarray(leaf["base"])
+        blade = float(np.linalg.norm(np.diff(leaf["midrib"], axis=0), axis=1).sum())
+        if stalks:
+            gaps = [float(np.linalg.norm(st[-1] - base)) for st in stalks]
+            k = int(np.argmin(gaps))
+            if gaps[k] <= max(0.25 * blade, 3.0 / MM_PER_UNIT):
+                out[key] = (np.vstack([stalks[k], base]), "stem-tree stalk")
+                continue
+        for frame in (leaf["views"] if len(leaf["views"]) >= 2 else sorted(leaf["frames"])):
+            todo[frame].append(key)
+
+    hits = defaultdict(list)                     # key -> [(frame, index into dense, 2D walk)]
+    for frame, keys in sorted(todo.items()):
+        plant = cv2.imread(str(run.workdir / "p2" / "masks" / "plant" / f"{frame}.png"), 0) > 127
+        stem = cv2.imread(str(run.workdir / "p2" / "masks" / "stem" / f"{frame}.png"), 0) > 127
+        h, w = plant.shape
+        im = run.image_of[frame]
+        cam, pose = run.rec.cameras[im.camera_id], im.cam_from_world()
+        on_axis = _uv(cam, pose, dense)
+        for key in keys:
+            leaf = leaves[key]
+            b = _uv(cam, pose, [leaf["base"]])[0]
+            rib = _uv(cam, pose, leaf["midrib"])
+            reach = int(min(500, 2.0 * np.linalg.norm(np.diff(rib, axis=0), axis=1).sum() + 40))
+            r0, c0 = int(round(b[1])), int(round(b[0]))
+            ys, ye, xs, xe = max(0, r0 - reach), min(h, r0 + reach), max(0, c0 - reach), min(w, c0 + reach)
+            if not (ys <= r0 < ye and xs <= c0 < xe):
+                continue
+            sel = np.flatnonzero((on_axis[:, 0] >= xs) & (on_axis[:, 0] < xe - 0.5)
+                                 & (on_axis[:, 1] >= ys) & (on_axis[:, 1] < ye - 0.5))
+            if not len(sel):
+                continue
+            cost = np.where(plant[ys:ye, xs:xe], np.where(stem[ys:ye, xs:xe], 1.0, 4.0), np.inf)
+            start = (r0 - ys, c0 - xs)
+            if not np.isfinite(cost[start]):
+                cost[start] = 4.0
+            mcp = MCP_Geometric(cost)
+            dist, _ = mcp.find_costs([start])
+            rr = on_axis[sel, 1].round().astype(int) - ys
+            cc = on_axis[sel, 0].round().astype(int) - xs
+            d = dist[rr, cc]
+            if not np.isfinite(d).any():
+                continue
+            j = int(np.argmin(d))
+            walk = np.asarray(mcp.traceback((rr[j], cc[j])), float)[:, ::-1] + [xs, ys]
+            hits[key].append((frame, sel[j], walk))
+
+    for key, leaf in leaves.items():
+        if key in out:
+            continue
+        base = np.asarray(leaf["base"])
+        hs = hits.get(key, [])
+        if len(hs) >= 2:
+            P = dense[[hh[1] for hh in hs]]
+            D = np.linalg.norm(P[:, None] - P[None], axis=2)
+            i = int(np.argmax((D < CENTRE_TOL).sum(axis=1)))
+            agree = np.flatnonzero(D[i] < CENTRE_TOL)
+            if len(agree) >= 2:
+                joint = dense[np.argmin(np.linalg.norm(dense - P[agree].mean(axis=0), axis=1))]
+                views = [CurveView(run, hs[k][0], resample(hs[k][2], SAMPLES_2D)) for k in agree]
+                out[key] = (fit_curve(joint, base, views, n_ctrl=3, smooth=2.0), "2D stalk walk")
+                continue
+        out[key] = (np.vstack([dense[np.argmin(np.linalg.norm(dense - base, axis=1))], base]),
+                    "nearest axis point (no 2D walk agreed)")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -648,8 +873,8 @@ def main():
                     help="use only these capture passes' frames -- the skeleton needs P2 masks, "
                          "P3 poses and P5's crown/frame, not a per-pass 3D run")
     ap.add_argument("--architecture", choices=["upright", "caulescent", "rosette"],
-                    help="override P5's (p5/instancing.json); rosette = no stem, petioles to "
-                         "the crown")
+                    help="override P5's (p5/instancing.json); rosette = no stem, no petioles: "
+                         "each leaf runs from the crown")
     ap.add_argument("--other-passes", type=Path, help="full run, to draw on frames not used")
     ap.add_argument("--flat-lay", type=Path,
                     help="leaf-pose output dir with leaves.json (run with --marker-mm so blades "
@@ -667,6 +892,12 @@ def main():
     ap.add_argument("--profile", choices=sorted(plant_profiles.PROFILES),
                     help="use this plant's rules (pose_estimator/plant_profiles.py) instead of "
                          "the one the workdir's folder name picks")
+    ap.add_argument("--petiole-rule", choices=["leaf_axis", "stem_tree", "stalk_2d"],
+                    help="override the profile's petiole rule (see petioles_2d, petiole_on_tree, "
+                         "petiole). A rosette has no petioles whatever this says")
+    ap.add_argument("--base-rule", choices=["foot", "stem_contact", "stalk"],
+                    help="override the profile's rule for telling a mask's base from its tip "
+                         "(see extract_2d)")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
     if args.mm_per_unit is None and args.tag_mm is None and args.flat_lay is None:
@@ -700,13 +931,14 @@ def main():
     has_stem = architecture != "rosette"
     print(f"  {len(frames)} frames" + (f" of passes {args.passes}" if args.passes else "")
           + f"; architecture {architecture or 'unknown'} -> "
-          + ("stem + petioles off it" if has_stem else "no stem, petioles to the crown"))
+          + ("stem + petioles off it" if has_stem else "no stem, leaves run from the crown"))
     junk = junk_masks(masks, args.workdir, set(frames))
     life = defaultdict(set)
     for t, f in zip(masks["track"], masks["frame"]):
         life[str(t)].add(str(f))
+    base_rule = args.base_rule or profile.base_rule
     leaves2d, stems2d = extract_2d(run, masks, set(frames), junk, args.out / "evidence_2d.json",
-                                   base_rule=profile.base_rule)
+                                   base_rule=base_rule)
 
     # 0. the scale, before anything that thresholds in mm. Fitted against the
     # flat lay it is circular -- the merges it sets decide which midribs the fit
@@ -783,7 +1015,8 @@ def main():
     # plant whose leaves sit on side branches. A skeleton.json written before
     # the tree existed has no axes, so it is re-traced here.
     p5x = run.skeleton
-    if args.retrace_p5x or (profile.petiole_rule == "stem_tree" and not p5x.get("axes")):
+    if args.retrace_p5x or ((args.petiole_rule or profile.petiole_rule) in ("stem_tree", "stalk_2d")
+                              and not p5x.get("axes")):
         from pose_estimator.leaf_skeleton import trace
         upright = (run.points - run.origin) @ run.rotation.T
         voxel, _ = cloud_source.voxel_size(args.workdir, cloud_source.BASELINE, upright)
@@ -795,15 +1028,31 @@ def main():
     trunk, stalks = [], []
     for axis in p5x.get("axes") or []:
         (stalks if axis["kind"] == "petiole" else trunk).append(run.to_world(axis["points"]))
-    use_tree = profile.petiole_rule == "stem_tree" and bool(trunk)
-    if profile.petiole_rule == "stem_tree" and not trunk:
+    petiole_rule = args.petiole_rule or profile.petiole_rule
+    # the stem tree is drawn, and petioles join it, for both tree rules
+    use_tree = petiole_rule in ("stem_tree", "stalk_2d") and bool(trunk)
+    if petiole_rule == "stem_tree" and not trunk:
         print("  WARNING: the profile asks for petioles on the stem tree, but P5x has no stem "
               "tree (no stem tissue?) -- falling back to the leaf-axis rule")
 
     rules = defaultdict(int)
-    for leaf in leaves.values():
-        leaf["petiole"], leaf["petiole_rule"] = (petiole_on_tree(leaf, trunk, stalks) if use_tree
-                                                 else petiole(leaf, stem, crown))
+    if petiole_rule == "stalk_2d" and has_stem:
+        # walk to the stem tree, else to the one stem
+        placed = petioles_2d(run, leaves, trunk if trunk else [stem], stalks)
+    for key, leaf in leaves.items():
+        if not has_stem:
+            # A rosette leaf has no petiole: it runs from the crown, widening
+            # into its blade, all the way to the tip. Whatever part of it the
+            # 2D masks did not show is joined straight to the crown.
+            leaf["midrib"] = np.vstack([crown, leaf["midrib"]])
+            leaf["base"] = np.asarray(crown)
+            leaf["petiole"], leaf["petiole_rule"] = np.zeros((0, 3)), "none (rosette: leaf from the crown)"
+        elif petiole_rule == "stalk_2d":
+            leaf["petiole"], leaf["petiole_rule"] = placed[key]
+        elif petiole_rule == "stem_tree" and use_tree:
+            leaf["petiole"], leaf["petiole_rule"] = petiole_on_tree(leaf, trunk, stalks)
+        else:
+            leaf["petiole"], leaf["petiole_rule"] = petiole(leaf, stem, crown)
         rules[leaf["petiole_rule"]] += 1
     blade_of = lambda l: float(np.linalg.norm(np.diff(l["midrib"], axis=0), axis=1).sum())
     pet_of = lambda l: (float(np.linalg.norm(np.diff(l["petiole"], axis=0), axis=1).sum())
@@ -823,7 +1072,8 @@ def main():
     scores = {"held_out_px": float(np.median(held)), "fitted_px": float(np.median(fitted)),
               "leaves": len(leaves), "failed": failed, "midrib_mm": lengths,
               "mm_per_unit": MM_PER_UNIT, "scale_source": scale_source,
-              "profile": profile.name, "petiole_rules": dict(rules),
+              "profile": profile.name, "base_rule": base_rule, "petiole_rule": petiole_rule,
+              "petiole_rules": dict(rules),
               "petioles_longer_than_blade": too_long}
     if blades is not None and lengths and not scale_source.startswith("flat lay"):
         # what the flat lay would have said: agreement with an independent scale
