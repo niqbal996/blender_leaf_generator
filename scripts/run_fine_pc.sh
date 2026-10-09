@@ -18,6 +18,10 @@ set -euo pipefail
 
 WD="${1:?usage: run_fine_pc.sh <workdir> [--only mvs|gs|compare] [--source-root DIR] [--skeleton2d DIR]}"
 shift
+if [[ "$WD" == -* || ! -d "$WD" ]]; then
+    echo "first argument must be the plant workdir, got '$WD' (is \$WD set in this shell?)" >&2
+    exit 1
+fi
 ONLY="" ; SRC=() ; S2D="$WD" ; EXTRA=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
