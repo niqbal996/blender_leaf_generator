@@ -231,6 +231,19 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
     stem_finder = cKDTree(np.vstack([_densify(line) for line in trunk_lines])) if trunk_lines else None
     stem_radius = 1.5 * tree.radius if tree is not None else 0.0
 
+    # A stretch of path two or more leaves are reached through is a branch,
+    # not anyone's petiole. On vogelmeere_x_1 (P4b cloud) leaves 4, 8, 14 and
+    # 36 drew the same 0.03 mm-apart course as four petioles. Routes are taken
+    # to where each midrib starts (its first node), which is also where the
+    # petiole now ends -- before, it ended at the leaf's first-reached point
+    # while the midrib could start elsewhere on the blade: 0.3-64 mm gaps,
+    # a 46 degree median kink. Rosettes keep whole paths (no tree, no branch).
+    users = np.zeros(len(local), np.int32)
+    if tree is not None:
+        for leaf_id, attachment, midrib_nodes, tip_local, n_members in traced:
+            route = _walk_back(predecessor, int(midrib_nodes[0]))
+            users[np.unique(route[labels[route] != leaf_id])] += 1
+
     for leaf_id, attachment, midrib_nodes, tip_local, n_members in traced:
         midrib = _tidy(local[midrib_nodes], samples, smooth_iterations)
         stalk, cut = petiole_axis.get(leaf_id), None
@@ -267,21 +280,29 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
             # sit in crowds of blades, 2-3 leaves within 1 mm, and stopping at
             # them cut 6 good petioles. Nodes of this same leaf are dropped so
             # a blade the path grazed on the way does not count twice.
-            approach = _walk_back(predecessor, attachment)
+            approach = _walk_back(predecessor, int(midrib_nodes[0]))
             start_at = 0
             on_trunk = np.zeros(len(approach), bool)
             if stem_finder is not None and stem_radius > 0:
                 on_trunk = stem_finder.query(local[approach])[0] <= stem_radius
+            on_trunk |= users[approach] >= 2                       # shared: a branch
             on_path = labels[approach]
             stop = on_trunk | _runs(((on_path >= 0) & (on_path != leaf_id)), CROSSING_NODES)
             last = np.flatnonzero(stop)
             if len(last):
                 # From the stem's surface, or from just past the neighbour.
                 start_at = int(last[-1]) + (0 if on_trunk[last[-1]] else 1)
-            branch = approach[start_at:]
-            petiole_nodes = branch[labels[branch] != leaf_id]
-            petiole = (_tidy(local[petiole_nodes], max(samples // 2, 4), smooth_iterations)
-                       if len(petiole_nodes) >= 2 else np.zeros((0, 3)))
+            petiole_nodes = approach[start_at:]
+            if len(petiole_nodes) >= 2:
+                # one curve, smoothed as one, split where the midrib starts: no
+                # gap and no kink at the join
+                both = np.vstack([local[petiole_nodes], local[midrib_nodes[1:]]])
+                smooth = smooth_polyline(both, iterations=smooth_iterations, strength=0.5)
+                j = len(petiole_nodes) - 1
+                petiole = np.asarray(resample_by_arclength(smooth[:j + 1], max(samples // 2, 4))[0], float)
+                midrib = np.asarray(resample_by_arclength(smooth[j:], samples)[0], float)
+            else:
+                petiole = np.zeros((0, 3))
         base = midrib[0]
         tip = local[tip_local]
         leaves.append({

@@ -952,7 +952,7 @@ def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
 
 
 def retrace(workdir: Path, geometry_backend: str = cloud_source.BASELINE,
-            keep_fragments: bool = False) -> dict:
+            keep_fragments: bool = False, out: str = "p5x") -> dict:
     """Redo everything after the votes, from the labels P5x already wrote.
 
     p5x/segmented.ply carries every point's leaf/stem label in P5's plant
@@ -965,7 +965,7 @@ def retrace(workdir: Path, geometry_backend: str = cloud_source.BASELINE,
     2.5 min on vogelmeere locally -- and when it folds anything in it rewrites
     instances.npy, segmented.ply, leaves.ply and instances.json to match.
     """
-    p5x = workdir / "p5x"
+    p5x = workdir / out
     if not keep_fragments:
         _retrace_absorb(workdir, geometry_backend, p5x)
     cloud = p5x / "segmented.ply"
@@ -1121,7 +1121,7 @@ def main(argv: Optional[list] = None) -> None:
                              "tracer changed")
     args = parser.parse_args(argv)
     if args.retrace:
-        retrace(args.workdir, args.geometry_backend, keep_fragments=args.keep_fragments)
+        retrace(args.workdir, args.geometry_backend, keep_fragments=args.keep_fragments, out=args.out)
         return
     run(workdir=args.workdir, min_frames=args.min_frames, min_points=args.min_points,
         keep_fragments=args.keep_fragments,
