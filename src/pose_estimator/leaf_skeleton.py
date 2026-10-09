@@ -272,7 +272,6 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
         route = approach[start_at:]
 
         stalk = petiole_axis.get(leaf_id)
-        from_stalk_base = False
         if len(route) < 2 and stalk is not None:
             # A stalk of its own but no route through it: follow the cloud from
             # the stalk's foot on the stem to where the midrib starts.
@@ -283,7 +282,6 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
             _, pred = _dijkstra(graph, indices=foot, limit=reach, return_predecessors=True)
             if pred[int(midrib_nodes[0])] >= 0 or foot == int(midrib_nodes[0]):
                 route = _walk_back(pred, int(midrib_nodes[0]))
-                from_stalk_base = len(route) >= 2
 
         if len(route) >= 2:
             raw = np.vstack([local[route], local[midrib_nodes[1:]]])
@@ -329,8 +327,11 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
             "petiole": petiole.round(6).tolist(),
             "midrib_length": float(_length(midrib)),
             "petiole_length": float(_length(petiole)),
-            "petiole_from": ("stalk" if blade > join else "stalk base" if from_stalk_base
-                             else "path" if len(petiole) else "none"),
+            # "stalk": the leaf has a stalk of its own in the stem tree, and
+            # the petiole is that stalk's tissue (traced through the cloud);
+            # "path": no stalk, the stretch of route that leads into the leaf
+            "petiole_from": ("none" if not len(petiole) else "stalk" if stalk is not None
+                             else "path"),
             "midrib_points": int(len(midrib_nodes)),
             "height": float(tip[2]),
         })
