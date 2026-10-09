@@ -18,7 +18,9 @@ Per cloud (scores.json, printed):
                  blade the cloud does not have, where the hull says plant
   webbing        over pairs of distinct leaves 1.5-8 mm apart, the share of
                  the straight gap between their midribs that has a point
-                 within 0.4 mm (low = the gap stayed open)
+                 within 0.2 mm, every cloud thinned to one point per 0.25 mm
+                 voxel first so that density does not decide it (low = the
+                 gap stayed open)
   each for isolated leaves, crowded ones (a distinct neighbour <= 8 mm) and
   the heart (leaves whose centre is within --heart-mm of the densest cluster)
 
@@ -175,10 +177,16 @@ def main():
             row[g] = {"leaves": int(sel.sum()), "on_surface": float((ds <= 0.5).mean()),
                       "buried": float(((dh <= 0.5) & (ds > 1.0)).mean()),
                       "median_mm": float(np.median(ds))}
+        # webbing on the cloud thinned to one point per 0.25 mm voxel: on the
+        # raw cloud a 0.04 mm-spaced MVS sheet always has some point within
+        # 0.4 mm of the gap line, so density, not geometry, would decide it
+        keys = np.floor(c["points"] / (0.25 / mm)).astype(np.int64)
+        _, first = np.unique(keys, axis=0, return_index=True)
+        thin = cKDTree(c["points"][first])
         web = []
         for gap, i, j, p, q, A, B in pairs:
             seg = p + np.linspace(0.3, 0.7, 15)[:, None] * (q - p)
-            web.append(float((c["tree"].query(seg)[0] * mm <= 0.4).mean()))
+            web.append(float((thin.query(seg)[0] * mm <= 0.2).mean()))
         row["webbing_median"] = float(np.median(web)) if web else None
         row["pairs_half_filled"] = int(np.sum(np.asarray(web) > 0.5)) if web else None
         scores[name] = row
