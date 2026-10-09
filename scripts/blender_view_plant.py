@@ -873,6 +873,23 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True, folder="p5x", 
         tips = _collection(f"{prefix}_tips")
         for leaf in graph.get("leaves", []):
             colour = LEAF_RGBA[leaf["id"] % len(LEAF_RGBA)]
+            curve = np.asarray(leaf.get("curve") or [], float)
+            if len(curve) >= 2:
+                # The leaf as one curve, stem to tip (P5x since 2026-10-09), and
+                # a small ball where the blade begins. Drawn as one object: the
+                # petiole and the midrib are parts of one line, not two lines
+                # that have to be made to meet.
+                curve = curve + off
+                add_curve(curve, f"{prefix}_leaf_curve_{leaf['id']:03d}", colour,
+                          point_radius * 1.6, ribs)
+                drawn_ribs += 1
+                start = int(leaf.get("blade_start") or 0)
+                if 0 < start < len(curve):
+                    add_sphere(curve[start], f"{prefix}_blade_start_{leaf['id']:03d}", PETIOLE_RGBA,
+                               point_radius * 2.0, petioles)
+                add_sphere(np.asarray(leaf["tip"], float) + off, f"{prefix}_tip_{leaf['id']:03d}",
+                           TIP_RGBA, point_radius * 3.0, tips)
+                continue
             midrib = np.asarray(leaf.get("midrib") or [], float)
             midrib = midrib + off if len(midrib) else midrib
             if len(midrib) >= 2:

@@ -245,64 +245,75 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
             users[np.unique(route[labels[route] != leaf_id])] += 1
 
     for leaf_id, attachment, midrib_nodes, tip_local, n_members in traced:
-        midrib = _tidy(local[midrib_nodes], samples, smooth_iterations)
-        stalk, cut = petiole_axis.get(leaf_id), None
-        if stalk is not None:
-            # Where the stalk ends on this leaf's midrib. SAM3's leaf mask often
-            # takes in the petiole, so the traced midrib can start back at the
-            # stem and run out along the stalk; the blade starts where the
-            # stalk ends. A stalk ending nowhere near the midrib is not this
-            # leaf's after all, and neither is one ending near the tip: that is
-            # stem tissue escorting the blade along its length, not a petiole
-            # ending where the blade begins. The path rule below decides those.
-            gaps = np.linalg.norm(midrib - stalk[-1], axis=1)
-            at = int(np.argmin(gaps))
-            if gaps[at] <= 2.0 * tree.shell and \
-                    _length(midrib[at:]) >= 0.3 * _length(midrib):
-                cut = at
-        if cut is not None:
-            if len(midrib) - cut >= 2 and _length(midrib[cut:]) > 0:
-                midrib = _tidy(midrib[cut:], samples, 0)
-            petiole = _tidy(np.vstack([stalk, midrib[:1]]), max(samples // 2, 4), 0)
+        # One curve per leaf, from where it leaves the stem to its tip, traced
+        # through the cloud's own points; the petiole/blade border is a place
+        # on it (blade_start). Petiole and midrib used to be built separately
+        # -- the petiole from a stem-tree stalk's centre line or a path, the
+        # midrib inside the blade -- and met with gaps and overlaps: leaf 24
+        # on vogelmeere_x_1's hull ran its stalk 3 mm beside the blade, then
+        # jumped to a midrib cut back where the stalk ended.
+        #
+        # The route in: this leaf's path from the crown to where its midrib
+        # starts, from the last point on a stem or branch, on a course another
+        # leaf also takes (a branch, not a petiole), or just past a crossing of
+        # another leaf's blade. A crossing, not a graze: a run of
+        # CROSSING_NODES -- leaf clouds carry stray specks. Leaves touching a
+        # neighbour are often reached *through* it (vogelmeere leaves 8, 9 and
+        # 37 climbed leaf 6's stalk), and get no petiole rather than its.
+        approach = _walk_back(predecessor, int(midrib_nodes[0]))
+        on_trunk = np.zeros(len(approach), bool)
+        if stem_finder is not None and stem_radius > 0:
+            on_trunk = stem_finder.query(local[approach])[0] <= stem_radius
+        on_trunk |= users[approach] >= 2
+        on_path = labels[approach]
+        stop = on_trunk | _runs(((on_path >= 0) & (on_path != leaf_id)), CROSSING_NODES)
+        last = np.flatnonzero(stop)
+        start_at = int(last[-1]) + (0 if on_trunk[last[-1]] else 1) if len(last) else 0
+        route = approach[start_at:]
+
+        stalk = petiole_axis.get(leaf_id)
+        from_stalk_base = False
+        if len(route) < 2 and stalk is not None:
+            # A stalk of its own but no route through it: follow the cloud from
+            # the stalk's foot on the stem to where the midrib starts.
+            from scipy.sparse.csgraph import dijkstra as _dijkstra
+
+            foot = int(np.argmin(np.linalg.norm(local - stalk[0], axis=1)))
+            reach = 3.0 * _length(stalk) + 4.0 * tree.shell
+            _, pred = _dijkstra(graph, indices=foot, limit=reach, return_predecessors=True)
+            if pred[int(midrib_nodes[0])] >= 0 or foot == int(midrib_nodes[0]):
+                route = _walk_back(pred, int(midrib_nodes[0]))
+                from_stalk_base = len(route) >= 2
+
+        if len(route) >= 2:
+            raw = np.vstack([local[route], local[midrib_nodes[1:]]])
+            join = len(route) - 1
         else:
-            # No stalk of its own: the stretch of this leaf's path that leads
-            # into it. Walking back from the leaf, it ends at a stem or branch
-            # -- or where the path crossed another leaf's blade. Leaves touching
-            # a neighbour are often reached *through* it: on vogelmeere the
-            # shortest paths to leaves 8, 9 and 37 climbed leaf 6's stalk and
-            # crossed 11-12 nodes of its blade, and each drew a copy of leaf
-            # 6's petiole. A leaf reached only through a neighbour gets no
-            # petiole rather than its neighbour's.
-            #
-            # A crossing, not a graze: a run of CROSSING_NODES. Leaf clouds
-            # carry stray specks, and the good petioles there met none or 2.
-            # Another leaf's *stalk* is no evidence either way -- stalk ends
-            # sit in crowds of blades, 2-3 leaves within 1 mm, and stopping at
-            # them cut 6 good petioles. Nodes of this same leaf are dropped so
-            # a blade the path grazed on the way does not count twice.
-            approach = _walk_back(predecessor, int(midrib_nodes[0]))
-            start_at = 0
-            on_trunk = np.zeros(len(approach), bool)
-            if stem_finder is not None and stem_radius > 0:
-                on_trunk = stem_finder.query(local[approach])[0] <= stem_radius
-            on_trunk |= users[approach] >= 2                       # shared: a branch
-            on_path = labels[approach]
-            stop = on_trunk | _runs(((on_path >= 0) & (on_path != leaf_id)), CROSSING_NODES)
-            last = np.flatnonzero(stop)
-            if len(last):
-                # From the stem's surface, or from just past the neighbour.
-                start_at = int(last[-1]) + (0 if on_trunk[last[-1]] else 1)
-            petiole_nodes = approach[start_at:]
-            if len(petiole_nodes) >= 2:
-                # one curve, smoothed as one, split where the midrib starts: no
-                # gap and no kink at the join
-                both = np.vstack([local[petiole_nodes], local[midrib_nodes[1:]]])
-                smooth = smooth_polyline(both, iterations=smooth_iterations, strength=0.5)
-                j = len(petiole_nodes) - 1
-                petiole = np.asarray(resample_by_arclength(smooth[:j + 1], max(samples // 2, 4))[0], float)
-                midrib = np.asarray(resample_by_arclength(smooth[j:], samples)[0], float)
-            else:
-                petiole = np.zeros((0, 3))
+            raw, join = local[midrib_nodes], 0
+        smooth = smooth_polyline(raw, iterations=smooth_iterations, strength=0.5) \
+            if len(raw) >= 3 else raw
+
+        # The blade starts where this leaf's own tissue does -- unless a stalk
+        # of the stem tree ends further out along the curve: SAM3's leaf mask
+        # often takes in part of the petiole, and the stalk says where the
+        # stem tissue really ends. A stalk ending near the tip is stem tissue
+        # escorting the blade, not a petiole, and is ignored.
+        blade = join
+        if stalk is not None and len(smooth) >= 2:
+            gaps = np.linalg.norm(smooth - stalk[-1], axis=1)
+            at = int(np.argmin(gaps))
+            if at > blade and gaps[at] <= 2.0 * tree.shell and \
+                    _length(smooth[at:]) >= 0.3 * _length(smooth[join:]):
+                blade = at
+
+        n_pet = max(samples // 2, 4)
+        if blade > 0 and _length(smooth[:blade + 1]) > 0:
+            petiole = np.asarray(resample_by_arclength(smooth[:blade + 1], n_pet)[0], float)
+        else:
+            petiole = np.zeros((0, 3))
+        midrib = np.asarray(resample_by_arclength(smooth[blade:], samples)[0], float) \
+            if len(smooth) - blade >= 2 else _tidy(local[midrib_nodes], samples, smooth_iterations)
+        curve = np.vstack([petiole[:-1], midrib]) if len(petiole) else midrib
         base = midrib[0]
         tip = local[tip_local]
         leaves.append({
@@ -310,11 +321,16 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
             "points": int(n_members),
             "tip": [float(v) for v in tip],
             "base": [float(v) for v in base],
+            # the leaf as one curve, stem to tip; the blade begins at
+            # curve[blade_start] (0 when there is no petiole)
+            "curve": curve.round(6).tolist(),
+            "blade_start": int(max(len(petiole) - 1, 0)),
             "midrib": midrib.round(6).tolist(),
             "petiole": petiole.round(6).tolist(),
             "midrib_length": float(_length(midrib)),
             "petiole_length": float(_length(petiole)),
-            "petiole_from": "stalk" if cut is not None else "path",
+            "petiole_from": ("stalk" if blade > join else "stalk base" if from_stalk_base
+                             else "path" if len(petiole) else "none"),
             "midrib_points": int(len(midrib_nodes)),
             "height": float(tip[2]),
         })
