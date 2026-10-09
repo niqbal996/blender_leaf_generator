@@ -217,130 +217,244 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
         traced.append((leaf_id, attachment, midrib_nodes, tip_local, len(members)))
 
 
-    # A carved stem is thick, and inside it the shortest-path tree splits
-    # into side-by-side lanes: a leaf reached through a neighbouring lane
-    # leaves the trunk low and climbs *inside* the stem, which drew as
-    # parallel lines up the stem. So a petiole without a stalk of its own
-    # starts at the last point of its path still inside a stem or branch --
-    # within 1.5x the stem's measured radius of their centre lines. That
-    # radius used to be measured around the lower trunk, which on a plant
-    # branching low takes in the branches: 51 mm on vogelmeere, every leaf
-    # base "inside the stem", and every petiole empty.
-    trunk_lines = [line for axis, line in zip(tree.axes, axis_lines) if axis.kind != "petiole"] \
-        if tree is not None else []
-    stem_finder = cKDTree(np.vstack([_densify(line) for line in trunk_lines])) if trunk_lines else None
-    stem_radius = 1.5 * tree.radius if tree is not None else 0.0
+    def leaf_curves():
+        """Every traced leaf as one stem-to-tip curve, given the tree's current kinds."""
+        # A carved stem is thick, and inside it the shortest-path tree splits
+        # into side-by-side lanes: a leaf reached through a neighbouring lane
+        # leaves the trunk low and climbs *inside* the stem. So a route starts
+        # at its last point still inside a stem or branch -- within 1.5x the
+        # stem's measured radius of their centre lines (measured round the
+        # main stem only: around branches it read 51 mm on vogelmeere).
+        petiole_axis = {}
+        trunk_lines = []
+        if tree is not None:
+            for axis, line in zip(tree.axes, axis_lines):
+                if axis.kind == "petiole":
+                    # A leaf whose stalk split in two keeps the longer.
+                    if _length(line) > _length(petiole_axis.get(axis.leaf, np.zeros((0, 3)))):
+                        petiole_axis[axis.leaf] = line
+                else:
+                    trunk_lines.append(line)
+        trunk_dense = np.vstack([_densify(line) for line in trunk_lines]) if trunk_lines else None
+        stem_finder = cKDTree(trunk_dense) if trunk_dense is not None else None
+        stem_radius = 1.5 * tree.radius if tree is not None else 0.0
+        on_any_trunk = (stem_finder.query(local)[0] <= stem_radius) if stem_finder is not None else None
 
-    # A stretch of path two or more leaves are reached through is a branch,
-    # not anyone's petiole. On vogelmeere_x_1 (P4b cloud) leaves 4, 8, 14 and
-    # 36 drew the same 0.03 mm-apart course as four petioles. Routes are taken
-    # to where each midrib starts (its first node), which is also where the
-    # petiole now ends -- before, it ended at the leaf's first-reached point
-    # while the midrib could start elsewhere on the blade: 0.3-64 mm gaps,
-    # a 46 degree median kink. Rosettes keep whole paths (no tree, no branch).
-    users = np.zeros(len(local), np.int32)
-    if tree is not None:
+        # A stretch of path two or more leaves are reached through is a branch,
+        # not anyone's petiole (vogelmeere leaves 4, 8, 14, 36 drew one course
+        # as four petioles). Rosettes keep whole paths (no tree, no branch).
+        def trim(approach, leaf_id, users=None):
+            """(index the route starts at, whether it starts on a stem/branch)."""
+            on_trunk = np.zeros(len(approach), bool)
+            if stem_finder is not None and stem_radius > 0:
+                on_trunk = stem_finder.query(local[approach])[0] <= stem_radius
+            if users is not None:
+                on_trunk |= users[approach] >= 2
+            on_path = labels[approach]
+            stop = on_trunk | _runs(((on_path >= 0) & (on_path != leaf_id)), CROSSING_NODES)
+            last = np.flatnonzero(stop)
+            if not len(last):
+                return 0, False
+            return int(last[-1]) + (0 if on_trunk[last[-1]] else 1), bool(on_trunk[last[-1]])
+
+        # Shared use is counted on routes already cut at stems and at blade
+        # crossings: a leaf reached *through* another leaf's blade does not
+        # share that leaf's stalk, and must not turn it into a branch.
+        users = np.zeros(len(local), np.int32)
+        if tree is not None:
+            for leaf_id, attachment, midrib_nodes, tip_local, n_members in traced:
+                route = _walk_back(predecessor, int(midrib_nodes[0]))
+                route = route[trim(route, leaf_id)[0]:]
+                users[np.unique(route[labels[route] != leaf_id])] += 1
+
+        out = []
         for leaf_id, attachment, midrib_nodes, tip_local, n_members in traced:
-            route = _walk_back(predecessor, int(midrib_nodes[0]))
-            users[np.unique(route[labels[route] != leaf_id])] += 1
+            # The route in: this leaf's path from the crown to where its midrib
+            # starts, from the last point on a stem or branch, on a course
+            # another leaf also takes, or just past a crossing of another
+            # leaf's blade (a run of CROSSING_NODES, not a graze: leaf clouds
+            # carry specks). A leaf reached *through* a neighbour (vogelmeere
+            # 8, 9, 37 climbed leaf 6's stalk) gets no route rather than its.
+            approach = _walk_back(predecessor, int(midrib_nodes[0]))
+            start_at, from_trunk = trim(approach, leaf_id, users)
+            route = approach[start_at:]
 
-    for leaf_id, attachment, midrib_nodes, tip_local, n_members in traced:
-        # One curve per leaf, from where it leaves the stem to its tip, traced
-        # through the cloud's own points; the petiole/blade border is a place
-        # on it (blade_start). Petiole and midrib used to be built separately
-        # -- the petiole from a stem-tree stalk's centre line or a path, the
-        # midrib inside the blade -- and met with gaps and overlaps: leaf 24
-        # on vogelmeere_x_1's hull ran its stalk 3 mm beside the blade, then
-        # jumped to a midrib cut back where the stalk ended.
-        #
-        # The route in: this leaf's path from the crown to where its midrib
-        # starts, from the last point on a stem or branch, on a course another
-        # leaf also takes (a branch, not a petiole), or just past a crossing of
-        # another leaf's blade. A crossing, not a graze: a run of
-        # CROSSING_NODES -- leaf clouds carry stray specks. Leaves touching a
-        # neighbour are often reached *through* it (vogelmeere leaves 8, 9 and
-        # 37 climbed leaf 6's stalk), and get no petiole rather than its.
-        approach = _walk_back(predecessor, int(midrib_nodes[0]))
-        on_trunk = np.zeros(len(approach), bool)
-        if stem_finder is not None and stem_radius > 0:
-            on_trunk = stem_finder.query(local[approach])[0] <= stem_radius
-        on_trunk |= users[approach] >= 2
-        on_path = labels[approach]
-        stop = on_trunk | _runs(((on_path >= 0) & (on_path != leaf_id)), CROSSING_NODES)
-        last = np.flatnonzero(stop)
-        start_at = int(last[-1]) + (0 if on_trunk[last[-1]] else 1) if len(last) else 0
-        route = approach[start_at:]
+            stalk = petiole_axis.get(leaf_id)
+            if not from_trunk and stalk is None and stem_finder is not None:
+                # Reached only across another leaf's blade: look for a way in
+                # through stem tissue and this leaf alone. Touching blades in
+                # the cloud make the shortest route cross them (large leaves on
+                # vogelmeere's hull, heart leaves everywhere); a route that
+                # avoids every other blade is this leaf's own, if the cloud has
+                # one. Without one the curve keeps its gap.
+                alt = _stem_route(graph, labels, leaf_id, int(midrib_nodes[0]), on_any_trunk,
+                                  8.0 * tree.shell)
+                if alt is not None:
+                    route, from_trunk = alt, True
+            if len(route) < 2 and stalk is not None:
+                # A stalk of its own but no route through it: follow the cloud
+                # from the stalk's foot on the stem to where the midrib starts.
+                from scipy.sparse.csgraph import dijkstra as _dijkstra
 
-        stalk = petiole_axis.get(leaf_id)
-        if len(route) < 2 and stalk is not None:
-            # A stalk of its own but no route through it: follow the cloud from
-            # the stalk's foot on the stem to where the midrib starts.
-            from scipy.sparse.csgraph import dijkstra as _dijkstra
+                foot = int(np.argmin(np.linalg.norm(local - stalk[0], axis=1)))
+                reach = 3.0 * _length(stalk) + 4.0 * tree.shell
+                _, pred = _dijkstra(graph, indices=foot, limit=reach, return_predecessors=True)
+                if pred[int(midrib_nodes[0])] >= 0:
+                    route = _walk_back(pred, int(midrib_nodes[0]))
+                    from_trunk = True
 
-            foot = int(np.argmin(np.linalg.norm(local - stalk[0], axis=1)))
-            reach = 3.0 * _length(stalk) + 4.0 * tree.shell
-            _, pred = _dijkstra(graph, indices=foot, limit=reach, return_predecessors=True)
-            if pred[int(midrib_nodes[0])] >= 0 or foot == int(midrib_nodes[0]):
-                route = _walk_back(pred, int(midrib_nodes[0]))
+            if len(route) >= 2:
+                raw = np.vstack([local[route], local[midrib_nodes[1:]]])
+                join = len(route) - 1
+            else:
+                raw, join = local[midrib_nodes], 0
+            # Start on the stem's centre line, not on its surface: a leaf whose
+            # route begins at a stem or branch is attached to it, and drawn
+            # from its surface it floated a stem radius or more away.
+            starts_on = "leaf" if start_at > 0 and not from_trunk else "free"
+            if from_trunk or (len(route) < 2 and stem_finder is not None):
+                d0, j0 = stem_finder.query(raw[0]) if stem_finder is not None else (np.inf, 0)
+                if d0 <= 1.2 * stem_radius:
+                    raw = np.vstack([trunk_dense[j0], raw])
+                    join += 1
+                    starts_on = "stem"
+            smooth = smooth_polyline(raw, iterations=smooth_iterations, strength=0.5) \
+                if len(raw) >= 3 else raw
 
-        if len(route) >= 2:
-            raw = np.vstack([local[route], local[midrib_nodes[1:]]])
-            join = len(route) - 1
-        else:
-            raw, join = local[midrib_nodes], 0
-        smooth = smooth_polyline(raw, iterations=smooth_iterations, strength=0.5) \
-            if len(raw) >= 3 else raw
+            # The blade starts where the leaf gets wide: a petiole is about as
+            # thick as the stem, a blade is not. Where the stem tree's stalk
+            # ends is no guide -- the stem cloud often runs on up the midrib
+            # vein, and SAM3's leaf mask often takes in part of the petiole.
+            blade = _blade_start(smooth, local[labels == leaf_id], join,
+                                 tree.radius if tree is not None else 0.0,
+                                 tree.shell if tree is not None else 0.0)
 
-        # The blade starts where this leaf's own tissue does -- unless a stalk
-        # of the stem tree ends further out along the curve: SAM3's leaf mask
-        # often takes in part of the petiole, and the stalk says where the
-        # stem tissue really ends. A stalk ending near the tip is stem tissue
-        # escorting the blade, not a petiole, and is ignored.
-        blade = join
-        if stalk is not None and len(smooth) >= 2:
-            gaps = np.linalg.norm(smooth - stalk[-1], axis=1)
-            at = int(np.argmin(gaps))
-            if at > blade and gaps[at] <= 2.0 * tree.shell and \
-                    _length(smooth[at:]) >= 0.3 * _length(smooth[join:]):
-                blade = at
+            n_pet = max(samples // 2, 4)
+            if blade > 0 and _length(smooth[:blade + 1]) > 0:
+                petiole = np.asarray(resample_by_arclength(smooth[:blade + 1], n_pet)[0], float)
+            else:
+                petiole = np.zeros((0, 3))
+            midrib = np.asarray(resample_by_arclength(smooth[blade:], samples)[0], float) \
+                if len(smooth) - blade >= 2 else _tidy(local[midrib_nodes], samples, smooth_iterations)
+            curve = np.vstack([petiole[:-1], midrib]) if len(petiole) else midrib
+            tip = local[tip_local]
+            out.append({
+                "id": leaf_id,
+                "points": int(n_members),
+                "tip": [float(v) for v in tip],
+                "base": [float(v) for v in midrib[0]],
+                # the leaf as one curve, stem to tip; the blade begins at
+                # curve[blade_start] (0 when there is no petiole)
+                "curve": curve.round(6).tolist(),
+                "blade_start": int(max(len(petiole) - 1, 0)),
+                "midrib": midrib.round(6).tolist(),
+                "petiole": petiole.round(6).tolist(),
+                "midrib_length": float(_length(midrib)),
+                "petiole_length": float(_length(petiole)),
+                # "stalk": the leaf has a stalk of its own in the stem tree, and
+                # the petiole is that stalk's tissue (traced through the cloud);
+                # "path": no stalk, the stretch of route that leads into the leaf
+                "petiole_from": ("none" if not len(petiole) else "stalk" if stalk is not None
+                                 else "path"),
+                "midrib_points": int(len(midrib_nodes)),
+                # where the curve begins: on a stem or branch centre line; just
+                # past another leaf's blade it was reached through; or neither
+                "starts_on": starts_on,
+                "height": float(tip[2]),
+            })
+        return out
 
-        n_pet = max(samples // 2, 4)
-        if blade > 0 and _length(smooth[:blade + 1]) > 0:
-            petiole = np.asarray(resample_by_arclength(smooth[:blade + 1], n_pet)[0], float)
-        else:
-            petiole = np.zeros((0, 3))
-        midrib = np.asarray(resample_by_arclength(smooth[blade:], samples)[0], float) \
-            if len(smooth) - blade >= 2 else _tidy(local[midrib_nodes], samples, smooth_iterations)
-        curve = np.vstack([petiole[:-1], midrib]) if len(petiole) else midrib
-        base = midrib[0]
-        tip = local[tip_local]
-        leaves.append({
-            "id": leaf_id,
-            "points": int(n_members),
-            "tip": [float(v) for v in tip],
-            "base": [float(v) for v in base],
-            # the leaf as one curve, stem to tip; the blade begins at
-            # curve[blade_start] (0 when there is no petiole)
-            "curve": curve.round(6).tolist(),
-            "blade_start": int(max(len(petiole) - 1, 0)),
-            "midrib": midrib.round(6).tolist(),
-            "petiole": petiole.round(6).tolist(),
-            "midrib_length": float(_length(midrib)),
-            "petiole_length": float(_length(petiole)),
-            # "stalk": the leaf has a stalk of its own in the stem tree, and
-            # the petiole is that stalk's tissue (traced through the cloud);
-            # "path": no stalk, the stretch of route that leads into the leaf
-            "petiole_from": ("none" if not len(petiole) else "stalk" if stalk is not None
-                             else "path"),
-            "midrib_points": int(len(midrib_nodes)),
-            "height": float(tip[2]),
-        })
+    leaves = leaf_curves()
+
+    # A childless "branch" carrying one leaf -- that leaf's blade starts at its
+    # end or along it, and no other leaf's does -- is that leaf's stalk: a long
+    # petiole off the main stem, like leaf 24's, not a shoot. The stem tree's
+    # own test missed these (on vogelmeere's hull, 11 of 18 branches carried
+    # one leaf), mostly because the stem cloud runs on past the blade's base
+    # up the midrib, so the axis's far end sat inside the blade. Branches with
+    # two leaves at their end (an opposite pair at a node) or child shoots stay.
+    if tree is not None and tree.axes:
+        has_children = {axis.parent for axis in tree.axes}
+        starts = {leaf["id"]: np.asarray(leaf["curve"][leaf["blade_start"]]) for leaf in leaves}
+        changed = 0
+        for i, axis in enumerate(tree.axes):
+            if axis.kind != "branch" or i in has_children:
+                continue
+            line = axis_lines[i]
+            near = {k for k, b in starts.items() if np.linalg.norm(b - line[-1]) <= 1.5 * tree.shell}
+            if len(line) > 2:
+                near |= {k for k, b in starts.items()
+                         if np.min(np.linalg.norm(line[1:-1] - b, axis=1)) <= 0.8 * tree.shell}
+            if len(near) == 1:
+                axis.kind, axis.leaf = "petiole", int(next(iter(near)))
+                changed += 1
+        if changed:
+            axes_out = [axis.to_dict(line, i) for i, (axis, line) in enumerate(zip(tree.axes, axis_lines))]
+            leaves = leaf_curves()
 
     return {"crown": [float(v) for v in crown], "stem": stem.round(6).tolist(), "leaves": leaves,
             "axes": axes_out,
             "stem_tree": tree.summary() if tree is not None else None,
             "unreachable": unreachable, "crown_moved_to_largest_component": moved,
             "graph_components": int(n_parts), "dropped_because": dropped_because}
+
+
+def _stem_route(graph, labels: np.ndarray, leaf_id: int, target: int, on_trunk: np.ndarray,
+                limit: float):
+    """Node path from the nearest stem/branch point to `target`, through stem tissue
+    and this leaf's own points only (crown-first order), or None."""
+    from scipy.sparse.csgraph import dijkstra
+
+    allowed = np.flatnonzero((labels == SKELETON) | (labels == leaf_id))
+    pos = np.searchsorted(allowed, target)
+    if pos >= len(allowed) or allowed[pos] != target:
+        return None
+    sub = graph[allowed][:, allowed]
+    dist, pred = dijkstra(sub, indices=int(pos), limit=limit, return_predecessors=True)
+    hits = np.flatnonzero(np.isfinite(dist) & on_trunk[allowed])
+    if not len(hits):
+        return None
+    best = int(hits[np.argmin(dist[hits])])
+    chain = []
+    node = best
+    while node >= 0:
+        chain.append(int(allowed[node]))
+        node = int(pred[node])
+    route = np.array(chain, dtype=int)              # trunk point ... target
+    return route if len(route) >= 2 else None
+
+
+def _blade_start(curve: np.ndarray, leaf_points: np.ndarray, join: int,
+                 stem_radius: float, shell: float) -> int:
+    """Index on `curve` where the leaf turns from stalk into blade: where its own
+    points first spread wider than half their widest, and than a stem.
+
+    Half-width at each curve point: the 90th percentile distance from the curve
+    of the leaf's points in a slab across it. Searched from the start up to the
+    widest point; without a width signal (no tree, a sliver of a leaf) the
+    blade starts where the leaf's own tissue does (`join`).
+    """
+    if stem_radius <= 0 or len(curve) < 4 or len(leaf_points) < 20:
+        return join
+    finder = cKDTree(leaf_points)
+    tangent = np.gradient(curve, axis=0)
+    tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-12)
+    slab, reach = 0.5 * shell, 4.0 * shell
+    width = np.zeros(len(curve))
+    for i, (c, t) in enumerate(zip(curve, tangent)):
+        near = leaf_points[finder.query_ball_point(c, reach)]
+        if len(near) < 5:
+            continue
+        rel = near - c
+        across = rel[np.abs(rel @ t) <= slab]
+        if len(across) >= 5:
+            width[i] = np.percentile(np.linalg.norm(across - np.outer(across @ t, t), axis=1), 90)
+    if width.max() <= 0:
+        return join
+    widest = int(np.argmax(width))
+    wide = np.flatnonzero((width[:widest + 1] >= 0.5 * width.max())
+                          & (width[:widest + 1] >= 1.5 * stem_radius))
+    return int(wide[0]) if len(wide) else join
 
 
 def _densify(line: np.ndarray, per_segment: int = 8) -> np.ndarray:
