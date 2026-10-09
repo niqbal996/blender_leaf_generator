@@ -790,7 +790,8 @@ def build(workdir, point_radius=None, stem_radius=None, frame=True,
             "graph": graph}
 
 
-def build_p5x(workdir, point_radius=None, frame=True, clear=True):
+def build_p5x(workdir, point_radius=None, frame=True, clear=True, folder="p5x", prefix="p5x",
+              offset=None):
     """Draw a P5x result: one object per leaf, plus the skeleton and root.
 
     P5x is the alternative to P4c+P5 and its output is a different shape, so
@@ -806,7 +807,8 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True):
     same in a screenshot and can do none of that.
     """
     workdir = Path(workdir)
-    p5x = workdir / "p5x"
+    p5x = workdir / folder
+    off = np.zeros(3) if offset is None else np.asarray(offset, float)
     cloud = p5x / "segmented.ply"
     if not cloud.exists():
         print(f"[plant] ERROR: {cloud} not found.")
@@ -828,6 +830,7 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True):
         _PREPARED.clear()
         clear_startup_scene()
 
+    xyz = xyz + off
     low, high = xyz.min(axis=0), xyz.max(axis=0)
     extent = float((high - low).max())
     if point_radius is None:
@@ -838,19 +841,19 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True):
     # import the repo.
     SKELETON, ROOT = -2, -3
 
-    leaves_coll = _collection("p5x_leaves")
+    leaves_coll = _collection(f"{prefix}_leaves")
     drawn = 0
     for leaf_id in sorted({int(v) for v in np.unique(label) if v >= 0}):
         keep = label == leaf_id
         add_point_cloud(xyz[keep], rgb[keep], point_radius, leaves_coll,
-                        name=f"p5x_leaf_{leaf_id:03d}")
+                        name=f"{prefix}_leaf_{leaf_id:03d}")
         drawn += 1
 
     # Label -2 is the tissue that voted "stem" -- the stem cloud, the same
     # points P5 draws as plant_stem_cloud. It was drawn as "p5x_skeleton",
     # which read as the skeleton itself; the skeleton is the curves below.
-    for value, name, coll in ((SKELETON, "p5x_stem_cloud", "p5x_stem_cloud"),
-                              (ROOT, "p5x_root", "p5x_root")):
+    for value, name, coll in ((SKELETON, f"{prefix}_stem_cloud", f"{prefix}_stem_cloud"),
+                              (ROOT, f"{prefix}_root", f"{prefix}_root")):
         keep = label == value
         if keep.any():
             add_point_cloud(xyz[keep], rgb[keep], point_radius,
@@ -865,44 +868,48 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True):
     if graph_path.exists():
         with open(graph_path) as f:
             graph = json.load(f)
-        ribs = _collection("p5x_midribs")
-        petioles = _collection("p5x_petioles")
-        tips = _collection("p5x_tips")
+        ribs = _collection(f"{prefix}_midribs")
+        petioles = _collection(f"{prefix}_petioles")
+        tips = _collection(f"{prefix}_tips")
         for leaf in graph.get("leaves", []):
             colour = LEAF_RGBA[leaf["id"] % len(LEAF_RGBA)]
             midrib = np.asarray(leaf.get("midrib") or [], float)
+            midrib = midrib + off if len(midrib) else midrib
             if len(midrib) >= 2:
-                add_curve(midrib, f"p5x_midrib_{leaf['id']:03d}", colour,
+                add_curve(midrib, f"{prefix}_midrib_{leaf['id']:03d}", colour,
                           point_radius * 1.6, ribs)
                 drawn_ribs += 1
             petiole = np.asarray(leaf.get("petiole") or [], float)
+            petiole = petiole + off if len(petiole) else petiole
             if len(petiole) >= 2:
-                add_curve(petiole, f"p5x_petiole_{leaf['id']:03d}", PETIOLE_RGBA,
+                add_curve(petiole, f"{prefix}_petiole_{leaf['id']:03d}", PETIOLE_RGBA,
                           point_radius * 1.3, petioles)
-            add_sphere(np.asarray(leaf["tip"], float), f"p5x_tip_{leaf['id']:03d}",
+            add_sphere(np.asarray(leaf["tip"], float) + off, f"{prefix}_tip_{leaf['id']:03d}",
                        TIP_RGBA, point_radius * 3.0, tips)
         # The stem, once. Older skeleton.json files have no "stem": each leaf's
         # petiole then still runs from the crown, and that is how they draw.
         stem = np.asarray(graph.get("stem") or [], float)
+        stem = stem + off if len(stem) else stem
         if len(stem) >= 2:
-            add_curve(stem, "p5x_stem", STEM_RGBA, point_radius * 2.2, _collection("p5x_stem"))
+            add_curve(stem, f"{prefix}_stem", STEM_RGBA, point_radius * 2.2, _collection(f"{prefix}_stem"))
         # The branches of the stem tree, thinner with each order. A stalk that
         # carries one leaf is that leaf's petiole and is drawn with it above.
         branches = [a for a in graph.get("axes") or [] if a.get("kind") == "branch"]
         for axis in branches:
             line = np.asarray(axis["points"], float)
+            line = line + off if len(line) else line
             if len(line) >= 2:
-                add_curve(line, f"p5x_branch_{axis['id']:02d}_order{axis['order']}", BRANCH_RGBA,
+                add_curve(line, f"{prefix}_branch_{axis['id']:02d}_order{axis['order']}", BRANCH_RGBA,
                           point_radius * max(1.9 - 0.3 * axis["order"], 1.0),
-                          _collection("p5x_branches"))
+                          _collection(f"{prefix}_branches"))
         if graph.get("stem_tree"):
             tree = graph["stem_tree"]
             print(f"[plant] stem tree: {len(branches)} branches, "
                   f"{tree['axes'].get('petiole', 0)} leaf stalks, {tree['forks']} forks")
         crown = graph.get("crown")
         if crown:
-            add_sphere(np.asarray(crown, float), "p5x_crown", CROWN_RGBA,
-                       point_radius * 4.5, _collection("p5x_crown"))
+            add_sphere(np.asarray(crown, float) + off, f"{prefix}_crown", CROWN_RGBA,
+                       point_radius * 4.5, _collection(f"{prefix}_crown"))
         print(f"[plant] {drawn_ribs} midribs, {len(graph.get('leaves', []))} tips, "
               f"crown {'placed' if crown else 'not found'}")
         if graph.get("unreachable"):
@@ -915,13 +922,50 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True):
     print(f"[plant] P5x: {drawn} leaves, "
           f"{int((label == SKELETON).sum())} stem-cloud points, "
           f"{int((label == ROOT).sum())} root points")
-    print("[plant] each leaf is its own object under the 'p5x_leaves' collection")
+    print(f"[plant] each leaf is its own object under the '{prefix}_leaves' collection")
     print("[plant] if everything looks grey, the viewport is in Solid shading with")
     print("[plant] Color set to Material -- press Z and pick Material Preview, or set")
     print("[plant] Viewport Shading > Color > Attribute.")
     if frame:
         frame_view((low + high) / 2.0, extent)
     return {"leaves": drawn, "points": len(xyz), "extent": extent}
+
+
+def build_p5x_comparison(workdir, folders, gap=1.2, frame=True):
+    """Several P5x results of one plant side by side -- one per point cloud it labelled.
+
+    `pose-leaf-instances --cloud <cloud> --out p5x_<name>` writes them; all are in
+    P5's plant frame and P3's units, so they are placed at their true size.
+    Each folder's objects and collections are prefixed with its name.
+    """
+    workdir = Path(workdir)
+    _PREPARED.clear()
+    clear_startup_scene()
+    present = [f for f in folders if (workdir / f / "segmented.ply").exists()]
+    for f in folders:
+        if f not in present:
+            print(f"[plant] NOTE: {workdir / f / 'segmented.ply'} not found -- skipped")
+    if not present:
+        return None
+    xyz, _, _ = read_ply(workdir / present[0] / "segmented.ply")
+    low, high = xyz.min(axis=0), xyz.max(axis=0)
+    width, extent = float(high[0] - low[0]), float((high - low).max())
+    radius = extent * 0.0022
+    built = {}
+    for i, f in enumerate(present):
+        offset = np.array([i * width * gap, 0.0, 0.0])
+        print(f"\n[plant] --- {f} at x={offset[0]:.3f} ---")
+        built[f] = build_p5x(workdir, point_radius=radius, frame=False, clear=False, folder=f,
+                             prefix=f, offset=offset)
+        n = built[f]["leaves"] if built[f] else 0
+        add_label(f"{f}  ({n} leaves)", (offset[0] + (low[0] + high[0]) / 2, (low[1] + high[1]) / 2,
+                                          low[2] - extent * 0.08),
+                  extent * 0.05, _collection("p5x_compare_labels"), f"label_{f}")
+    if frame:
+        span = width * gap * (len(present) - 1)
+        frame_view((low + high) / 2.0 + [span / 2.0, 0.0, 0.0], extent + span)
+    print("\n[plant] left to right: " + ", ".join(present))
+    return built
 
 
 def build_skeleton2d(path, point_radius=None, frame=True, clear=False):
@@ -1264,8 +1308,11 @@ def main():
     clouds = _after(script_args(list(sys.argv)), "--clouds", os.environ.get("PLANT_CLOUDS", ""))
     if "--clouds" in script_args(list(sys.argv)) and (not clouds or clouds.startswith("--")):
         clouds = ",".join(CLOUD_VARIANTS)
+    p5x_compare = _after(script_args(list(sys.argv)), "--p5x-compare", os.environ.get("PLANT_P5X_COMPARE", ""))
     try:
-        if clouds:
+        if p5x_compare:
+            build_p5x_comparison(target, [c for c in p5x_compare.split(",") if c])
+        elif clouds:
             build_clouds(target, [c for c in clouds.split(",") if c])
         elif skeleton2d and not want_p5x:
             build_skeleton2d(skeleton2d, clear=True)

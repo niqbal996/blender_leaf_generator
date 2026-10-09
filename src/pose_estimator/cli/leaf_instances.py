@@ -537,11 +537,12 @@ def run(
     covisible_frames: int = 2,
     occlusion_test: bool = True,
     keep_fragments: bool = False,
+    out: str = "p5x",
 ) -> dict:
     import pycolmap
 
     p2 = workdir / "p2"
-    p5x = workdir / "p5x"
+    p5x = workdir / out
     p5x.mkdir(parents=True, exist_ok=True)
 
     leaf_dirs = usable_instances(p2 / "masks" / "leaf_instances", min_frames)
@@ -1111,6 +1112,9 @@ def main(argv: Optional[list] = None) -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workdir", required=True, type=Path)
     add_arguments(parser)
+    parser.add_argument("--out", default="p5x",
+                        help="output folder under the workdir (default p5x); e.g. p5x_p4m with "
+                             "--cloud p4m/... to label another cloud without touching p5x/")
     parser.add_argument("--retrace", action="store_true",
                         help="re-trace the skeleton (stem tree, midribs, petioles) from "
                              "p5x/segmented.ply and stop -- seconds, for when only the "
@@ -1124,7 +1128,7 @@ def main(argv: Optional[list] = None) -> None:
         normal_weighting=not args.no_normal_weighting,
         occlusion_test=not args.no_occlusion_test,
         geometry_backend=args.geometry_backend, cloud=args.cloud, source=args.source,
-        merge_overlap=args.merge_overlap, covisible_frames=args.covisible_frames)
+        merge_overlap=args.merge_overlap, covisible_frames=args.covisible_frames, out=args.out)
 
 
 if __name__ == "__main__":

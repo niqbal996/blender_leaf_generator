@@ -101,6 +101,11 @@ main() {
                 SCRIPT_ARGS+=("$1"); shift ;;
             # The geometry phases' clouds side by side (P4a, P4b, P4m, P4g),
             # or the comma list given: same units, same plant frame.
+            # P5x results on several clouds side by side: p5x_<name> folders
+            # written by pose-leaf-instances --cloud ... --out p5x_<name>.
+            --p5x-compare)
+                if [[ $# -ge 2 && "$2" != -* ]]; then SCRIPT_ARGS+=("$1" "$2"); shift 2
+                else SCRIPT_ARGS+=("$1" "p5x_p4a,p5x_p4b,p5x_p4m"); shift; fi ;;
             --clouds)
                 if [[ $# -ge 2 && "$2" != -* ]]; then SCRIPT_ARGS+=("$1" "$2"); shift 2
                 else SCRIPT_ARGS+=("$1" "p4a,p4b,p4m,p4g"); shift; fi ;;
