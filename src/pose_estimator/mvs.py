@@ -246,8 +246,12 @@ def own_fuse(out: Path, input_type: str = "geometric", min_consistent: int = 2, 
     Each image's depth map, inside its plant mask, is back-projected; a point
     is kept when at least `min_consistent` of its source views (from
     patch-match.cfg) have a depth within `consistency_px` of it, in their own
-    pixels at its depth -- the test P4g uses on rendered depth. Normals
-    come from COLMAP's normal maps, colour from the undistorted photo.
+    pixels at its depth -- the test P4g uses on rendered depth. A kept point
+    is the mean of its own and the agreeing views' surface points along its
+    ray (a single view's depth is noisy across the blade, ~0.5 mm sheets on
+    vogelmeere without it). Normals are fitted by the caller after merging --
+    COLMAP's per-pixel normal maps are noisy -- and colour comes from the
+    undistorted photo.
 
     Exists because pycolmap-cuda 3.13.0.dev2's fuser returned 0 points per
     image on vogelmeere's maps, which covered 35% of the plant (geometric) at
@@ -276,7 +280,7 @@ def own_fuse(out: Path, input_type: str = "geometric", min_consistent: int = 2, 
         masks[n] = (m > 0) if m is not None else np.ones(depth[n].shape, bool)
     log(f"  own fusion: {len(depth)} {input_type} depth maps, {neighbours} source views each, "
         f"agreement within {consistency_px:g} px, at least {min_consistent} views")
-    P, N, C = [], [], []
+    P, N, C, V = [], [], [], []
     raw = kept = 0
     for i, n in enumerate(names):
         if n not in depth:
@@ -294,6 +298,7 @@ def own_fuse(out: Path, input_type: str = "geometric", min_consistent: int = 2, 
         X = (cam - m[:3, 3]) @ m[:3, :3]
         raw += len(X)
         agree = np.zeros(len(X), np.int32)
+        acc = X.copy()                            # sum of the agreeing views' points
         for src in [s_ for s_ in sources.get(n, []) if s_ in depth][:neighbours]:
             Kj, mj = cams[src]
             dj = depth[src]
@@ -305,21 +310,37 @@ def own_fuse(out: Path, input_type: str = "geometric", min_consistent: int = 2, 
             seen = np.zeros(len(X))
             seen[ok] = dj[yi[ok], xi[ok]]
             tol = consistency_px * cj[:, 2] / Kj[0, 0]
-            agree += ((seen > 0) & (np.abs(seen - cj[:, 2]) <= tol)).astype(np.int32)
+            ok_j = (seen > 0) & (np.abs(seen - cj[:, 2]) <= tol)
+            agree += ok_j.astype(np.int32)
+            # that view's own surface point on the same ray, for the average
+            cam_j = np.stack([(u - Kj[0, 2]) / Kj[0, 0] * seen, (v - Kj[1, 2]) / Kj[1, 1] * seen, seen], 1)
+            acc[ok_j] += ((cam_j - mj[:3, 3]) @ mj[:3, :3])[ok_j]
         keep = agree >= min_consistent
+        # each kept point is the mean of its own and the agreeing views' points:
+        # one view's depth is noisy across the blade, COLMAP's fuser averages too
+        X = acc / (agree[:, None] + 1.0)
         kept += int(keep.sum())
-        normal_path = dense / "stereo" / "normal_maps" / f"{n}.{input_type}.bin"
-        if normal_path.exists():
-            nc = read_colmap_array(normal_path)[ys[keep], xs[keep]].astype(np.float64)
-            N.append(nc @ m[:3, :3])                      # camera -> world
-        else:
-            N.append(np.zeros((int(keep.sum()), 3)))
+        N.append(np.zeros((int(keep.sum()), 3)))       # fitted after merging (fuse)
         photo = cv2.imread(str(dense / "images" / n), cv2.IMREAD_COLOR)
         C.append(photo[ys[keep], xs[keep]][:, ::-1] if photo is not None
                  else np.full((int(keep.sum()), 3), 128, np.uint8))
         P.append(X[keep])
+        V.append(np.full(int(keep.sum()), i, np.int32))
         if (i + 1) % 10 == 0 or i == len(names) - 1:
             log(f"  own fusion {i + 1}/{len(names)}: {raw:,} depths back-projected, {kept:,} agreed")
+    # a sample of the points before merging, with the view each came from:
+    # whether the two passes' surfaces coincide (the plant can move between
+    # passes) is measured from this, without the 50 GB of depth maps
+    if P:
+        allP, allV = np.vstack(P), np.concatenate(V)
+        pick = np.random.default_rng(0).choice(len(allP), min(3_000_000, len(allP)), replace=False)
+        try:
+            src = json.loads((out.parent / "p1" / "sources.json").read_text())
+        except OSError:
+            src = {}
+        passes = np.array([int(src.get(Path(n).stem, -1)) for n in names])
+        np.savez_compressed(out / "fused_raw_sample.npz", points=allP[pick].astype(np.float32),
+                            view=allV[pick], view_names=np.array(names), view_pass=passes)
     f_med = float(np.median([cams[n][0][0, 0] for n in depth]))
     z_med = float(np.median([np.median(depth[n][depth[n] > 0]) for n in depth if (depth[n] > 0).any()]))
     voxel = stride * z_med / f_med
@@ -385,7 +406,9 @@ def fuse(out: Path, info: dict, hull: np.ndarray, p3_focal: float, min_num_pixel
         pts, nrm, col, voxel = own_fuse(out, input_type=input_type, min_consistent=max(1, min_num_pixels - 1),
                                         log=log)
         pts, nrm, col = consolidate(pts, nrm, col, voxel)
-        log(f"  merged per {voxel:.6f}-unit voxel (2 px at the plant's depth): {len(pts):,} points")
+        nrm = _pca_normals(pts, k=16)
+        log(f"  merged per {voxel:.6f}-unit voxel (2 px at the plant's depth): {len(pts):,} points; "
+            "normals fitted to 16 neighbours")
     und = pycolmap.Reconstruction(str(out / "dense" / "sparse"))
     centres = np.array([-_w2c(im)[:3, :3].T @ _w2c(im)[:3, 3] for im in und.images.values()])
     # the plant is small next to the camera distance: one depth serves the bound
