@@ -140,7 +140,7 @@ def read_ply_vertices(path: Union[str, Path]) -> Dict[str, np.ndarray]:
         data_lines = [line for line in data_lines if line.strip()][:n_vertices]
         if len(data_lines) != n_vertices:
             raise ValueError(f"expected {n_vertices} vertex rows, found {len(data_lines)} in {path}")
-        parsed = np.array([line.split() for line in data_lines], dtype=np.float64)
+        parsed = np.array([line.split() for line in data_lines], dtype=np.float64).reshape(n_vertices, len(props))
         for col_idx, (ply_type, name) in enumerate(props):
             dtype = _NUMPY_DTYPE_BY_PLY_TYPE.get(ply_type, np.float32)
             fields[name] = parsed[:, col_idx].astype(dtype)

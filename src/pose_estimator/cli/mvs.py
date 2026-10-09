@@ -47,6 +47,8 @@ def main(argv: Optional[list] = None) -> None:
     ap.add_argument("--min-num-pixels", type=int, default=3,
                     help="fusion: views a point must be seen consistently in")
     ap.add_argument("--gpu-index", default="-1")
+    ap.add_argument("--plain-fusion", action="store_true",
+                    help="fuse without the plant masks and bounding box (the hull bound still applies)")
     ap.add_argument("--stop-after", choices=["prepare", "patch_match", "fuse"], default="fuse")
     ap.add_argument("--redo-patch-match", action="store_true")
     args = ap.parse_args(argv)
@@ -60,7 +62,7 @@ def main(argv: Optional[list] = None) -> None:
     p3_focal = float(np.mean([rec.cameras[c].mean_focal_length() for c in rec.cameras]))
 
     maps = out / "dense" / "stereo" / "depth_maps"
-    have_maps = maps.is_dir() and any(maps.glob("*.geometric.bin"))
+    have_maps = maps.is_dir() and (any(maps.glob("*.geometric.bin")) or any(maps.glob("*.photometric.bin")))
     if have_maps and not args.redo_patch_match:
         print(f"P4m: reusing the depth maps in {maps}")
         info = json.loads((out / "prepare.json").read_text())
@@ -78,13 +80,14 @@ def main(argv: Optional[list] = None) -> None:
     if args.stop_after == "patch_match":
         return
     print("P4m: fusion on the plant")
-    pts, nrm, col, stats = mvs.fuse(out, info, hull, p3_focal, min_num_pixels=args.min_num_pixels)
+    pts, nrm, col, stats = mvs.fuse(out, info, hull, p3_focal, min_num_pixels=args.min_num_pixels,
+                                    plain=args.plain_fusion)
     write_ply_vertices(out / "surface.ply", {
         "x": pts[:, 0].astype(np.float32), "y": pts[:, 1].astype(np.float32),
         "z": pts[:, 2].astype(np.float32),
         "nx": nrm[:, 0].astype(np.float32), "ny": nrm[:, 1].astype(np.float32),
         "nz": nrm[:, 2].astype(np.float32),
-        "red": col[:, 0], "green": col[:, 1], "blue": col[:, 2]})
+        "red": col[:, 0], "green": col[:, 1], "blue": col[:, 2]}, binary=True)
     report = {**info, **stats, "settings": vars(args) | {"workdir": str(wd), "source_root": str(args.source_root)},
               "seconds": {"prepare_and_patch_match": round(t_pm), "total": round(time.time() - t0)}}
     (out / "p4m.json").write_text(json.dumps(report, indent=1, default=str))

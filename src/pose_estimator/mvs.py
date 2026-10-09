@@ -176,6 +176,52 @@ def patch_match(out: Path, info: dict, window_radius: int = 5, iterations: int =
     pycolmap.patch_match_stereo(str(out / "dense"), options=opts)
 
 
+def read_colmap_array(path: Path) -> np.ndarray:
+    """A COLMAP depth/normal map (.bin): 'w&h&c&' then float32, channel-major."""
+    with open(path, "rb") as f:
+        head = b""
+        while head.count(b"&") < 3:
+            head += f.read(1)
+        w, h, c = (int(x) for x in head.split(b"&")[:3])
+        data = np.fromfile(f, np.float32, w * h * c)
+    return data.reshape(c, h, w).transpose(1, 2, 0)
+
+
+def depth_coverage(out: Path, n: int = 4, log=print) -> dict:
+    """{map type: median share of plant-mask pixels with a depth} over a few images.
+
+    What fusion has to work with: if the geometric pass filtered (almost)
+    everything, fusion makes nothing, which is what an empty P4m looks like.
+    """
+    stereo = out / "dense" / "stereo"
+    names = [l.strip() for l in (stereo / "fusion.cfg").read_text().splitlines() if l.strip()]
+    pick = [names[int(i)] for i in np.linspace(0, len(names) - 1, n).round()]
+    report = {}
+    for kind in ("photometric", "geometric"):
+        have = sorted((stereo / "depth_maps").glob(f"*.{kind}.bin"))
+        shares, ranges = [], []
+        for name in pick:
+            path = stereo / "depth_maps" / f"{name}.{kind}.bin"
+            mask = cv2.imread(str(out / "dense" / "masks" / f"{name}.png"), cv2.IMREAD_GRAYSCALE)
+            if not path.exists() or mask is None:
+                continue
+            d = read_colmap_array(path)[..., 0]
+            plant = mask > 0
+            if d.shape != plant.shape:
+                log(f"  {name}.{kind}: depth map {d.shape} but mask {plant.shape}")
+                continue
+            valid = plant & (d > 0)
+            shares.append(float(valid.sum() / max(plant.sum(), 1)))
+            if valid.any():
+                ranges.append((float(np.percentile(d[valid], 1)), float(np.percentile(d[valid], 99))))
+        report[kind] = {"maps": len(have), "plant_covered": float(np.median(shares)) if shares else 0.0,
+                        "depth_p1_p99": ranges[:1]}
+        log(f"  {kind:11s} depth maps: {len(have)}; plant pixels with a depth (median over "
+            f"{len(shares)} images): {report[kind]['plant_covered']:.0%}"
+            + (f"; depths {ranges[0][0]:.3f}..{ranges[0][1]:.3f}" if ranges else ""))
+    return report
+
+
 def _pca_normals(points: np.ndarray, k: int = 12) -> np.ndarray:
     from scipy.spatial import cKDTree
 
@@ -187,25 +233,34 @@ def _pca_normals(points: np.ndarray, k: int = 12) -> np.ndarray:
 
 
 def fuse(out: Path, info: dict, hull: np.ndarray, p3_focal: float, min_num_pixels: int = 3,
-         hull_slack_px: float = 6.0, log=print):
+         hull_slack_px: float = 6.0, plain: bool = False, log=print):
     """Steps 5-6: fused points restricted to the plant. Returns (points, normals, colours, stats)."""
     import pycolmap
     from scipy.spatial import cKDTree
 
     from pose_estimator.ply_io import read_ply_vertices
 
+    coverage = depth_coverage(out, log=log)
+    input_type = "geometric"
+    if coverage["geometric"]["plant_covered"] < 0.02 <= coverage["photometric"]["plant_covered"]:
+        input_type = "photometric"
+        log("  the geometric maps are (almost) empty -- fusing the photometric ones instead")
     opts = pycolmap.StereoFusionOptions()
-    opts.mask_path = str(out / "dense" / "masks")
     opts.min_num_pixels = int(min_num_pixels)
-    opts.bounding_box = (np.asarray(info["bbox"][0], np.float32), np.asarray(info["bbox"][1], np.float32))
+    if plain:
+        # no masks, no box: the hull bound below still removes the background
+        log("  plain fusion: no plant masks, no bounding box")
+    else:
+        opts.mask_path = str(out / "dense" / "masks")
+        opts.bounding_box = (np.asarray(info["bbox"][0], np.float32), np.asarray(info["bbox"][1], np.float32))
     fused = out / "fused.ply"
     if fused.exists():
         fused.unlink()
     try:                                  # pycolmap 4.x writes the PLY itself
-        result = pycolmap.stereo_fusion(str(fused), str(out / "dense"), input_type="geometric",
+        result = pycolmap.stereo_fusion(str(fused), str(out / "dense"), input_type=input_type,
                                         options=opts, output_type="PLY")
     except TypeError:                     # 3.13 has no output_type and returns a model
-        result = pycolmap.stereo_fusion(str(fused), str(out / "dense"), input_type="geometric",
+        result = pycolmap.stereo_fusion(str(fused), str(out / "dense"), input_type=input_type,
                                         options=opts)
     if fused.exists() and fused.is_file():
         f = read_ply_vertices(fused)
@@ -229,7 +284,11 @@ def fuse(out: Path, info: dict, hull: np.ndarray, p3_focal: float, min_num_pixel
         nrm *= np.where(np.einsum("ij,ij->i", nrm, near - pts) < 0, -1.0, 1.0)[:, None]
     d_hull, _ = cKDTree(hull).query(pts)
     keep = d_hull <= hull_slack_px * depth / p3_focal
-    stats = {"fused": int(len(pts)), "inside_hull_bound": int(keep.sum())}
+    stats = {"fused": int(len(pts)), "inside_hull_bound": int(keep.sum()), "input_type": input_type,
+             "coverage": coverage}
+    if not len(pts):
+        log("  WARNING: fusion produced no points. The coverage lines above say whether the depth "
+            "maps hold any plant; send them with p4m/run.log")
     log(f"  fused {len(pts):,} points, {int(keep.sum()):,} inside the hull bound "
         f"({hull_slack_px:g} P3 px at their depth)")
     return pts[keep], nrm[keep], col[keep], stats

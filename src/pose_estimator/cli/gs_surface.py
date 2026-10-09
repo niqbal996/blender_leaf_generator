@@ -55,7 +55,9 @@ def run(workdir: Path, scale: float = 1.0, iterations: int = 30_000, seeds: int 
     views = load_fine_views(workdir, hull, scale=scale, source_root=source_root, frames=frames)
     mvs_cloud = workdir / "p4m" / "surface.ply"
     if init == "auto":
-        init = "p4m" if mvs_cloud.exists() else "hull"
+        init = "p4m" if mvs_cloud.exists() and _vertex_count(mvs_cloud) >= 1000 else "hull"
+        if mvs_cloud.exists() and init == "hull":
+            print(f"  {mvs_cloud} has too few points to start from -- starting from the hull")
     if init == "p4m":
         m = read_ply_vertices(mvs_cloud)
         pts = np.stack([m["x"], m["y"], m["z"]], 1).astype(np.float64)
@@ -84,7 +86,7 @@ def run(workdir: Path, scale: float = 1.0, iterations: int = 30_000, seeds: int 
         "z": points[:, 2].astype(np.float32),
         "nx": normals[:, 0].astype(np.float32), "ny": normals[:, 1].astype(np.float32),
         "nz": normals[:, 2].astype(np.float32),
-        "red": colours[:, 0], "green": colours[:, 1], "blue": colours[:, 2]})
+        "red": colours[:, 0], "green": colours[:, 1], "blue": colours[:, 2]}, binary=True)
     np.savez_compressed(out / "gaussians.npz",
                         **{k: v.detach().cpu().numpy() for k, v in params.items()})
 
@@ -101,6 +103,16 @@ def run(workdir: Path, scale: float = 1.0, iterations: int = 30_000, seeds: int 
     print(f"  wrote {out / 'surface.ply'}, gaussians.npz, p4g.json, diag/  "
           f"({report['seconds']['total']} s)")
     return report
+
+
+def _vertex_count(path: Path) -> int:
+    with open(path, "rb") as f:
+        for line in f:
+            if line.startswith(b"element vertex"):
+                return int(line.split()[2])
+            if line.startswith(b"end_header"):
+                break
+    return 0
 
 
 def _diagnostics(params, views, diag: Path, sh_degree: int, device: str) -> float:
