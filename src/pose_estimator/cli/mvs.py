@@ -47,6 +47,9 @@ def main(argv: Optional[list] = None) -> None:
     ap.add_argument("--min-num-pixels", type=int, default=3,
                     help="fusion: views a point must be seen consistently in")
     ap.add_argument("--gpu-index", default="-1")
+    ap.add_argument("--fusion", choices=["auto", "colmap", "own"], default="auto",
+                    help="COLMAP's fuser, our own depth-map fusion, or COLMAP's falling back to ours "
+                         "when it keeps nothing (auto)")
     ap.add_argument("--plain-fusion", action="store_true",
                     help="fuse without the plant masks and bounding box (the hull bound still applies)")
     ap.add_argument("--stop-after", choices=["prepare", "patch_match", "fuse"], default="fuse")
@@ -81,7 +84,7 @@ def main(argv: Optional[list] = None) -> None:
         return
     print("P4m: fusion on the plant")
     pts, nrm, col, stats = mvs.fuse(out, info, hull, p3_focal, min_num_pixels=args.min_num_pixels,
-                                    plain=args.plain_fusion)
+                                    plain=args.plain_fusion, method=args.fusion)
     write_ply_vertices(out / "surface.ply", {
         "x": pts[:, 0].astype(np.float32), "y": pts[:, 1].astype(np.float32),
         "z": pts[:, 2].astype(np.float32),

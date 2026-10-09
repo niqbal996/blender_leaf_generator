@@ -232,8 +232,123 @@ def _pca_normals(points: np.ndarray, k: int = 12) -> np.ndarray:
     return np.linalg.eigh(np.einsum("nki,nkj->nij", c, c))[1][:, :, 0]
 
 
+def _read_cfg_lists(path: Path) -> dict:
+    """patch-match.cfg: {image: [source images]} (pairs of lines)."""
+    lines = [l.strip() for l in path.read_text().splitlines() if l.strip()]
+    return {lines[i]: [x.strip() for x in lines[i + 1].split(",") if x.strip()]
+            for i in range(0, len(lines) - 1, 2)}
+
+
+def own_fuse(out: Path, input_type: str = "geometric", min_consistent: int = 2, neighbours: int = 8,
+             consistency_px: float = 2.0, stride: int = 2, log=print):
+    """Depth maps fused without COLMAP's fuser: back-projected, kept where neighbours agree.
+
+    Each image's depth map, inside its plant mask, is back-projected; a point
+    is kept when at least `min_consistent` of its source views (from
+    patch-match.cfg) have a depth within `consistency_px` of it, in their own
+    pixels at its depth -- the test P4g uses on rendered depth. Normals
+    come from COLMAP's normal maps, colour from the undistorted photo.
+
+    Exists because pycolmap-cuda 3.13.0.dev2's fuser returned 0 points per
+    image on vogelmeere's maps, which covered 35% of the plant (geometric) at
+    the plant's depths, with settings the released 3.13.0 fuses with.
+    Returns (points, normals, colours uint8, voxel) -- not yet hull-bounded
+    or consolidated.
+    """
+    import pycolmap
+
+    dense = out / "dense"
+    und = pycolmap.Reconstruction(str(dense / "sparse"))
+    by_name = {im.name: im for im in und.images.values()}
+    names = [l.strip() for l in (dense / "stereo" / "fusion.cfg").read_text().splitlines() if l.strip()]
+    sources = _read_cfg_lists(dense / "stereo" / "patch-match.cfg")
+    cams, depth, masks = {}, {}, {}
+    for n in names:
+        im = by_name[n]
+        cam = und.cameras[im.camera_id]
+        K = np.asarray(cam.calibration_matrix(), float)
+        cams[n] = (K, _w2c(im))
+        path = dense / "stereo" / "depth_maps" / f"{n}.{input_type}.bin"
+        if not path.exists():
+            continue
+        depth[n] = read_colmap_array(path)[..., 0]
+        m = cv2.imread(str(dense / "masks" / f"{n}.png"), cv2.IMREAD_GRAYSCALE)
+        masks[n] = (m > 0) if m is not None else np.ones(depth[n].shape, bool)
+    log(f"  own fusion: {len(depth)} {input_type} depth maps, {neighbours} source views each, "
+        f"agreement within {consistency_px:g} px, at least {min_consistent} views")
+    P, N, C = [], [], []
+    raw = kept = 0
+    for i, n in enumerate(names):
+        if n not in depth:
+            continue
+        K, m = cams[n]
+        d = depth[n]
+        valid = (d > 0) & masks[n]
+        sub = np.zeros_like(valid)
+        sub[::stride, ::stride] = True
+        ys, xs = np.nonzero(valid & sub)
+        if not len(ys):
+            continue
+        z = d[ys, xs].astype(np.float64)
+        cam = np.stack([(xs - K[0, 2]) / K[0, 0] * z, (ys - K[1, 2]) / K[1, 1] * z, z], 1)
+        X = (cam - m[:3, 3]) @ m[:3, :3]
+        raw += len(X)
+        agree = np.zeros(len(X), np.int32)
+        for src in [s_ for s_ in sources.get(n, []) if s_ in depth][:neighbours]:
+            Kj, mj = cams[src]
+            dj = depth[src]
+            cj = X @ mj[:3, :3].T + mj[:3, 3]
+            u = cj[:, 0] / cj[:, 2] * Kj[0, 0] + Kj[0, 2]
+            v = cj[:, 1] / cj[:, 2] * Kj[1, 1] + Kj[1, 2]
+            xi, yi = np.round(u).astype(int), np.round(v).astype(int)
+            ok = (xi >= 0) & (xi < dj.shape[1]) & (yi >= 0) & (yi < dj.shape[0]) & (cj[:, 2] > 0)
+            seen = np.zeros(len(X))
+            seen[ok] = dj[yi[ok], xi[ok]]
+            tol = consistency_px * cj[:, 2] / Kj[0, 0]
+            agree += ((seen > 0) & (np.abs(seen - cj[:, 2]) <= tol)).astype(np.int32)
+        keep = agree >= min_consistent
+        kept += int(keep.sum())
+        normal_path = dense / "stereo" / "normal_maps" / f"{n}.{input_type}.bin"
+        if normal_path.exists():
+            nc = read_colmap_array(normal_path)[ys[keep], xs[keep]].astype(np.float64)
+            N.append(nc @ m[:3, :3])                      # camera -> world
+        else:
+            N.append(np.zeros((int(keep.sum()), 3)))
+        photo = cv2.imread(str(dense / "images" / n), cv2.IMREAD_COLOR)
+        C.append(photo[ys[keep], xs[keep]][:, ::-1] if photo is not None
+                 else np.full((int(keep.sum()), 3), 128, np.uint8))
+        P.append(X[keep])
+        if (i + 1) % 10 == 0 or i == len(names) - 1:
+            log(f"  own fusion {i + 1}/{len(names)}: {raw:,} depths back-projected, {kept:,} agreed")
+    f_med = float(np.median([cams[n][0][0, 0] for n in depth]))
+    z_med = float(np.median([np.median(depth[n][depth[n] > 0]) for n in depth if (depth[n] > 0).any()]))
+    voxel = stride * z_med / f_med
+    cat = lambda L, w, t: np.vstack(L).astype(t) if L else np.zeros((0, w), t)
+    return cat(P, 3, np.float64), cat(N, 3, np.float64), cat(C, 3, np.uint8), voxel
+
+
+def _colmap_fusion(pycolmap, fused: Path, out: Path, input_type: str, opts, read_ply_vertices):
+    """COLMAP's own fuser: (points, normals, colours), on pycolmap 4.x or 3.13."""
+    try:                                  # pycolmap 4.x writes the PLY itself
+        result = pycolmap.stereo_fusion(str(fused), str(out / "dense"), input_type=input_type,
+                                        options=opts, output_type="PLY")
+    except TypeError:                     # 3.13 has no output_type and returns a model
+        result = pycolmap.stereo_fusion(str(fused), str(out / "dense"), input_type=input_type,
+                                        options=opts)
+    if fused.exists() and fused.is_file():
+        f = read_ply_vertices(fused)
+        return (np.stack([f["x"], f["y"], f["z"]], 1).astype(np.float64),
+                np.stack([f["nx"], f["ny"], f["nz"]], 1).astype(np.float64),
+                np.stack([f["red"], f["green"], f["blue"]], 1).astype(np.uint8))
+    # the returned model carries points and colours but no normals: local
+    # PCA, flipped to face the nearest camera by the caller
+    ps = list(result.points3D.values())
+    pts = np.array([q.xyz for q in ps], np.float64).reshape(-1, 3)
+    return pts, _pca_normals(pts), np.array([q.color for q in ps], np.uint8).reshape(-1, 3)
+
+
 def fuse(out: Path, info: dict, hull: np.ndarray, p3_focal: float, min_num_pixels: int = 3,
-         hull_slack_px: float = 6.0, plain: bool = False, log=print):
+         hull_slack_px: float = 6.0, plain: bool = False, method: str = "auto", log=print):
     """Steps 5-6: fused points restricted to the plant. Returns (points, normals, colours, stats)."""
     import pycolmap
     from scipy.spatial import cKDTree
@@ -256,24 +371,21 @@ def fuse(out: Path, info: dict, hull: np.ndarray, p3_focal: float, min_num_pixel
     fused = out / "fused.ply"
     if fused.exists():
         fused.unlink()
-    try:                                  # pycolmap 4.x writes the PLY itself
-        result = pycolmap.stereo_fusion(str(fused), str(out / "dense"), input_type=input_type,
-                                        options=opts, output_type="PLY")
-    except TypeError:                     # 3.13 has no output_type and returns a model
-        result = pycolmap.stereo_fusion(str(fused), str(out / "dense"), input_type=input_type,
-                                        options=opts)
-    if fused.exists() and fused.is_file():
-        f = read_ply_vertices(fused)
-        pts = np.stack([f["x"], f["y"], f["z"]], 1).astype(np.float64)
-        nrm = np.stack([f["nx"], f["ny"], f["nz"]], 1).astype(np.float64)
-        col = np.stack([f["red"], f["green"], f["blue"]], 1).astype(np.uint8)
+    if method == "own":
+        pts = nrm = np.zeros((0, 3))
+        col = np.zeros((0, 3), np.uint8)
     else:
-        # the returned model carries points and colours but no normals:
-        # local PCA, flipped to face the nearest camera below
-        ps = list(result.points3D.values())
-        pts = np.array([q.xyz for q in ps], np.float64).reshape(-1, 3)
-        col = np.array([q.color for q in ps], np.uint8).reshape(-1, 3)
-        nrm = _pca_normals(pts)
+        pts, nrm, col = _colmap_fusion(pycolmap, fused, out, input_type, opts, read_ply_vertices)
+    voxel = None
+    if method == "own" or (method == "auto" and not len(pts)):
+        if method == "auto":
+            log("  COLMAP's fusion kept nothing -- fusing the depth maps directly instead")
+        from pose_estimator.gs_surface import consolidate
+
+        pts, nrm, col, voxel = own_fuse(out, input_type=input_type, min_consistent=max(1, min_num_pixels - 1),
+                                        log=log)
+        pts, nrm, col = consolidate(pts, nrm, col, voxel)
+        log(f"  merged per {voxel:.6f}-unit voxel (2 px at the plant's depth): {len(pts):,} points")
     und = pycolmap.Reconstruction(str(out / "dense" / "sparse"))
     centres = np.array([-_w2c(im)[:3, :3].T @ _w2c(im)[:3, 3] for im in und.images.values()])
     # the plant is small next to the camera distance: one depth serves the bound
@@ -285,7 +397,7 @@ def fuse(out: Path, info: dict, hull: np.ndarray, p3_focal: float, min_num_pixel
     d_hull, _ = cKDTree(hull).query(pts)
     keep = d_hull <= hull_slack_px * depth / p3_focal
     stats = {"fused": int(len(pts)), "inside_hull_bound": int(keep.sum()), "input_type": input_type,
-             "coverage": coverage}
+             "fusion": "own" if voxel is not None else "colmap", "coverage": coverage}
     if not len(pts):
         log("  WARNING: fusion produced no points. The coverage lines above say whether the depth "
             "maps hold any plant; send them with p4m/run.log")
