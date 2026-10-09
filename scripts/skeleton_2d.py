@@ -733,6 +733,7 @@ def petioles_2d(run: Run, leaves: dict, parents, stalks) -> dict:
     A rosette has no petioles at all (main()).
     """
     out = {}
+    walks_of = {}                                # key -> {frame: 2D walk} of the agreeing views
     lines = [np.atleast_2d(np.asarray(p, float)) for p in parents]
     dense = np.vstack([resample(p, max(len(p) * 8, 2)) for p in lines])
     todo = defaultdict(list)
@@ -798,10 +799,45 @@ def petioles_2d(run: Run, leaves: dict, parents, stalks) -> dict:
                 joint = dense[np.argmin(np.linalg.norm(dense - P[agree].mean(axis=0), axis=1))]
                 views = [CurveView(run, hs[k][0], resample(hs[k][2], SAMPLES_2D)) for k in agree]
                 out[key] = (fit_curve(joint, base, views, n_ctrl=3, smooth=2.0), "2D stalk walk")
+                walks_of[key] = {hs[k][0]: hs[k][2] for k in agree}
                 continue
         out[key] = (np.vstack([dense[np.argmin(np.linalg.norm(dense - base, axis=1))], base]),
                     "nearest axis point (no 2D walk agreed)")
+    petioles_2d.walks = walks_of
     return out
+
+
+def leaf_curve(run: Run, leaf: dict, rows2d, anchor: np.ndarray, walks: dict):
+    """(curve, blade_start): the leaf as one 3D curve from where it joins the plant
+    (`anchor`, the joint its 2D stalk walks agreed on) to its tip.
+
+    In each view where the stalk walk and the 2D midrib were both seen, the
+    two together are the leaf's 2D path, and the curve is fitted to that path
+    both ways -- every part of the curve is held by evidence, the stalk by the
+    walk and the blade by the midrib. (Fitted one-sided to the midrib alone,
+    the stretch between plant and blade was held by nothing and wandered.)
+    Same weights, smoothness and control points (midrib's plus petiole's) as
+    the separate fits. The blade starts where the 2D midribs do: per view the
+    curve point nearest the midrib's end away from the tip, median over views.
+    """
+    tip = np.asarray(leaf["tip"])
+    used = [r for r in rows2d if r["weight"] >= 0.2 and r["frame"] in walks]
+    views = _spread([CurveView(run, r["frame"], np.vstack([walks[r["frame"]], r["midrib"]]), r["weight"])
+                     for r in used], MAX_FIT_VIEWS)
+    if len(views) < 2:
+        return None
+    curve = fit_curve(np.asarray(anchor), tip, views, n_ctrl=5 + 3)
+    dense = resample(curve, SAMPLES_3D)
+    by_frame = {r["frame"]: r for r in used}
+    starts = []
+    for v in views:
+        mid = by_frame[v.frame]["midrib"]
+        ends = v.curve[[len(walks[v.frame]), -1]]          # the midrib's two ends, normalised
+        uv = v.project(dense)
+        tip_uv = v.project(tip[None])[0]
+        base_uv = ends[int(np.argmax(np.linalg.norm(ends - tip_uv, axis=1)))]
+        starts.append(int(np.argmin(np.linalg.norm(uv - base_uv, axis=1))))
+    return dense, int(np.median(starts))
 
 
 # --------------------------------------------------------------------------
@@ -892,6 +928,12 @@ def main():
     ap.add_argument("--profile", choices=sorted(plant_profiles.PROFILES),
                     help="use this plant's rules (pose_estimator/plant_profiles.py) instead of "
                          "the one the workdir's folder name picks")
+    ap.add_argument("--stem-tree", type=Path,
+                    help="a P5x skeleton.json whose stem tree to use (e.g. <workdir>/p5x_p4a/"
+                         "skeleton.json); default: <workdir>/p5x/skeleton.json")
+    ap.add_argument("--leaf-curves", action="store_true",
+                    help="each leaf as one curve from where it joins the plant to its tip, fitted "
+                         "to its 2D midribs (leaf_curve); petiole and midrib are cut from it")
     ap.add_argument("--petiole-rule", choices=["leaf_axis", "stem_tree", "stalk_2d"],
                     help="override the profile's petiole rule (see petioles_2d, petiole_on_tree, "
                          "petiole). A rosette has no petioles whatever this says")
@@ -1014,7 +1056,9 @@ def main():
     # The stem tree P5x traced from the stem cloud: what petioles join on a
     # plant whose leaves sit on side branches. A skeleton.json written before
     # the tree existed has no axes, so it is re-traced here.
-    p5x = run.skeleton
+    p5x = json.loads(args.stem_tree.read_text()) if args.stem_tree else run.skeleton
+    if args.stem_tree:
+        print(f"  stem tree from {args.stem_tree}: {len(p5x.get('axes') or [])} axes")
     if args.retrace_p5x or ((args.petiole_rule or profile.petiole_rule) in ("stem_tree", "stalk_2d")
                               and not p5x.get("axes")):
         from pose_estimator.leaf_skeleton import trace
@@ -1054,6 +1098,42 @@ def main():
         else:
             leaf["petiole"], leaf["petiole_rule"] = petiole(leaf, stem, crown)
         rules[leaf["petiole_rule"]] += 1
+    if args.leaf_curves:
+        # each leaf as one curve, from where its petiole joins the plant (the
+        # stem tree, the stem, or a rosette's crown) to its tip
+        rows_of = defaultdict(list)
+        for r in leaves2d:
+            rows_of[r["track"]].append(r)
+        fitted = 0
+        for key, leaf in leaves.items():
+            anchor = (np.asarray(leaf["petiole"])[0] if len(leaf["petiole"]) >= 2
+                      else np.asarray(crown) if not has_stem else None)
+            if anchor is None and trunk:
+                dense = np.vstack([resample(t, max(len(t) * 8, 2)) for t in trunk])
+                anchor = dense[np.argmin(np.linalg.norm(dense - np.asarray(leaf["base"]), axis=1))]
+            if anchor is None:
+                continue
+            best = {}
+            for t in leaf["tracks"]:
+                for r in rows_of[t]:
+                    if r["frame"] in leaf["frames"] and (r["frame"] not in best
+                                                         or r["length_px"] > best[r["frame"]]["length_px"]):
+                        best[r["frame"]] = r
+            walks = getattr(petioles_2d, "walks", {}).get(key, {})
+            if not walks:
+                # no 2D evidence for the stalk: keep the separate petiole and midrib
+                continue
+            got = leaf_curve(run, leaf, list(best.values()), anchor, walks)
+            if got is None:
+                continue
+            curve, b = got
+            leaf["curve"], leaf["blade_start"] = curve, b
+            leaf["petiole"] = curve[:b + 1] if b > 0 else np.zeros((0, 3))
+            leaf["midrib"] = curve[b:]
+            leaf["base"] = curve[b]
+            fitted += 1
+        print(f"  leaf curves (plant -> tip, fitted to each view's stalk walk + midrib): {fitted} of "
+              f"{len(leaves)}; the rest have no agreeing 2D stalk walk and keep petiole + midrib")
     blade_of = lambda l: float(np.linalg.norm(np.diff(l["midrib"], axis=0), axis=1).sum())
     pet_of = lambda l: (float(np.linalg.norm(np.diff(l["petiole"], axis=0), axis=1).sum())
                         if len(l["petiole"]) >= 2 else 0.0)
@@ -1108,6 +1188,8 @@ def main():
                        "midrib": to_plant(leaves[t]["midrib"]).tolist(),
                        "petiole": to_plant(leaves[t]["petiole"]).tolist(),
                        "petiole_rule": leaves[t]["petiole_rule"],
+                       **({"curve": to_plant(leaves[t]["curve"]).tolist(),
+                           "blade_start": int(leaves[t]["blade_start"])} if "curve" in leaves[t] else {}),
                        "colour_bgr": list(colours[t]),
                        "midrib_mm": float(np.linalg.norm(np.diff(leaves[t]["midrib"], axis=0),
                                                          axis=1).sum() * MM_PER_UNIT),

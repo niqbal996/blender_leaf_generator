@@ -1032,6 +1032,17 @@ def build_skeleton2d(path, point_radius=None, frame=True, clear=False):
         b, g, r = leaf.get("colour_bgr", (255, 255, 255))
         colour = (r / 255.0, g / 255.0, b / 255.0, 1.0)
         name = "+".join(leaf.get("sam3_ids") or [str(leaf["id"])])
+        curve = np.asarray(leaf.get("curve") or [], float)
+        if len(curve) >= 2:
+            # one curve, plant to tip (skeleton_2d.py --leaf-curves), a ball at the blade start
+            add_curve(curve, f"s2d_leaf_curve_{leaf['id']:02d}_{name}", colour, point_radius * 1.8, ribs)
+            start = int(leaf.get("blade_start") or 0)
+            if 0 < start < len(curve):
+                add_sphere(curve[start], f"s2d_blade_start_{leaf['id']:02d}", STEM_RGBA,
+                           point_radius * 2.2, petioles)
+            add_sphere(np.asarray(leaf["tip"], float), f"s2d_tip_{leaf['id']:02d}", colour,
+                       point_radius * 3.2, tips)
+            continue
         midrib = np.asarray(leaf["midrib"], float)
         if len(midrib) >= 2:
             add_curve(midrib, f"s2d_midrib_{leaf['id']:02d}_{name}", colour,
