@@ -24,6 +24,10 @@
 #
 #   ./scripts/view_in_blender.sh runs/plant_9 --p5x --skeleton2d runs/<specimen>_skeleton2d
 #
+# Two or more of them in one scene, each in collections named after its folder:
+#
+#   ./scripts/view_in_blender.sh runs/plant_9 --skeleton2d <dir>/s2d_baseline,<dir>/s2d_zoom
+#
 # The geometry phases' point clouds of one plant side by side -- the P4a hull
 # and P4b surface baselines next to P4m (MVS) and P4g (2DGS) -- in the same
 # units and plant frame:
@@ -111,9 +115,15 @@ main() {
                 else SCRIPT_ARGS+=("$1" "p4a,p4b,p4m,p4g"); shift; fi ;;
             # The 2D-built skeleton (scripts/skeleton_2d.py): its folder or
             # skeleton.json, translated like the workdir. With --p5x it is
-            # drawn over the P5x scene; alone, it is drawn by itself.
+            # drawn over the P5x scene; alone, it is drawn by itself. A comma
+            # list (A,B) draws each, its collections named after its folder.
             --skeleton2d)
-                SCRIPT_ARGS+=("$1" "$(to_windows_path "$(cd "$(dirname "$2")" && pwd)/$(basename "$2")")")
+                local parts=() part
+                IFS=',' read -ra items <<< "$2"
+                for part in "${items[@]}"; do
+                    parts+=("$(to_windows_path "$(cd "$(dirname "$part")" && pwd)/$(basename "$part")")")
+                done
+                SCRIPT_ARGS+=("$1" "$(IFS=','; echo "${parts[*]}")")
                 shift 2 ;;
             *) BLENDER_ARGS+=("$1"); shift ;;
         esac

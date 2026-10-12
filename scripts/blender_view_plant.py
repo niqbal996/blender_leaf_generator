@@ -985,7 +985,16 @@ def build_p5x_comparison(workdir, folders, gap=1.2, frame=True):
     return built
 
 
-def build_skeleton2d(path, point_radius=None, frame=True, clear=False):
+def skeleton2d_tags(arg):
+    """`--skeleton2d A[,B...]` -> [(path, tag)]: one is tagged s2d, several by folder name."""
+    paths = [p for p in arg.split(",") if p]
+    if len(paths) == 1:
+        return [(paths[0], "s2d")]
+    folder = lambda p: (Path(p).parent if Path(p).suffix == ".json" else Path(p)).name
+    return [(p, folder(p) if folder(p).startswith("s2d") else f"s2d_{folder(p)}") for p in paths]
+
+
+def build_skeleton2d(path, point_radius=None, frame=True, clear=False, tag="s2d"):
     """Draw a skeleton built in 2D and fused in 3D (scripts/skeleton_2d.py).
 
     Its skeleton.json uses P5x's schema and P5's upright plant frame, so it
@@ -993,6 +1002,9 @@ def build_skeleton2d(path, point_radius=None, frame=True, clear=False):
     toggle the s2d_* collections against p5x_midribs. Every part is its own
     object -- stem, one petiole and one midrib per leaf, one ball per tip --
     named after the SAM3 id(s) the leaf came from.
+
+    `tag` prefixes every collection and object, so two skeletons can share a
+    scene (`--skeleton2d A,B`: each tagged with its folder's name).
     """
     path = Path(path)
     if path.is_dir():
@@ -1017,17 +1029,17 @@ def build_skeleton2d(path, point_radius=None, frame=True, clear=False):
 
     stem = np.asarray(graph.get("stem") or [], float)
     if len(stem) >= 2:
-        add_curve(stem, "s2d_stem", STEM_RGBA, point_radius * 2.4, _collection("s2d_stem"))
+        add_curve(stem, f"{tag}_stem", STEM_RGBA, point_radius * 2.4, _collection(f"{tag}_stem"))
     # On a plant profiled "stem_tree" (vogelmeere) the stem is P5x's tree and
     # its branches come along; petioles join them rather than the main stem.
     for axis in graph.get("axes") or []:
         line = np.asarray(axis["points"], float)
         if axis.get("kind") == "branch" and len(line) >= 2:
-            add_curve(line, f"s2d_branch_{axis['id']:02d}_order{axis['order']}", BRANCH_RGBA,
+            add_curve(line, f"{tag}_branch_{axis['id']:02d}_order{axis['order']}", BRANCH_RGBA,
                       point_radius * max(2.0 - 0.3 * axis["order"], 1.0),
-                      _collection("s2d_branches"))
-    ribs, petioles, tips = (_collection("s2d_midribs"), _collection("s2d_petioles"),
-                            _collection("s2d_tips"))
+                      _collection(f"{tag}_branches"))
+    ribs, petioles, tips = (_collection(f"{tag}_midribs"), _collection(f"{tag}_petioles"),
+                            _collection(f"{tag}_tips"))
     for leaf in graph.get("leaves", []):
         b, g, r = leaf.get("colour_bgr", (255, 255, 255))
         colour = (r / 255.0, g / 255.0, b / 255.0, 1.0)
@@ -1035,29 +1047,29 @@ def build_skeleton2d(path, point_radius=None, frame=True, clear=False):
         curve = np.asarray(leaf.get("curve") or [], float)
         if len(curve) >= 2:
             # one curve, plant to tip (skeleton_2d.py --leaf-curves), a ball at the blade start
-            add_curve(curve, f"s2d_leaf_curve_{leaf['id']:02d}_{name}", colour, point_radius * 1.8, ribs)
+            add_curve(curve, f"{tag}_leaf_curve_{leaf['id']:02d}_{name}", colour, point_radius * 1.8, ribs)
             start = int(leaf.get("blade_start") or 0)
             if 0 < start < len(curve):
-                add_sphere(curve[start], f"s2d_blade_start_{leaf['id']:02d}", STEM_RGBA,
+                add_sphere(curve[start], f"{tag}_blade_start_{leaf['id']:02d}", STEM_RGBA,
                            point_radius * 2.2, petioles)
-            add_sphere(np.asarray(leaf["tip"], float), f"s2d_tip_{leaf['id']:02d}", colour,
+            add_sphere(np.asarray(leaf["tip"], float), f"{tag}_tip_{leaf['id']:02d}", colour,
                        point_radius * 3.2, tips)
             continue
         midrib = np.asarray(leaf["midrib"], float)
         if len(midrib) >= 2:
-            add_curve(midrib, f"s2d_midrib_{leaf['id']:02d}_{name}", colour,
+            add_curve(midrib, f"{tag}_midrib_{leaf['id']:02d}_{name}", colour,
                       point_radius * 1.8, ribs)
         petiole = np.asarray(leaf.get("petiole") or [], float)
         if len(petiole) >= 2:
-            add_curve(petiole, f"s2d_petiole_{leaf['id']:02d}", STEM_RGBA,
+            add_curve(petiole, f"{tag}_petiole_{leaf['id']:02d}", STEM_RGBA,
                       point_radius * 1.2, petioles)
-        add_sphere(np.asarray(leaf["tip"], float), f"s2d_tip_{leaf['id']:02d}", colour,
+        add_sphere(np.asarray(leaf["tip"], float), f"{tag}_tip_{leaf['id']:02d}", colour,
                    point_radius * 3.2, tips)
     if graph.get("crown"):
-        add_sphere(np.asarray(graph["crown"], float), "s2d_crown", CROWN_RGBA,
-                   point_radius * 4.5, _collection("s2d_crown"))
+        add_sphere(np.asarray(graph["crown"], float), f"{tag}_crown", CROWN_RGBA,
+                   point_radius * 4.5, _collection(f"{tag}_crown"))
     print(f"[plant] skeleton from 2D: {len(graph.get('leaves', []))} leaves, "
-          f"stem {'drawn' if len(stem) >= 2 else 'missing'} -- collections s2d_*")
+          f"stem {'drawn' if len(stem) >= 2 else 'missing'} -- collections {tag}_*")
     if frame:
         frame_view((low + high) / 2.0, extent)
     return {"leaves": len(graph.get("leaves", [])), "extent": extent}
@@ -1343,12 +1355,14 @@ def main():
         elif clouds:
             build_clouds(target, [c for c in clouds.split(",") if c])
         elif skeleton2d and not want_p5x:
-            build_skeleton2d(skeleton2d, clear=True)
+            for i, (path, tag) in enumerate(skeleton2d_tags(skeleton2d)):
+                build_skeleton2d(path, clear=i == 0, frame=i == 0, tag=tag)
         elif want_p5x:
             built = build_p5x(target)
             if skeleton2d:
                 radius = built["extent"] * 0.0022 if built else None
-                build_skeleton2d(skeleton2d, point_radius=radius, frame=False)
+                for path, tag in skeleton2d_tags(skeleton2d):
+                    build_skeleton2d(path, point_radius=radius, frame=False, tag=tag)
         elif backends:
             build_comparison(target, backends, align=align)
         else:

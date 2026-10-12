@@ -153,10 +153,17 @@ vggt = [
 # third_party/sam3 && pip install -e third_party/sam3` -- which this repo does
 # NOT use: it requires Python 3.12+ and torch 2.7+, and setup_env.sh builds a
 # 3.10 env. The transformers port runs the same weights on 3.10.
+#
+# `kernels` comes through transformers' own extra rather than a pin of ours:
+# SAM3 video loads its NMS / hole-filling / sprinkle-removal kernels only when
+# kernels' version is inside the window that transformers release accepts
+# (5.19: >=0.17,<0.18), and silently skips them otherwise. A pin here went
+# stale the moment transformers moved (0.16 vs 0.17: every P2 mask until
+# 2026-10-12 was made without that clean-up). setup_env.sh --with-sam3
+# checks that the kernel actually loads.
 sam3 = [
     "torch>=2.5",
-    "transformers>=5.0",
-    "kernels>=0.16,<0.17",
+    "transformers[kernels]>=5.0",
     "opencv-contrib-python",
 ]
 # pose-geometry --backends vggt_omega -- VGGT-Omega ships no COLMAP exporter,

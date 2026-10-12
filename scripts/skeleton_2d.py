@@ -270,6 +270,13 @@ def extract_2d(run: Run, masks, frames, junk, cache: Path, base_rule: str = "foo
                                          inside[:, 1] - (fuv[0] - px0)))]
         _, foot_dist = _farthest(sub, [foot])
 
+        def foot_at(r, c):
+            # A leaf mask can reach a few px past the plant mask's box (113 of
+            # 2537 masks on vogelmeere); off the box is off the plant: -1.
+            r, c = r - py0, c - px0
+            inside = 0 <= r < foot_dist.shape[0] and 0 <= c < foot_dist.shape[1]
+            return foot_dist[r, c] if inside else -1.0
+
         # the stem: foot -> highest stem-residual pixel the foot can reach
         stem_line = None
         reach = stem_sub & (foot_dist >= 0)
@@ -298,8 +305,7 @@ def extract_2d(run: Run, masks, frames, junk, cache: Path, base_rule: str = "foo
                 continue
             a, _ = _farthest(crop, [np.argwhere(crop)[0]])
             b, along = _farthest(crop, [a])
-            fa = foot_dist[y0 + a[0] - py0, x0 + a[1] - px0]
-            fb = foot_dist[y0 + b[0] - py0, x0 + b[1] - px0]
+            fa, fb = foot_at(y0 + a[0], x0 + a[1]), foot_at(y0 + b[0], x0 + b[1])
             tip_rc, base_rc = (a, b) if fa > fb else (b, a)
             base_by = "foot"
             anchored = stalk_end(crop, stem, x0, y0) if base_rule == "stalk" else None

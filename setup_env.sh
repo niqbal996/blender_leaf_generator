@@ -484,6 +484,34 @@ if [[ "$WITH_SAM3" -eq 1 ]]; then
         warn "if P4c starts failing, that is where to look -- or use a separate env."
     fi
     "$PY" -m pip install -e ".[sam3]"
+    # SAM3 video's mask clean-up (NMS, hole filling, sprinkle removal) is a hub
+    # kernel that transformers loads only when `kernels` is inside its version
+    # window -- otherwise it prints one warning and quietly skips it. Make the
+    # window right, then load the kernel the way transformers does.
+    WINDOW="$("$PY" -c 'from transformers.utils import import_utils as u; print(f"kernels>={u.KERNELS_MIN_VERSION},<{u.KERNELS_MAX_VERSION}")')"
+    "$PY" -c 'from transformers.utils.import_utils import is_kernels_available as k; raise SystemExit(0 if k() else 1)' \
+        || "$PY" -m pip install "$WINDOW"
+    if ! "$PY" - <<'PYCODE'
+from transformers.utils import import_utils as u
+import kernels
+ok = u.is_kernels_available()
+print(f"    kernels {kernels.__version__}, transformers wants >={u.KERNELS_MIN_VERSION},<{u.KERNELS_MAX_VERSION}: "
+      + ("ok" if ok else "OUTSIDE the window"))
+raise SystemExit(0 if ok else 1)
+PYCODE
+    then
+        die "kernels is outside transformers' window even after '$WINDOW' -- SAM3 masks would skip their clean-up"
+    fi
+    if "$PY" - <<'PYCODE'
+from kernels import get_kernel
+k = get_kernel("kernels-community/cv-utils", version=1)
+print(f"    [ok]   SAM3 mask clean-up kernel loads ({k.__name__}): NMS, hole filling, sprinkle removal on")
+PYCODE
+    then :
+    else
+        warn "SAM3's clean-up kernel did not load (no network to the HF hub, or no build for this"
+        warn "torch/CUDA). P2 still runs, but its masks skip NMS / hole filling / sprinkle removal."
+    fi
     echo "    weights are gated: accept https://huggingface.co/facebook/sam3, then 'hf auth login'"
 fi
 
@@ -540,6 +568,21 @@ check("gsplat", "P4b", required=False)
 check("pytorch_msssim", "P4b", required=False)
 check("pose_estimator", "this repo")
 check("leaf_generator", "this repo")
+
+# SAM3 (--with-sam3): without kernels in transformers' window its masks skip
+# their clean-up, with only a log warning per run to show for it
+try:
+    from transformers import Sam3VideoModel  # noqa: F401
+    from transformers.utils import import_utils as u
+    window = f">={u.KERNELS_MIN_VERSION},<{u.KERNELS_MAX_VERSION}"
+    if u.is_kernels_available():
+        print(f"    [ok]   sam3 clean-up    kernels in transformers' window {window}")
+    else:
+        ok = False
+        print(f"    [FAIL] sam3 clean-up    kernels not in transformers' window {window} -- "
+              "re-run ./setup_env.sh --with-sam3")
+except ImportError:
+    pass
 
 if torch is not None:
     print(f"    cuda available:  {torch.cuda.is_available()}"
