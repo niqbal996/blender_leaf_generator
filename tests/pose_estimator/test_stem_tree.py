@@ -136,3 +136,46 @@ def test_a_leaf_reached_through_a_neighbour_does_not_copy_its_petiole():
     assert by_id[0]["petiole_from"] == "stalk"
     assert by_id[3]["petiole_length"] < 0.05, \
         f"leaf 3 drew a {by_id[3]['petiole_length']:.2f} petiole through leaf 0"
+
+
+def _axis(i, parent, kind, points):
+    return {"id": i, "order": 0 if parent < 0 else 1, "parent": parent, "kind": kind, "leaf": None,
+            "points": [list(map(float, p)) for p in points]}
+
+
+def test_an_axis_that_hooks_back_ends_at_its_farthest_point():
+    # up the stem to z = 1, then curling back down beside itself: the apex blob
+    up = [(0, 0, z) for z in np.linspace(0, 1, 11)]
+    hook = [(0.05, 0, 1.0), (0.1, 0, 0.95), (0.1, 0, 0.85)]
+    axes, _ = stem_tree.end_axes([_axis(0, -1, "stem", up + hook)], [(0.0, 0.0, 1.0)])
+    end = np.asarray(axes[0]["points"])[-1]
+    assert np.linalg.norm(end - (0.1, 0, 0.95)) < 1e-6 or end[2] >= 0.95
+
+
+def test_an_axis_ends_at_its_last_leaf():
+    stem = [(0, 0, z) for z in np.linspace(0, 1, 21)]
+    leaves = [(0.0, 0.0, 0.3), (0.0, 0.0, 0.6)]          # nothing attaches above z = 0.6
+    axes, attach = stem_tree.end_axes([_axis(0, -1, "stem", stem)], leaves)
+    assert np.allclose(np.asarray(axes[0]["points"])[-1], (0, 0, 0.6))
+    assert np.allclose(attach, leaves)
+
+
+def test_a_leaf_on_a_cut_away_hook_is_attached_to_what_is_left():
+    up = [(0, 0, z) for z in np.linspace(0, 1, 11)]
+    hook = [(0.05, 0, 1.02), (0.1, 0, 0.9), (0.1, 0, 0.7)]
+    on_hook = (0.1, 0.0, 0.7)                            # a leaf start at the hook's end
+    axes, attach = stem_tree.end_axes([_axis(0, -1, "stem", up + hook)], [on_hook])
+    trunk = np.asarray(axes[0]["points"])
+    assert trunk[-1][2] > 0.9 and trunk[:, 0].max() < 0.06   # the hook is gone
+    # the leaf now starts on the stem, at its nearest point: beside it, not at its tip
+    assert np.allclose(attach[0], (0, 0, 0.7))
+
+
+def test_a_branch_off_a_shortened_stem_stays_attached():
+    stem = [(0, 0, z) for z in np.linspace(0, 1, 11)] + [(0.1, 0, 0.9), (0.1, 0, 0.6)]
+    branch = [(0.1, 0, 0.6), (0.3, 0, 0.7), (0.5, 0, 0.8)]   # leaves from the hook's end
+    axes, _ = stem_tree.end_axes([_axis(0, -1, "stem", stem), _axis(1, 0, "branch", branch)],
+                                 [(0.5, 0.0, 0.8)])
+    trunk = np.asarray(axes[0]["points"])
+    first = np.asarray(axes[1]["points"])[0]
+    assert min(np.linalg.norm(trunk - first, axis=1)) < 1e-6

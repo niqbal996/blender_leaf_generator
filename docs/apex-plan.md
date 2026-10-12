@@ -6,6 +6,88 @@ Every experiment writes into `<plant>/debug/<experiment>/`, never into the repo.
 
 ---
 
+## 0. Start here — handoff for option 3, step 3 (written 2026-10-12, end of day)
+
+Sections 1–6 below are the day's log, including dead ends and numbers that
+were later corrected. **This section is the current truth.**
+`P=/netscratch/naeem/blender_assets/06-10-2026-Naeem/vogelmeere/plant`, `D=$P/debug`.
+
+**Goal of the next session.** Option 3, step 3: *fit* the apex leaves to the
+photos. Until now the apex leaves were only *chosen* from candidates, never
+shaped, and by eye they are not yet better than before. Step 3 is what should
+make them better.
+
+**What exists and works (reuse it):**
+
+| piece | where | what it gives |
+|---|---|---|
+| apex regions from hand boxes | `scripts/apex_labels.py` → `$D/apex_labels/apex_regions.npz` | 4 apices (A–D), cloud points carved by boxes in 5–6 views, radius 9–15 mm |
+| zoomed SAM3 on those regions, clean-up on | `scripts/apex_zoom.py --regions` → `$D/apex_zoom_fair/sam3/apex<X>_pass<p>.npz` | per frame per apex: leaf masks at 1008 px of the square (`m_<i>_<obj>`), square `crop_<i>`, scale `up_<i>`. Good *within* a frame; ids drift *across* frames — never rely on them |
+| candidate leaves by geometry | `scripts/apex_match.py` (`match_dense`) | identity solved by epipolar agreement of SAM3 lines over 74 frames: best recall (68–73 %) |
+| renderer + selection (steps 1–2) | `scripts/apex_select.py` → `$D/apex_select/` (on P5x), `$D/apex_select_p4g/` (on P5x-on-P4g) | leaf strips drawn into all 74 views on the GPU (torch, depth-tested, SIMPLE_RADIAL camera), greedy subset explaining the zoomed masks; output = P5x with apex leaves replaced, each one smooth curve from its shoot to its tip |
+| structure rules | `stem_tree.end_axes`, `leaf_skeleton.smooth_curve`, apex node + "leads away" in `apex_select.py` | axes end at their last leaf / where they turn back; leaves one smooth curve, base at the stem, never folding back |
+| yardstick | `scripts/apex_labels.py --score <dirs> --annotate $D/apex_compare` | 105 hand-drawn leaf lines in 6 frames (`$P/p1/frames/frame_00{00,06,14,17,23,25}.json`); identity-free pairing per frame |
+| Blender bundle | `$D/blender_bundle/vogelmeere_view_core_<stamp>.tar.gz` (+ clouds) | the user views locally; see "Viewing" below |
+
+**Current numbers** (your lines found / tip error; *precision is meaningless*:
+the labels are partial): P5x 34 % / 6.9 px · s2d one-curve on fair zoom 67 % /
+5.7 px · selection on P5x 58 % / 5.6 px · selection on P5x-on-P4g 57 % / 7.0 px.
+
+**Why the selection stops short** (what step 3 must fix): its leaf shape is a
+crude strip (width ½ length, 4 fixed rolls), so real leaves that are wider or
+tilted in between spill off their masks and are not chosen; and one SAM3 mask
+over two young leaves pays only one leaf.
+
+**Step 3, as agreed** (details in §3.2–3.9):
+- start from `apex_select*` leaves (both bases are available; P4g is the
+  densest cloud and the user values it);
+- per leaf, fit: midrib control points (attachment on the shoot fixed or
+  sliding along it), width profile, roll, fold — with a *differentiable*
+  renderer (gsplat 2DGS is installed and used by P4g; or a soft rasterizer in
+  torch on the same projection code as `apex_select.Views`);
+- losses, all identity-free: plant-mask silhouette in each apex square;
+  per-view Hungarian-matched overlap with the zoomed SAM3 masks; a mask may
+  be shared by two leaves lying side by side; smoothness; leaf stays on its
+  shoot and leads away from it;
+- then re-run selection with the fitted shapes (add/remove leaves);
+- output in the same skeleton schema (`curve`, `blade_start`) plus the new
+  per-leaf `width`, `roll`, `fold` — what the PBR leaf assets snap to;
+- score: `apex_labels.py --score` (found %, tip px), a label-free held-out
+  check (fit on even frames, overlap on odd), and the user's Blender look.
+  **Checkpoint**: if the crowns do not look visibly better than P5x and the
+  current selection, stop and reconsider (fallback §"other options": a
+  parametric bud from the measured apex region).
+
+**How the user works — follow it:**
+- experiments and outputs go to `$D/<experiment>/`, never the repo (disk quota);
+- **no tuned thresholds**: structural rules only; if a number is needed,
+  measure it and say where it came from (the user removed tuned thresholds
+  from the P5x tracer on purpose);
+- P5x conventions: one smooth curve per leaf, stem → tip, `blade_start`; no
+  separate petiole segments; white in Blender means stem only;
+- the user judges by looking in Blender locally: every deliverable ends with
+  a fresh dated bundle and fetch/view commands; verify *what ships* (check the
+  bundled files, the viewer prints each skeleton's path and build stamp);
+- keep this doc's checklist current; plain words.
+
+**Pitfalls already paid for:**
+- P5x outputs on disk can predate the tracer (vogelmeere's did): retrace
+  (`pose-leaf-instances --retrace`, seconds) before comparing;
+- crops for an apex come from the labelled regions, not stem-tree ends;
+- SAM3's base/tip call per mask can be swapped; orient by structure;
+- two views always triangulate *some* 3D curve — a 2-view fit proves nothing;
+- `skeleton_2d.py` needs leaf masks inside the plant mask's box (fixed);
+- `pose` env: `./setup_env.sh --with-sam3` keeps `kernels` in transformers'
+  window (SAM3 mask clean-up was silently off before);
+- other plants still need `--retrace` to get `end_axes`.
+
+**Suggested first prompt for the new session:** "Read `docs/apex-plan.md`
+section 0 and the code it names. Then propose a concrete design for option 3
+step 3 on vogelmeere's 4 apices — model parameters, renderer, losses,
+evaluation — before writing code."
+
+---
+
 ## 1. The problem, in one paragraph
 
 At the tip of every branch (the *apex*) vogelmeere keeps a cluster of young
@@ -380,6 +462,8 @@ key view (where zoomed SAM3 already does fairly well).
 
       | method | found | precision | tip px |
       |---|---|---|---|
+      | P5x (`p5x/`, current best by eye) | 34 % | 15 % | |
+      | P5x on P4g (`p5x_p4g/`) | 37 % | 15 % | |
       | s2d, original P2 masks | 58 % | **33 %** | 7.5 |
       | s2d, zoomed 18 mm squares | 53 % | 20 % | 6.1 |
       | s2d, zoomed fair crops + clean-up | 59 % | 22 % | 5.4 |
@@ -389,14 +473,134 @@ key view (where zoomed SAM3 already does fairly well).
       Geometry finds the most of your leaves, with the best tips, and needs
       no ids — but it keeps too many leaves (59 for the 4 apices at ≥ 8
       frames): chance agreements between lines of different leaves survive.
-- [ ] **Next: choose among the candidates by explaining the masks** — the
-      geometry-matched leaves are *proposals*; keep the subset that, drawn
-      into every view (step 2's renderer), covers the zoomed SAM3 masks with
-      the fewest leaves and no two leaves on the same surface. That is option
-      3's render-and-compare, started from proposals instead of from nothing.
-- [ ] Blender look at `debug/apex_match_fair/dense_all` (whole plant: s2d
-      leaves outside the apices + matched apex leaves) next to
-      `debug/apex_zoom/s2d_baseline` (you)
+- [x] **Steps 1–2, on P5x** (`scripts/apex_select.py` → `debug/apex_select/`):
+      candidates per apex = the geometry-matched leaves (≥ 4 frames) plus
+      every apex leaf of P5x, P5x on P4g, s2d and s2d on fair zoom; each a
+      leaf-shaped strip (width ½ its length, narrow stalk) at 4 roll angles.
+      **Step 1, renderer:** all strips drawn into the apex square of all 74
+      views on the GPU, depth-tested, with P5x's other leaves as occluders.
+      **Step 2, selection:** greedily add the candidate that best explains the
+      zoomed SAM3 masks — per view each leaf earns the pixels of its best mask,
+      each mask pays one leaf, pixels off the mask cost ALPHA = ½ each (a
+      leaf must lie mostly on one mask). A per-leaf cost of 0 / 150 / 300 px
+      kept 26 / 24 / 23 leaves, so it is set to 0: nothing tuned. Seconds per
+      apex. Result: P5x with its 34 apex leaves replaced by 26 selected ones
+      (25 from the geometry candidates), one curve each, no petiole segments.
+      `apex_<X>.jpg`: photo | SAM3 masks | kept leaves as drawn.
+
+      | method | your lines found | its apex leaves found |
+      |---|---|---|
+      | P5x | 34 % | 17 of 43 |
+      | P5x on P4g | 37 % | 17 of 45 |
+      | s2d, original masks | 58 % | 22 of 33 |
+      | s2d, fair zoom | 59 % | 23 of 50 |
+      | geometry match | 68 % | 35 of 92 |
+      | **selection on P5x** | 45 % | 18 of 35 |
+
+      By eye (`debug/apex_compare/compare/apex<X>_labelled.jpg`: photo | P5x
+      | selection | s2d): the selection draws separate leaves where P5x
+      draws loops — but fewer of them. It stops at ~26 because (a) SAM3 often
+      draws one mask over two young leaves and a mask pays one leaf, and (b)
+      the strip shape is crude (fixed width, 4 rolls): a real leaf that is
+      wider or tilted between rolls spills off its mask and is penalised.
+- [x] Blender: every method's skeleton, leaves marked against your labels
+      (`apex_labels.py --annotate` → `debug/apex_compare/<method>/`): leaves
+      that pair with one of your lines are **magenta and thick**, in their own
+      `<method>_gt_found` collection. Overlays now also work on the cloud
+      panels (`--clouds ... --skeleton2d A,B`).
+- [ ] Your look in Blender (commands below)
+- [ ] **Step 3, next:** fit each kept leaf's width, roll and bend to the masks
+      (differentiable, gsplat), and let a mask pay two leaves when both lie
+      on it side by side — the two reasons the selection stops early.
+
+- [x] **Fixes before step 3** (your review):
+      - *P5x on disk was stale*: `p5x/` (15:01, Oct 9) and `p5x_p4g/` (14:24)
+        predate the "one curve per leaf / curves start on the stem /
+        structural rules only" tracer commits. Retraced copies with the
+        current tracer: `debug/p5x_current`, `debug/p5x_p4g_current`
+        (`pose-leaf-instances --retrace --out debug/...`; `p5x/` untouched).
+      - *Stem running on into the apex and hooking back*: new
+        `stem_tree.end_axes`, called by the P5x tracer — a stem or branch ends
+        where it stops leading away from its own start, or at its last
+        attachment (child axis or leaf start), whichever comes first; a leaf
+        or child on a cut part is re-attached to the nearest point left.
+        No thresholds. Stem + branches: 229 → 161 mm (P4g: 546 → 286 mm).
+        Tests: 4 new in `tests/pose_estimator/test_stem_tree.py`, all 26 pass.
+      - *Apex leaves diverge from the shoot*: in the selection each apex's
+        shoot runs on to its apex node (median of its leaves' bases) and every
+        apex leaf is one curve starting on that shoot; base/tip of SAM3 lines
+        re-oriented (the base is the end at the stem). Joins 3.0 mm median.
+        A last `end_axes` pass removes stubs left beside a shoot.
+      - *s2d petiole webbing*: the s2d reference was the old run without
+        `--leaf-curves`, and the viewer drew its petioles in stem white. Now
+        `debug/s2d_curves_baseline`, `debug/s2d_curves_zoom_fair`
+        (`--leaf-curves --stem-tree debug/p5x_current/skeleton.json`): one
+        curve per leaf where a 2D stalk walk agrees (25/36, 35/52), the rest
+        keep a petiole — drawn light green now, as in the P5x scene; P5x leaves
+        (no colour of their own) get per-leaf colours instead of white.
+
+      | method (current versions) | your lines found | its apex leaves found | tip |
+      |---|---|---|---|
+      | P5x, retraced | 34 % | 17 of 43 | 6.9 px |
+      | P5x on P4g, retraced | 35 % | 16 of 45 | 7.7 px |
+      | s2d one-curve, original masks | 54 % | 22 of 34 | 6.7 px |
+      | s2d one-curve, fair zoom | **60 %** | 23 of 50 | 5.8 px |
+      | **selection on retraced P5x** | 53 % | 20 of 34 | **5.6 px** |
+
+- [x] **Fixes after your Blender look** (smooth joins; C and D floating / reversed):
+      - *Smooth stalk → blade, every method*: new `leaf_skeleton.smooth_curve`
+        draws any leaf polyline the way the P5x tracer does (re-spaced to the
+        hull voxel, 24 × 0.5 Laplacian, ends fixed). The selection's join and
+        s2d's leaves now go through it: every s2d leaf is one curve from where
+        it joins to its tip (before: separate petiole meeting its blade at a
+        kink, and `fit_curve`'s few control points drawn as straight pieces).
+      - *Selection, C and D*: a leaf's base is the end nearer its apex node,
+        and the node is the median of the bases — settled together by
+        iterating from the region's centre (the old "nearer any stem" rule
+        turned leaves where branches crowd). Every apex leaf joins the nearest
+        shoot, unconditionally (the old "gap shorter than the leaf" rule left
+        C and D's leaves floating, and the shoot's run-on was then cut as
+        unused). A leaf leads away from where it joins — tip farther from it
+        than its base — else it is turned (4 were).
+      - *s2d, same rule*: a leaf that folded back towards where it joined
+        (3 of 36, 5 of 52; mostly 2D stalk walks of 17–55 mm) is re-joined at
+        the nearest stem point, turned if needed; `petiole_rule` says so.
+      - Now: every leaf of every method one curve, none folding back; worst
+        bend per leaf median 6° (selection), 8–10° (s2d), 12° (P5x).
+
+      | method | your lines found | tip |
+      |---|---|---|
+      | P5x | 34 % | 6.9 px |
+      | P5x on P4g | 35 % | 7.7 px |
+      | s2d one-curve, original masks | 57 % | 7.2 px |
+      | s2d one-curve, fair zoom | **67 %** | 5.7 px |
+      | selection on P5x | 58 % | **5.6 px** |
+
+**Blender, all current methods on one plant** (`P=/netscratch/naeem/blender_assets/06-10-2026-Naeem/vogelmeere/plant`,
+`C=$P/debug/apex_compare`):
+
+```bash
+# over the P5x scene (its cloud, coloured by leaf):
+./scripts/view_in_blender.sh $P --p5x --skeleton2d $C/p5x_current,$C/p5x_p4g_current,$C/apex_select,$C/s2d_curves_baseline,$C/s2d_curves_zoom_fair
+# on the clouds side by side (each skeleton drawn on every cloud panel):
+./scripts/view_in_blender.sh $P --clouds p4a,p4b,p4m,p4g --skeleton2d $C/p5x_current,$C/apex_select
+```
+
+Collections are named `s2d_<method>_*` (`..._midribs`, `..._gt_found`, …),
+and `s2d_<method>@<cloud>_*` on the cloud panels; toggle them to compare.
+Leaves matching one of your lines are magenta and thick (`..._gt_found`).
+Pictures: `$C/compare/apex<X>_labelled.jpg` (photo | P5x | selection | s2d),
+`$P/debug/apex_select/axes_check.jpg` (stem ends and apex leaves per apex).
+
+**Viewing locally** (2026-10-12): `p5x/` and `p5x_p4g/` were retraced in place
+with the current tracer (old files in `debug/stale_backup/`), the comparison
+set rebuilt from them, and two bundles written to
+`/netscratch/naeem/blender_assets/06-10-2026-Naeem/vogelmeere/plant/debug/blender_bundle/`:
+`vogelmeere_view_core.tar.gz` (9 MB: the P5x scene, all skeletons marked
+against the labels, the pictures, and `scripts/` with the viewer) and
+`vogelmeere_view_clouds.tar.gz` (120 MB: the four clouds, P4m and P4g thinned
+to 0.1 mm). Unpacked side by side they are a mini-repo:
+`./scripts/view_in_blender.sh vogelmeere/plant --p5x --skeleton2d ...` runs as is.
 
 #### Annotation guide (LabelMe, on `p1/frames/frame_XXXX.jpg`, saved to `debug/annotations/`)
 
@@ -409,8 +613,10 @@ key view (where zoomed SAM3 already does fairly well).
 - Optional: if you use two key views for one apex and are *sure* of a leaf
   in both, label it `leaf_<n>` with the same number in both frames.
 - Which frame is a key view is your call per apex; P3 angles for reference
-  (pass 0 looks down at +19°, pass 1 up at −25°, ~10° per frame, azimuth
-  falls as the frame number rises): 0000 0°, 0006 291°, 0012 233°,
+  (azimuth only; ~10° per frame, falling as the frame number rises. The
+  passes are ~44° apart in height — pass 0 about level with the plant, pass 1
+  from ~45° higher; an earlier "+19° / −25°" here was measured from the centre
+  of a circle fitted through both passes, i.e. between them, and was wrong): 0000 0°, 0006 291°, 0012 233°,
   0018 179°, 0024 126°, 0030 50°; pass 1: 0037 2°, 0043 293°, 0049 246°,
   0055 184°, 0061 126°, 0067 68°.
 

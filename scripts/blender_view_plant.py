@@ -81,6 +81,7 @@ PETIOLE_RGBA = (0.62, 0.95, 0.50, 1.0)
 # The two ends of the stem line, drawn as balls in colours nothing else uses,
 # so "is the crown in the right place?" can be answered by looking.
 CROWN_RGBA = (1.0, 0.85, 0.10, 1.0)       # yellow: foot of the stem, above the root
+GT_FOUND_RGBA = (1.0, 0.0, 0.85, 1.0)    # magenta: an apex leaf that matches a hand-drawn line
 HEART_RGBA = (0.10, 0.75, 1.0, 1.0)       # cyan: top of the stem, where leaves start
 
 # The organ colours P5 writes into structure.ply (cli/structure.py's ROOT_RGB
@@ -985,6 +986,13 @@ def build_p5x_comparison(workdir, folders, gap=1.2, frame=True):
     return built
 
 
+def _leaf_bgr(i: int) -> tuple:
+    """A leaf colour by id (golden-ratio hues), for skeletons that carry none."""
+    import colorsys
+    r, g, b = colorsys.hsv_to_rgb((i * 0.61803398875) % 1.0, 0.85, 1.0 if i % 2 == 0 else 0.75)
+    return int(b * 255), int(g * 255), int(r * 255)
+
+
 def skeleton2d_tags(arg):
     """`--skeleton2d A[,B...]` -> [(path, tag)]: one is tagged s2d, several by folder name."""
     paths = [p for p in arg.split(",") if p]
@@ -994,7 +1002,22 @@ def skeleton2d_tags(arg):
     return [(p, folder(p) if folder(p).startswith("s2d") else f"s2d_{folder(p)}") for p in paths]
 
 
-def build_skeleton2d(path, point_radius=None, frame=True, clear=False, tag="s2d"):
+def _shifted(graph: dict, offset) -> dict:
+    """A copy of a skeleton.json moved by `offset` (plant frame), for drawing it on a
+    cloud panel that --clouds placed off the origin."""
+    move = lambda pts: (np.asarray(pts, float).reshape(-1, 3) + offset).tolist() if len(pts) else pts
+    out = dict(graph)
+    for key in ("stem", "crown"):
+        if graph.get(key):
+            out[key] = move(graph[key]) if key == "stem" else (np.asarray(graph[key]) + offset).tolist()
+    out["axes"] = [dict(a, points=move(a["points"])) for a in graph.get("axes") or []]
+    out["leaves"] = [dict(l, **{k: move(l[k]) for k in ("midrib", "petiole", "curve") if l.get(k)},
+                          tip=(np.asarray(l["tip"]) + offset).tolist())
+                     for l in graph.get("leaves", [])]
+    return out
+
+
+def build_skeleton2d(path, point_radius=None, frame=True, clear=False, tag="s2d", offset=None):
     """Draw a skeleton built in 2D and fused in 3D (scripts/skeleton_2d.py).
 
     Its skeleton.json uses P5x's schema and P5's upright plant frame, so it
@@ -1014,6 +1037,8 @@ def build_skeleton2d(path, point_radius=None, frame=True, clear=False, tag="s2d"
         return None
     with open(path) as f:
         graph = json.load(f)
+    if offset is not None:
+        graph = _shifted(graph, np.asarray(offset, float))
     if clear:
         _PREPARED.clear()
         clear_startup_scene()
@@ -1040,17 +1065,31 @@ def build_skeleton2d(path, point_radius=None, frame=True, clear=False, tag="s2d"
                       _collection(f"{tag}_branches"))
     ribs, petioles, tips = (_collection(f"{tag}_midribs"), _collection(f"{tag}_petioles"),
                             _collection(f"{tag}_tips"))
+    # Leaves marked by scripts/apex_labels.py --annotate: those that paired with
+    # a hand-drawn line in some labelled frame go magenta and thick, into their own
+    # collection, so the found ones stand out and can be toggled on their own.
+    found = None
+    if any("gt_found" in leaf for leaf in graph.get("leaves", [])):
+        found = _collection(f"{tag}_gt_found")
     for leaf in graph.get("leaves", []):
-        b, g, r = leaf.get("colour_bgr", (255, 255, 255))
+        # P5x leaves carry no colour of their own; white would read as stem
+        b, g, r = leaf.get("colour_bgr") or _leaf_bgr(int(leaf["id"]))
         colour = (r / 255.0, g / 255.0, b / 255.0, 1.0)
         name = "+".join(leaf.get("sam3_ids") or [str(leaf["id"])])
+        if found is not None and leaf.get("gt_found"):
+            midrib = np.asarray(leaf.get("curve") or leaf["midrib"], float)
+            add_curve(midrib, f"{tag}_found_{leaf['id']:02d}_{leaf['gt_found']}of{leaf['gt_checked']}",
+                      GT_FOUND_RGBA, point_radius * 3.0, found)
+            add_sphere(np.asarray(leaf["tip"], float), f"{tag}_found_tip_{leaf['id']:02d}",
+                       GT_FOUND_RGBA, point_radius * 4.0, found)
+            continue
         curve = np.asarray(leaf.get("curve") or [], float)
         if len(curve) >= 2:
             # one curve, plant to tip (skeleton_2d.py --leaf-curves), a ball at the blade start
             add_curve(curve, f"{tag}_leaf_curve_{leaf['id']:02d}_{name}", colour, point_radius * 1.8, ribs)
             start = int(leaf.get("blade_start") or 0)
             if 0 < start < len(curve):
-                add_sphere(curve[start], f"{tag}_blade_start_{leaf['id']:02d}", STEM_RGBA,
+                add_sphere(curve[start], f"{tag}_blade_start_{leaf['id']:02d}", PETIOLE_RGBA,
                            point_radius * 2.2, petioles)
             add_sphere(np.asarray(leaf["tip"], float), f"{tag}_tip_{leaf['id']:02d}", colour,
                        point_radius * 3.2, tips)
@@ -1061,14 +1100,18 @@ def build_skeleton2d(path, point_radius=None, frame=True, clear=False, tag="s2d"
                       point_radius * 1.8, ribs)
         petiole = np.asarray(leaf.get("petiole") or [], float)
         if len(petiole) >= 2:
-            add_curve(petiole, f"{tag}_petiole_{leaf['id']:02d}", STEM_RGBA,
+            add_curve(petiole, f"{tag}_petiole_{leaf['id']:02d}", PETIOLE_RGBA,
                       point_radius * 1.2, petioles)
         add_sphere(np.asarray(leaf["tip"], float), f"{tag}_tip_{leaf['id']:02d}", colour,
                    point_radius * 3.2, tips)
     if graph.get("crown"):
         add_sphere(np.asarray(graph["crown"], float), f"{tag}_crown", CROWN_RGBA,
                    point_radius * 4.5, _collection(f"{tag}_crown"))
-    print(f"[plant] skeleton from 2D: {len(graph.get('leaves', []))} leaves, "
+    whole = sum(1 for leaf in graph.get("leaves", []) if len(leaf.get("curve") or []) >= 2)
+    stamp = graph.get("annotated") or graph.get("built") or {}
+    print(f"[plant] {tag}: {path}")
+    print(f"[plant]   written {stamp.get('at', 'before build stamps (2026-10-12 21:00) -- an old file?')}; "
+          f"{len(graph.get('leaves', []))} leaves, {whole} drawn as one curve stem -> tip, "
           f"stem {'drawn' if len(stem) >= 2 else 'missing'} -- collections {tag}_*")
     if frame:
         frame_view((low + high) / 2.0, extent)
@@ -1313,8 +1356,10 @@ def build_clouds(workdir, names, gap=1.2, max_points=4_000_000, frame=True):
     hi = np.max([c[1].max(axis=0) for c in clouds], axis=0)
     width = float(hi[0] - lo[0])
     centre = (lo + hi) / 2.0
+    placed = []
     for index, (name, xyz, rgb, n, radius) in enumerate(clouds):
         offset = np.array([index * width * gap, 0.0, 0.0]) - [centre[0], 0.0, 0.0]
+        placed.append((name, offset))
         coll = _collection(f"cloud_{name}")
         add_point_cloud(xyz + offset, rgb, radius, coll, name=f"cloud_{name}")
         add_label(f"{name}  ({n:,} pts)", (offset[0] + centre[0], centre[1], lo[2] - width * 0.12),
@@ -1326,7 +1371,7 @@ def build_clouds(workdir, names, gap=1.2, max_points=4_000_000, frame=True):
         frame_view(mid, float(span.max()))
     print("[plant] left to right: " + ", ".join(c[0] for c in clouds)
           + " -- same units and plant frame, no normalisation")
-    return clouds
+    return placed
 
 
 def main():
@@ -1353,7 +1398,11 @@ def main():
         if p5x_compare:
             build_p5x_comparison(target, [c for c in p5x_compare.split(",") if c])
         elif clouds:
-            build_clouds(target, [c for c in clouds.split(",") if c])
+            placed = build_clouds(target, [c for c in clouds.split(",") if c])
+            # skeletons (--skeleton2d A,B) drawn on every cloud panel, toggled by collection
+            for name, offset in placed or []:
+                for path, tag in skeleton2d_tags(skeleton2d) if skeleton2d else []:
+                    build_skeleton2d(path, frame=False, tag=f"{tag}@{name}", offset=offset)
         elif skeleton2d and not want_p5x:
             for i, (path, tag) in enumerate(skeleton2d_tags(skeleton2d)):
                 build_skeleton2d(path, clear=i == 0, frame=i == 0, tag=tag)

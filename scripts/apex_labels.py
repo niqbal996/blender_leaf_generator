@@ -158,13 +158,13 @@ def project(run: Run, frame: str, plant_xyz) -> np.ndarray:
 
 
 def skeleton_curves(run: Run, frame: str, skeleton: dict):
-    """Per skeleton leaf: (name, 2D whole curve petiole+midrib, 2D midrib, 2D tip)."""
+    """Per skeleton leaf: (its index, 2D whole curve petiole+midrib, 2D midrib, 2D tip)."""
     out = []
-    for leaf in skeleton["leaves"]:
+    for i, leaf in enumerate(skeleton["leaves"]):
         rib = np.asarray(leaf["midrib"], float)
         pet = np.asarray(leaf.get("petiole") or [], float)
         whole = np.vstack([pet, rib]) if len(pet) >= 2 else rib
-        out.append((leaf.get("track", str(leaf["id"])), project(run, frame, resample(whole, SAMPLES)),
+        out.append((i, project(run, frame, resample(whole, SAMPLES)),
                     project(run, frame, resample(rib, SAMPLES)), project(run, frame, [leaf["tip"]])[0]))
     return out
 
@@ -215,6 +215,28 @@ def score(run: Run, labels: dict, skeleton: dict) -> dict:
     total["precision"] = total["matched"] / max(total["skeleton_in_box"], 1)
     out["all"] = total
     return out, pairs
+
+
+def annotate(skeleton: dict, pairs: dict) -> dict:
+    """A copy of the skeleton whose leaves say how they fared against the labels:
+    gt_checked = labelled frames where the leaf lay in an apex box, gt_found = of
+    those, how many paired it with a drawn line. Blender (--skeleton2d) shows
+    gt_found leaves highlighted."""
+    checked, found = defaultdict(int), defaultdict(int)
+    for (_, _), (gts, near, ok) in pairs.items():
+        for s in near:
+            checked[s[0]] += 1
+        for _, c in ok:
+            found[near[c][0]] += 1
+    leaves = []
+    for i, leaf in enumerate(skeleton["leaves"]):
+        leaf = dict(leaf)
+        if checked[i]:
+            leaf["gt_checked"], leaf["gt_found"] = checked[i], found[i]
+        leaves.append(leaf)
+    import time
+    return dict(skeleton, leaves=leaves, annotated={"by": "scripts/apex_labels.py --annotate",
+                                                    "at": time.strftime("%Y-%m-%d %H:%M:%S")})
 
 
 # --------------------------------------------------------------------------
@@ -300,7 +322,10 @@ def main():
     ap.add_argument("--labels", type=Path, help="folder of LabelMe JSONs (default: <workdir>/p1/frames)")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--score", type=Path, nargs="*", default=[],
-                    help="s2d output folders (with skeleton.json) to score against the labels")
+                    help="skeleton folders (skeleton.json: s2d, P5x, ...) to score against the labels")
+    ap.add_argument("--annotate", type=Path,
+                    help="with --score: write each scored skeleton, its leaves marked found / not "
+                         "found, to <dir>/<name>/skeleton.json for view_in_blender.sh --skeleton2d")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     mpu = json.loads((args.workdir / "tag_scale.json").read_text())["mm_per_unit"]
@@ -317,22 +342,28 @@ def main():
     scores = {}
     for d in args.score:
         sk = json.loads((d / "skeleton.json").read_text())
-        scores[d.name], pairs = score(run, labels, sk)
-        draw_score(run, labels, pairs, args.out / f"score_{d.name}.jpg", d.name)
+        name = d.name if d.name != "dense_all" else d.parent.name
+        scores[name], pairs = score(run, labels, sk)
+        draw_score(run, labels, pairs, args.out / f"score_{name}.jpg", name)
+        if args.annotate:
+            (args.annotate / name).mkdir(parents=True, exist_ok=True)
+            marked = annotate(sk, pairs)
+            (args.annotate / name / "skeleton.json").write_text(json.dumps(marked, indent=1))
+            n_found = sum(1 for l in marked["leaves"] if l.get("gt_found"))
+            n_checked = sum(1 for l in marked["leaves"] if l.get("gt_checked"))
+            scores[name]["leaves_found"] = n_found
+            scores[name]["leaves_in_apex_boxes"] = n_checked
     if scores:
         (args.out / "scores.json").write_text(json.dumps(scores, indent=1))
-        apex_names = sorted(a for a in next(iter(scores.values())) if a != "all")
-        print(f"\n  your leaves found (matched / labelled), share of skeleton leaves in the box that "
-              f"are yours, median tip error px")
-        print("  " + "".ljust(10) + "".join(n[:26].ljust(28) for n in scores))
-        for a in apex_names + ["all"]:
-            cells = []
-            for n in scores:
-                s = scores[n][a]
-                tip = f", tip {s['tip_px']:.0f}px" if s.get("tip_px") is not None else ""
-                cells.append(f"{s['matched']}/{s['labelled']}, prec {s['precision'] or 0:.0%}{tip}"
-                             [:26].ljust(28))
-            print("  " + a.ljust(10) + "".join(cells))
+        apex_names = sorted(a for a in next(iter(scores.values())) if a.startswith("apex"))
+        print(f"\n  per skeleton: your lines found (pairs / lines drawn, over the labelled frames); "
+              f"its apex leaves that pair with a line in >= 1 frame; median tip error")
+        for n, sc in scores.items():
+            tips = [sc[a]["tip_px"] for a in apex_names if sc[a]["tip_px"] is not None]
+            extra = (f"  {sc['leaves_found']:3d} of its {sc['leaves_in_apex_boxes']:3d} apex leaves found"
+                     if "leaves_found" in sc else "")
+            print(f"    {n[:34]:34s} {sc['all']['matched']:3d}/{sc['all']['labelled']} "
+                  f"({sc['all']['found']:.0%}){extra}  tip {np.median(tips):.1f} px")
     print(f"\n  wrote {args.out}")
 
 

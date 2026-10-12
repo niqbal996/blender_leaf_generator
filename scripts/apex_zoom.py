@@ -52,6 +52,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from compare_runs import track_colour                                 # noqa: E402
 from p5x_views import Run, unpack                                     # noqa: E402
 from pose_estimator.fine_views import source_image                   # noqa: E402
 
@@ -434,10 +435,13 @@ def compare(args, run: Run, skeleton: dict, mpu: float):
                     if a["kind"] != "petiole" and len(a["points"]) >= 2:
                         cv2.polylines(img, [uv(a["points"])], False, (255, 255, 255), 4)
                 for leaf in s["leaves"]:
-                    col = tuple(int(c) for c in leaf["colour_bgr"])
-                    if len(leaf["petiole"]) >= 2:
-                        cv2.polylines(img, [uv(leaf["petiole"])], False, (200, 200, 200), 3)
-                    cv2.polylines(img, [uv(leaf["midrib"])], False, col, 5)
+                    col = tuple(int(c) for c in leaf.get("colour_bgr") or track_colour(int(leaf["id"])))
+                    if len(leaf.get("curve") or []) >= 2:       # one curve, stem to tip
+                        cv2.polylines(img, [uv(leaf["curve"])], False, col, 5)
+                    else:                                       # petiole (light green, as in Blender)
+                        if len(leaf["petiole"]) >= 2:
+                            cv2.polylines(img, [uv(leaf["petiole"])], False, (128, 242, 158), 3)
+                        cv2.polylines(img, [uv(leaf["midrib"])], False, col, 5)
                     cv2.circle(img, tuple(int(v) for v in uv([leaf["tip"]])[0]), 9, col, -1)
                 tiles.append(img)
             row = np.hstack([cv2.resize(x, (480, 480)) for x in tiles])
@@ -466,17 +470,20 @@ def apex_table(args, run: Run, skeleton: dict, sk, names, mpu: float) -> dict:
           "(n: blade lengths mm / median fit px)")
     print("  " + "apex".ljust(12) + "".join(n[:28].ljust(30) for n in names))
     for name, s, d in zip(names, sk, args.compare):
-        scores = json.loads((d / "scores.json").read_text())
-        out[name] = {"leaves": scores["leaves"], "failed_ids": len(scores["failed"]),
-                     "held_out_px": scores["held_out_px"], "apices": {}}
+        f = d / "scores.json"                     # s2d writes one; P5x and the others do not
+        scores = json.loads(f.read_text()) if f.exists() else {}
+        out[name] = {"leaves": len(s["leaves"]), "failed_ids": len(scores.get("failed", {})),
+                     "held_out_px": scores.get("held_out_px", float("nan")), "apices": {}}
         for aid, (kind, P) in tips.items():
             near = [l for l in s["leaves"]
                     if np.linalg.norm(np.asarray(l["midrib"])[len(l["midrib"]) // 2] - P) * mpu
                     < reach[aid]]
             out[name]["apices"][str(aid)] = {
                 "kind": kind, "leaves": len(near),
-                "midrib_mm": sorted(round(l["midrib_mm"], 1) for l in near),
-                "median_fit_px": float(np.median([l["fit_px"] for l in near])) if near else None}
+                "midrib_mm": sorted(round(float(np.linalg.norm(np.diff(np.asarray(l["midrib"]), axis=0),
+                                                              axis=1).sum()) * mpu, 1) for l in near),
+                "median_fit_px": (float(np.median([l["fit_px"] for l in near]))
+                                  if near and all("fit_px" in l for l in near) else None)}
     for aid, (kind, _) in tips.items():
         cells = []
         for name in names:

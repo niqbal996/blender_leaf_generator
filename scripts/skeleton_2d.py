@@ -1140,6 +1140,51 @@ def main():
             fitted += 1
         print(f"  leaf curves (plant -> tip, fitted to each view's stalk walk + midrib): {fitted} of "
               f"{len(leaves)}; the rest have no agreeing 2D stalk walk and keep petiole + midrib")
+    # Every leaf as one curve from where it joins the plant to its tip, smoothed
+    # the way P5x's tracer smooths route and midrib together (smooth_curve): a
+    # petiole met its blade at a kink, and fit_curve's few control points
+    # joined by straight lines drew angular midribs.
+    from pose_estimator import stem_tree
+    from pose_estimator.leaf_skeleton import smooth_curve
+    trunk_lines = [np.asarray(t, float) for t in trunk if len(t) >= 2] if use_tree else []
+    refolded = 0
+    for leaf in leaves.values():
+        pet = np.asarray(leaf.get("petiole") if len(leaf.get("petiole", [])) else [], float).reshape(-1, 3)
+        if "curve" in leaf:
+            whole = np.asarray(leaf["curve"], float)
+            blade_at = whole[int(leaf["blade_start"])]
+        else:
+            whole = np.vstack([pet, leaf["midrib"]]) if len(pet) >= 2 else np.asarray(leaf["midrib"], float)
+            blade_at = np.asarray(leaf["midrib"], float)[0]
+        # A leaf leads away from where it joins the plant: its tip is farther
+        # from there than its blade's base. One that folds back had a wrong
+        # stalk (vogelmeere: 3 of 36, mostly 2D walks 17-55 mm long): join the
+        # blade to the nearest stem point instead -- or, if it still folds,
+        # its base and tip were swapped, and it joins at its other end.
+        if trunk_lines and has_stem and (np.linalg.norm(whole[-1] - whole[0])
+                                         <= np.linalg.norm(blade_at - whole[0])):
+            blade = whole[int(np.argmin(np.linalg.norm(whole - blade_at, axis=1))):]
+            for cand in (blade, blade[::-1]):
+                _, q, _ = min((stem_tree._on_polyline(t, cand[0]) for t in trunk_lines),
+                              key=lambda h: h[2])
+                if np.linalg.norm(cand[-1] - q) > np.linalg.norm(cand[0] - q):
+                    whole, blade_at = np.vstack([q, cand]), cand[0]
+                    leaf["tip"] = cand[-1]
+                    leaf["petiole_rule"] = "nearest stem point (its stalk folded back)"
+                    pet = whole[:2]
+                    refolded += 1
+                    break
+        curve = smooth_curve(whole, run.voxel)
+        b = int(np.argmin(np.linalg.norm(curve - blade_at, axis=1))) if len(pet) >= 2 or "curve" in leaf else 0
+        leaf["curve"], leaf["blade_start"] = curve, b
+        leaf["petiole"] = curve[:b + 1] if b > 0 else np.zeros((0, 3))
+        leaf["midrib"], leaf["base"] = curve[b:], curve[b]
+    if refolded:
+        rules = defaultdict(int)
+        for leaf in leaves.values():
+            rules[leaf["petiole_rule"]] += 1
+        print(f"  {refolded} leaves folded back towards where they joined: re-joined at the nearest "
+              "stem point")
     blade_of = lambda l: float(np.linalg.norm(np.diff(l["midrib"], axis=0), axis=1).sum())
     pet_of = lambda l: (float(np.linalg.norm(np.diff(l["petiole"], axis=0), axis=1).sum())
                         if len(l["petiole"]) >= 2 else 0.0)
