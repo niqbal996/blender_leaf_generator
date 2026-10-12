@@ -367,3 +367,99 @@ def classify_petioles(tree: StemTree, leaf_points: np.ndarray, leaf_ids: np.ndar
         axis.kind, axis.leaf = "petiole", leaf
         found += 1
     return found
+
+
+# --------------------------------------------------------------------------
+# where an axis ends
+# --------------------------------------------------------------------------
+
+
+def _on_polyline(line: np.ndarray, q: np.ndarray):
+    """(arc length along `line` of the point nearest q, that point, its distance)."""
+    a, b = line[:-1], line[1:]
+    ab = b - a
+    t = np.clip(((q - a) * ab).sum(1) / np.maximum((ab * ab).sum(1), 1e-18), 0.0, 1.0)
+    near = a + t[:, None] * ab
+    d = np.linalg.norm(near - q, axis=1)
+    k = int(np.argmin(d))
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(ab, axis=1))]
+    return float(s[k] + t[k] * np.linalg.norm(ab[k])), near[k], float(d[k])
+
+
+def _cut(line: np.ndarray, length: float) -> np.ndarray:
+    """`line` up to arc length `length`, its last point interpolated."""
+    seg = np.linalg.norm(np.diff(line, axis=0), axis=1)
+    s = np.r_[0.0, np.cumsum(seg)]
+    if length >= s[-1]:
+        return line
+    k = int(np.searchsorted(s, length, side="right")) - 1
+    t = (length - s[k]) / max(seg[k], 1e-18)
+    return np.vstack([line[:k + 1], line[k] + t * (line[k + 1] - line[k])])
+
+
+def end_axes(axes: List[dict], leaf_starts: np.ndarray):
+    """Stem and branch axes ended where the plant ends them; leaves re-attached.
+
+    The stem cloud does not stop where the shoot does: at a branch's apex the
+    young leaves close into one blob that carries stem labels, and the tree
+    followed it -- on vogelmeere every branch ran 4-20 mm past its last leaf,
+    hooking back or coiling inside the apex and ending in mid air. Two rules,
+    neither with a threshold, end a stem or branch axis at whichever comes
+    first:
+
+      - where it stops leading away from its own start: a shoot does not turn
+        back towards its base, so past its farthest point it is a hook;
+      - its last attachment: a child axis's first point, or a leaf start
+        (`leaf_starts`, the points leaves' curves begin at) nearer to this
+        axis than to any other. Past the last leaf there is no stem -- the
+        apex *is* its leaves.
+
+    Petiole axes end in their blade and are left alone. A child axis or a
+    leaf whose start lay on a part that was cut is re-attached to the
+    nearest point of what is left.
+
+    Returns (axes, attach): the axes as `Axis.to_dict` writes them, and per
+    leaf start the point on the ended axes it now attaches to (equal to the
+    start when it was already on one).
+    """
+    out = [dict(a, points=np.asarray(a["points"], float)) for a in axes]
+    trunks = [i for i, a in enumerate(out) if a["kind"] != "petiole" and len(a["points"]) >= 2]
+    starts = np.asarray(leaf_starts, float).reshape(-1, 3)
+
+    # attachments per trunk axis, in arc length along it
+    along = {i: [] for i in trunks}
+    for a in out:
+        if a["parent"] in along and len(a["points"]):
+            along[a["parent"]].append(_on_polyline(out[a["parent"]]["points"], a["points"][0])[0])
+    for q in starts:
+        hits = [(_on_polyline(out[i]["points"], q), i) for i in trunks]
+        if hits:
+            (s, _, _), i = min(hits, key=lambda h: h[0][2])
+            along[i].append(s)
+
+    for i in sorted(trunks):                                   # parents before children
+        line = out[i]["points"]
+        p = out[i]["parent"]
+        if p in along and len(out[p]["points"]) >= 2:
+            # re-attach to a parent that was shortened under this axis's start
+            s, near, d = _on_polyline(out[p]["points"], line[0])
+            if d > 0:
+                line = np.vstack([near, line])
+        reach = np.linalg.norm(line - line[0], axis=1)
+        turn = float(np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(line, axis=0), axis=1))][
+            int(np.argmax(reach))])
+        end = min(turn, max(along[i])) if along[i] else turn
+        out[i]["points"] = _cut(line, end)
+    for a in out:                                              # petioles off a shortened axis
+        if a["kind"] == "petiole" and a["parent"] in along and len(a["points"]):
+            _, near, d = _on_polyline(out[a["parent"]]["points"], a["points"][0])
+            if d > 0:
+                a["points"] = np.vstack([near, a["points"]])
+
+    attach = []
+    for q in starts:
+        hits = [_on_polyline(out[i]["points"], q) for i in trunks if len(out[i]["points"]) >= 2]
+        attach.append(min(hits, key=lambda h: h[2])[1] if hits else q)
+    for a in out:
+        a["points"] = np.round(a["points"], 6).tolist()
+    return out, np.asarray(attach, float).reshape(-1, 3)

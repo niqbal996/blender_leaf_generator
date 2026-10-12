@@ -400,6 +400,20 @@ def trace(points: np.ndarray, assignment: np.ndarray, voxel: float,
             axes_out = [axis.to_dict(line, i) for i, (axis, line) in enumerate(zip(tree.axes, axis_lines))]
             leaves = leaf_curves()
 
+        # Stems and branches end at their last leaf, not where the stem cloud
+        # does (it runs on into the apex blob and hooks back): end_axes. A
+        # leaf whose start lay on a part cut away begins at the new end.
+        on_stem = [leaf for leaf in leaves if leaf.get("starts_on") == "stem"]
+        axes_out, attach = stem_tree.end_axes(axes_out, [leaf["curve"][0] for leaf in on_stem])
+        for leaf, q in zip(on_stem, attach):
+            if np.linalg.norm(q - np.asarray(leaf["curve"][0])) > 0:
+                leaf["curve"] = [q.round(6).tolist()] + leaf["curve"]
+                leaf["petiole"] = [q.round(6).tolist()] + (leaf["petiole"] or [leaf["curve"][1]])
+                leaf["blade_start"] = len(leaf["petiole"]) - 1
+                leaf["petiole_length"] = float(_length(np.asarray(leaf["petiole"])))
+        main = np.asarray(axes_out[0]["points"], float)
+        stem = _tidy(main, samples, 0) if len(main) >= 2 else main
+
     return {"crown": [float(v) for v in crown], "stem": stem.round(6).tolist(), "leaves": leaves,
             "axes": axes_out,
             "stem_tree": tree.summary() if tree is not None else None,
@@ -549,6 +563,26 @@ def _tidy(path: np.ndarray, samples: int, iterations: int) -> np.ndarray:
     smoothed = smooth_polyline(path, iterations=iterations, strength=0.5)
     resampled, _length_of = resample_by_arclength(smoothed, samples)
     return np.asarray(resampled, float)
+
+
+def smooth_curve(points, voxel: float, samples: int = 48, iterations: int = 24) -> np.ndarray:
+    """Any leaf polyline drawn the way `trace` draws one: smooth, stem to tip.
+
+    The tracer smooths a leaf's route and midrib *as one polyline* of graph
+    nodes about a voxel apart (24 iterations at 0.5), which is what makes the
+    stalk run into the blade without a kink. A curve built another way -- a
+    straight join from the stem to a blade, or skeleton_2d's few fitted control
+    points, angular between them -- is re-spaced to that voxel first, so the
+    same smoothing rounds it over the same length (~1.3 mm on vogelmeere's
+    hull voxel), then resampled. Its ends stay put: it still starts on the
+    stem and ends at the tip.
+    """
+    path = np.asarray(points, float)
+    total = _length(path)
+    if len(path) < 2 or total <= 0:
+        return path
+    dense, _ = resample_by_arclength(path, max(int(np.ceil(total / voxel)) + 1, 3))
+    return _tidy(np.asarray(dense, float), samples, iterations)
 
 
 def _length(path: np.ndarray) -> float:
