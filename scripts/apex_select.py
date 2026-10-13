@@ -92,6 +92,45 @@ def in_region(curve_w, reach):
     return np.linalg.norm(curve_w[len(curve_w) // 2] - c) < r
 
 
+def leaf_world(run: Run, leaf: dict) -> np.ndarray:
+    """A skeleton leaf as one world-frame curve, petiole then midrib."""
+    pet = np.asarray(leaf.get("petiole") or [], float).reshape(-1, 3)
+    rib = np.asarray(leaf["midrib"], float)
+    return run.to_world(np.vstack([pet, rib]) if len(pet) >= 2 else rib)
+
+
+def candidates(run: Run, regions: dict, reach: dict, evidence: Path | None, dirs, mpu: float):
+    """Per apex: candidate leaves {source, curve (world), roll, group}, every one at each of ROLLS --
+    the geometry matches of SAM3's lines (>= CAND_SUPPORT frames) and the apex leaves of `dirs`."""
+    per = defaultdict(list)
+    group = 0
+
+    def add(apex, source, curve):
+        nonlocal group
+        for r in ROLLS:
+            per[apex].append({"source": source, "curve": curve, "roll": r, "group": group})
+        group += 1
+
+    if evidence:
+        rows = json.loads(Path(evidence).read_text())["leaves"]
+        cams = {f: apex_match.Cam(run, f) for f in run.image_of}
+        obs = apex_match.evidence_obs(run, rows, regions, cams)
+        apex_match.MIN_SUPPORT = CAND_SUPPORT
+        for name in sorted(obs):
+            with contextlib.redirect_stdout(io.StringIO()):
+                got = apex_match.match_dense(run, obs[name], regions[name], cams, mpu)
+            for X, _ in got:
+                add(name, "geometry", X)
+    for d in dirs:
+        sk = json.loads((Path(d) / "skeleton.json").read_text())
+        for leaf in sk["leaves"]:
+            X = leaf_world(run, leaf)
+            for name in regions:
+                if in_region(X, reach[name]):
+                    add(name, Path(d).name, X)
+    return per
+
+
 def strip(curve_w: np.ndarray, roll_deg: float) -> np.ndarray:
     """(ALONG * ACROSS, 3) points of a leaf-shaped strip along the curve."""
     C = resample(curve_w, ALONG)
@@ -297,38 +336,8 @@ def main():
     base_dir = args.base or args.workdir / "p5x"
     base = json.loads((base_dir / "skeleton.json").read_text())
 
-    def leaf_curve(leaf):
-        pet = np.asarray(leaf.get("petiole") or [], float).reshape(-1, 3)
-        rib = np.asarray(leaf["midrib"], float)
-        return run.to_world(np.vstack([pet, rib]) if len(pet) >= 2 else rib)
-
-    # candidates per apex
-    per = defaultdict(list)
-    group = 0
-
-    def add(apex, source, curve):
-        nonlocal group
-        for r in ROLLS:
-            per[apex].append({"source": source, "curve": curve, "roll": r, "group": group})
-        group += 1
-
-    if args.evidence:
-        rows = json.loads(args.evidence.read_text())["leaves"]
-        cams = {f: apex_match.Cam(run, f) for f in run.image_of}
-        obs = apex_match.evidence_obs(run, rows, regions, cams)
-        apex_match.MIN_SUPPORT = CAND_SUPPORT
-        for name in sorted(obs):
-            with contextlib.redirect_stdout(io.StringIO()):
-                got = apex_match.match_dense(run, obs[name], regions[name], cams, mpu)
-            for X, _ in got:
-                add(name, "geometry", X)
-    for d in args.candidates:
-        sk = json.loads((d / "skeleton.json").read_text())
-        for leaf in sk["leaves"]:
-            X = leaf_curve(leaf)
-            for name in regions:
-                if in_region(X, reach[name]):
-                    add(name, d.name, X)
+    leaf_curve = lambda leaf: leaf_world(run, leaf)
+    per = candidates(run, regions, reach, args.evidence, args.candidates, mpu)
     occluders = [leaf_curve(l) for l in base["leaves"]
                  if not any(in_region(leaf_curve(l), reach[n]) for n in regions)]
 

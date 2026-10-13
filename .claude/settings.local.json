@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /root/.claude/projects/-home-iqbal-blender-leaf-generator/memory/ 2>/dev/null && cat /root/.claude/projects/-home-iqbal-blender-leaf-generator/memory/MEMORY.md 2>/dev/null; echo ---; ls /netscratch/naeem/blender_assets/06-10-2026-Naeem/ /netscratch/naeem/blender_assets/06-10-2026-Naeem/plant_data 2>/dev/null)",
+      "Read(//netscratch/naeem/blender_assets/06-10-2026-Naeem/**)"
+    ]
+  }
+}

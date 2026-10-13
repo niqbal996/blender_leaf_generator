@@ -6,16 +6,248 @@ Every experiment writes into `<plant>/debug/<experiment>/`, never into the repo.
 
 ---
 
-## 0. Start here — handoff for option 3, step 3 (written 2026-10-12, end of day)
+## 0. Start here — handoff (updated 2026-10-13, evening)
 
-Sections 1–6 below are the day's log, including dead ends and numbers that
-were later corrected. **This section is the current truth.**
+Sections 1–6 below are the log, including dead ends and numbers that were
+later corrected. **This section is the current truth.**
 `P=/netscratch/naeem/blender_assets/06-10-2026-Naeem/vogelmeere/plant`, `D=$P/debug`.
+Sessions run in replaceable containers: read the repo's `CLAUDE.md` first (the
+`pose` env and Claude's memory live on a tmpfs; how to restore both).
 
-**Goal of the next session.** Option 3, step 3: *fit* the apex leaves to the
-photos. Until now the apex leaves were only *chosen* from candidates, never
-shaped, and by eye they are not yet better than before. Step 3 is what should
-make them better.
+### 0.0 Where things stand (2026-10-13)
+
+**The user's look at v2** (`$D/apex_fit`, yesterday's last version) in Blender:
+1. counts on the plant (`$P/p1/frames/apex_counts.json`): A 7, B 6, C 7, D 4
+   leaves, plus at almost every apex one tiny leaf at the very centre (a bud,
+   not counted); may not be complete;
+2. blades close, but their curvature is not towards the centre: they spiral
+   away from it; midribs better, not there yet;
+3. a leaf behind an apex (not part of it) can look like part of it in some
+   views and confuse the fit — should all leaves be in the fit?;
+4. how is the fit started, can the starting template be better? (answered in
+   the chat of 2026-10-13; the template is now §0.1's);
+5. Blender: clouds hide the skeleton; collections need collapsing by hand;
+   use the P4g-based cloud.
+
+**Measured on v2** (`scripts/apex_fit_check.py`, same scorer for every
+version): midribs turned 62° median from base to tip (up to 138°), 10 of 26
+towards the shoot axis, the rest away; a sideways bend out of the leaf's own
+plane of 0.46 (median change of the unit tangent) — the spiral; rolls from
+−238° to +200°, twists to 209°: blades upside down, so their fold cupped
+outwards. Nothing in v2's leaf knew where the shoot was or which face is up.
+
+**Built today: v3** (`scripts/apex_fit.py`, design in §0.1) — every apex leaf
+lives in its shoot's frame: the apex has a tip and a shoot axis (both fitted;
+the axis starts along the P5x branch that ends at the apex); a leaf is placed
+by where it joins the axis, its azimuth, its elevation and how far it curls
+in; its midrib stays in the plane through the axis, turns only towards it,
+its upper face looks at the shoot, its blade is not twisted. A bud at each
+tip (structure: never a false positive, no longer than the shortest leaf).
+All other P5x leaves are instances in the render, so a leaf behind the apex
+claims its own SAM3 mask (point 3). Each fitted leaf proposes its opposite
+partner (§3.4); partners are judged one by one before the other candidates.
+
+**Numbers, v2 → v3** (all 74 frames unless said; `$D/apex_fit/recheck/` and
+`$D/apex_fit_v3/leaf_support.txt`, same scorer, context leaves in both):
+
+| | v2 | **v3** |
+|---|---|---|
+| leaves A / B / C / D (user: 7 / 6 / 7 / 4) | 9 / 6 / 7 / 4 | 9 / **4** / **6** / 4, + a bud at each |
+| PQ A / B / C / D | 0.40 / 0.40 / 0.29 / 0.36 | 0.41 / 0.41 / 0.37 / 0.35 |
+| held out (even frames fit, odd scored) PQ | (old scorer) | 0.40 / 0.41 / 0.36 / 0.37 |
+| midrib turn, median | 62° | 32° |
+| leaves curling towards the shoot | 10 of 26 | 21 of 23 |
+| sideways bend (spiral), median | 0.46 | 0.02 |
+| user's lines found (`apex_labels.py --score`) | 52 % | **63 %** (selection 58 %, s2d fair zoom 67 %) |
+| tip vs user's lines: across / along / distance | 6.2 / −0.6 / 9.1 px | 5.3 / +0.7 / 9.3 px |
+
+Variant `$D/apex_fit_v3_recurve` (`--recurve`: midribs may also bend away,
+to 90°): same counts, PQ 0.42 / 0.41 / 0.37 / 0.37 (held out 0.41 / 0.41 /
+0.35 / 0.40), 17 of 23 curl in, lines found 53 %, tips across 5.8 px — no
+gain, and the outward bends the user objected to come back. Not used.
+
+**Open, in this order** (each: structural rule, no tuned weight; judge with
+`apex_fit_check.py` incl. the counts, `apex_labels.py --score`, the held-out
+run, then a bundle):
+1. **Counts: B 4 of 6, C 6 of 7, A 9 of 7.** B's four are its two outer pairs;
+   the missing two are the young inner pair, turned 90° to the outer one,
+   smaller and more upright. A partner proposal (same leaf, other side) cannot
+   make them; every one at B lowered J. Next: propose the **next pair up** of
+   each fitted pair (azimuth +90°, nearer the tip; size and elevation from the
+   pair below — measure the ratio on apices that show two pairs, do not tune
+   it). At A, one partner landed 2.3 mm from leaf A_5 (a near-upright leaf's
+   partner is its neighbour): a twin; check A_5 / A_8 in Blender.
+2. **Growing stops at the first rejected candidate.** Partners are now judged
+   one by one; the evidence candidates still stop at the first that does not
+   raise J (always a geometry one so far). Cheap to judge the top few.
+3. **Midline term** (yesterday's step 1): each matched leaf's visible midrib on
+   its mask's 2D centre line (`$D/s2d_curves_zoom_fair/evidence_2d.json`).
+   Tips across went 6.2 → 5.3 px from the shape rules alone.
+4. Fit C and D together (their squares overlap).
+
+**How to run** (GPU H100; after a container restart see `CLAUDE.md`: rebuild
+`pose`, gsplat compiles ~5 min on first use):
+- fit: `$D/apex_fit_v3/run.sh` (all frames, the deliverable) and
+  `$D/apex_fit_v3_heldout/run.sh` (even frames, scores the odd ones); 3–6 min
+  per apex, ~17 min each, both can run at once (the candidate pool is CPU);
+- check: `PYTHONPATH=src python scripts/apex_fit_check.py --workdir $P --skeleton $D/apex_fit_v3`
+  (counts vs the user's, shape about the shoot axis, PQ, per-leaf support, tips);
+- labels: `PYTHONPATH=src python scripts/apex_labels.py --workdir $P --out $D/apex_labels --score $P/p5x $D/apex_select $D/s2d_curves_zoom_fair $D/apex_fit $D/apex_fit_v3 --annotate $D/apex_compare`
+  (re-carves `apex_regions.npz`: identical, checked 2026-10-13);
+- axis start, drawn: `$D/apex_axes/axis_look.py` (header says how);
+- bundle: `$D/blender_bundle/make_bundle.sh` (dated tar.gz + VERSION.txt);
+  delete the superseded one, unpack the new one and check what shipped
+  (`$D/blender_bundle/viewer_test.py` builds the scene headless with Blender's
+  `bpy` module; header says how to get it);
+- python is `/root/miniconda3/envs/pose/bin/python`.
+
+**Viewing** (bundle `$D/blender_bundle/vogelmeere_view_core_20261013_1631.tar.gz`):
+`./scripts/view_in_blender.sh vogelmeere/plant --p5x p5x_p4g --skeleton2d vogelmeere/plant/debug/apex_compare/p5x,vogelmeere/plant/debug/apex_compare/apex_select,vogelmeere/plant/debug/apex_compare/apex_fit,vogelmeere/plant/debug/apex_compare/apex_fit_v3`
+— base scene: P5x's leaf labels on the P4g cloud (`--p5x p5x_p4g`; plain
+`--p5x` = the hull-based one), drawn as small translucent points with every
+skeleton in front of it (`--cloud-alpha`, `--cloud-size`, `--no-in-front`);
+each method one collection (`s2d_apex_fit_v3` > `_blades`, `_midribs`,
+`_branches` (v3: each apex's fitted shoot), `_gt_found`, …), the outliner
+collapsed to one line per method once Blender's window is up (a timer; not
+testable headless — if it fails, the console says so). Buds: blades named
+`…_fit_apex_<X>_bud`.
+
+**Folder map of `$D`** (2026-10-13):
+
+| folder | what |
+|---|---|
+| `apex_labels/` | apex regions carved from the user's boxes, `labels.jpg`, `scores.json` + `score_<method>.jpg` (the yardstick) |
+| `apex_zoom_fair/` | zoomed SAM3 masks per apex (`sam3/`), `masks_zoom.npz` |
+| `s2d_curves_baseline/`, `s2d_curves_zoom_fair/` | s2d one-curve on P2 / on fair zoomed masks (`evidence_2d.json` feeds the geometry candidates) |
+| `apex_select/`, `apex_select_p4g/` | steps 1–2; `apex_select` is the fit's start |
+| `apex_fit_v3/` | **current result**: `skeleton.json` (+ `apices`: tip and axis per apex), `fit.json`, `apex_<X>.jpg` (photo / SAM3 / start / fitted; grey = context leaves), `leaf_support.txt`, `run.sh`, `apex_fit_v3_code.py` (the code as run) |
+| `apex_fit_v3_heldout/` | same, fitted on even frames; `fit.json` has the held-out scores |
+| `apex_fit_v3_recurve{,_heldout}/` | the `--recurve` variant (not used, numbers above) |
+| `apex_fit/`, `apex_fit_heldout/` | v2 (yesterday); `apex_fit/recheck/leaf_support.txt` = v2 in today's scorer; `apex_fit/apex_fit_v2.py` the code as it was |
+| `apex_fit_prev/` | v1 (split and ghost leaves), for the record |
+| `apex_axes/` | the axis start drawn per apex (`axis_look.py`, `.jpg`) |
+| `apex_compare/` | label-annotated copies of each method's skeleton (what the bundle ships) |
+| `blender_bundle/` | `make_bundle.sh`, `viewer_test.py`, the latest core bundle, `vogelmeere_view_clouds.tar.gz` (P4 clouds, unchanged) |
+
+**Code state** (nothing committed since `812bee9`): `scripts/apex_fit.py` (v3),
+`scripts/apex_fit_check.py` (v3 scorer), `apex_select.py` (candidate pool as
+a function), `blender_view_plant.py` + `view_in_blender.sh` (nested and
+collapsed collections, translucent clouds, skeleton in front, `--p5x
+<folder>`), `CLAUDE.md` (new), this doc.
+
+### 0.1 v3 as built (2026-10-13) — `scripts/apex_fit.py` → `$D/apex_fit_v3/`
+
+Same renderer, masks, on-plant and away terms, one-to-one instance scores and
+add/drop by J as v2 (§0.2). What changed:
+
+| part | v3 | why |
+|---|---|---|
+| apex | tip O (starts at the selection's node) and shoot axis a, both fitted, shared by its leaves. a starts along the P5x stem or branch that ends nearest the node (its last stretch, over the apex's reach); else the leaves' cone axis | an apex is a shoot's end. The tree apex_select hands on joins nodes sideways (47–90° off at B, D); the cone of the leaves was 61–82° off at A, D (leaves at 3–80° to the axis) — `$D/apex_axes/axis_look.jpg`. The fit turned the axes a further 22–32° |
+| leaf | 12 numbers: attach below O (a share of the apex's reach — clamped at 0, as in v2, a leaf touching the tip stuck there for good), azimuth, elevation, incurve 0..180° towards the axis, two Bézier legs; blade start, width, two tapers; one roll within ±90°; fold | the midrib lies in its median plane (the plane holding the axis) and curls only in; the upper face looks at the shoot, so the fold cups inwards; no twist. Removes v2's spirals by construction |
+| start | each selected curve read in that frame (its out-of-plane part dropped; incurve from its first and last quarters, at least 10° — a start value), roll 0, fold 4° | the template |
+| bud | one more element at O, along the axis, closed, half the shortest leaf; never a false positive, never dropped, no longer than the shortest leaf (`bud` term, unitless like `away`) | the user sees one at almost every apex; SAM3 seldom masks it apart. Judged as a leaf, J dropped it where it is plainly there; never a false positive and unbounded, it grew into an 11 mm leaf on a leaf's mask |
+| context | every P5x leaf with most of its points outside the apex's carved region is its own instance (its P5x points): it can claim a SAM3 mask, never a false positive. P5x leaves mostly inside: dropped (the fit replaces them); stem, unassigned: one occluder | the user's point 3: a leaf behind the apex is no longer a target an apex leaf has to cover. 33–44 context leaves per apex; they claim 7–51 masks |
+| growing | after the first fit, each leaf's partner (same leaf, turned 180° about the axis) is tried one by one, best first, kept if J rises; then apex_select's candidates as before | §3.4; ranked among all candidates, a partner was never reached (a geometry candidate came first, failed, and ended the growing) |
+
+### 0.2 v2 as built (2026-10-12, night) — `$D/apex_fit/` (kept for the record)
+
+**Design.** Per apex, every leaf is fitted at once to all 74 photos, starting
+from the selection (`$D/apex_select`).
+
+| part | choice | why |
+|---|---|---|
+| leaf | 14 numbers: base sliding along its shoot inside the apex region (1); midrib = quadratic Bézier from the base (6); blade start (1); width at the widest, ≤ ½ blade length (1); outline tᵃ(1−t)ᵇ, base taper a and tip taper b (2); roll at the base, 0 = level (1); twist to the tip (1); fold, 0 flat … 90° closed (1); stalk one voxel wide | the numbers the asset step needs (§3.2). Quadratic = one arc bending one way: a cubic hooked its tips inside the narrow blade end, where the masks hardly see it |
+| renderer | gsplat 3D Gaussians, flat: 40 × 11 per leaf, one at the centre of each blade cell, covariance from the grid's own steps (κ = 0.6 of a step, so neighbours close into one surface), antialiased; one colour channel per leaf; the cloud outside the apex region as a fixed occluder channel; pinhole cameras on an undistorted 128 px grid of each apex square, the masks resampled onto it through SIMPLE_RADIAL | depth order and occlusion for free, differentiable, ~25 ms for 74 views |
+| masks | per view, leaves and zoomed SAM3 masks matched **one to one** (Hungarian on IoU, every step, no gradient); scored as instances, the panoptic-quality way: a pair above IoU 0.5 is a true positive, a visible leaf in none a false positive, a mask in none a false negative; each pair earns its IoU, each FP and FN costs ½ (the F1 weights); masks reaching the square's edge are leaves passing through (apex_zoom's rule) and no target | no ids across views; two blades on one leaf leave one a false positive, and a blade where SAM3 sees no apex leaf pays in every view it shows in. (The first version let two leaves share a mask and charged nothing for blades on no mask — see below) |
+| on plant | every blade point must project inside the P2 plant mask: distance outside, in mm at the leaf, over the leaf's width | sets depth in the side views; a leaf off by its own width is as wrong as one missing its mask — no weight to tune |
+| away | distance from the base never decreases along the midrib | "leads away from where it joins" |
+| objective | J = Σ views [IoU of the pairs − (FP + FN)/2 − on-plant cost] / views − away | dimensionless; one leaf ≈ one unit |
+| leaf count | fit the selection's leaves → add the best-ranked candidate (apex_select's pool: geometry matches + P5x, P5x-on-P4g, both s2d one-curve), re-fit, keep it only if J went up; the first that does not ends the growing → drop any leaf whose removal does not lower J → final fit | §3.8 with the same J; nothing tuned. A raw candidate rarely reaches a true positive before it is fitted, so it is judged fitted |
+| output | skeleton.json in the P5x schema (`curve`, `blade_start`, one curve shoot → tip) + per leaf `blade` {length, width, widest_at, tapers, roll, twist, fold} and `blade_mesh` (40 × 11 surface) | what the PBR assets snap to; the viewer draws `blade_mesh` as a surface (`<tag>_blades`) |
+| evaluation | (1) held out: fit on even frames, score on odd (`$D/apex_fit_heldout`); (2) your 105 lines (`apex_labels.py --score`); (3) Blender | label-free + labelled + by eye |
+
+**Results** (`$D/apex_fit/run.sh`, ~1–2 min per apex on the H100).
+
+*First version (one evening, kept as `$D/apex_fit_prev`): too many leaves.*
+Your Blender look: two blades make one real leaf, and ghost leaves (e.g.
+`fit_apex_C_4`, `C_7`) where the plant has none; 54 apex leaves on a plant of
+30–35 leaves in all. Measured per leaf over the 74 views
+(`leaf_support.txt`): leaves shared their SAM3 mask with another leaf in 56 %
+of the views they showed in and were alone on one in only 19 %; 9 leaves lay
+on no mask in most views (C_4: 47 of 66, C_7: 54 of 64). Cause: the
+objective, not the training — J had stopped moving (< 1 % over the last 200
+steps). It let two leaves share a mask (meant for SAM3 masks over two young
+leaves; the fit used it everywhere, since two halves cover a mask better than
+one blade), and blades on no apex mask -- e.g. over the big leaves, whose
+masks are no target -- cost nothing. Fixed by the one-to-one instance scores
+above.
+
+*Now* (`$D/apex_fit`, all frames): 26 apex leaves (A 9, B 6, C 7, D 4) + 10
+others = 36 leaves; no two fitted leaves within half a blade width of each
+other (was 18 pairs); leaves alone on their mask in 71 % of the views they
+show in (was 19 %), sharing in 5 % (was 56 %); 2 leaves still on no mask in
+most views (A_8, B_4 — check in Blender). Same instance scores on all 74
+frames, first version → now: PQ A 0.23 → 0.37, B 0.17 → 0.40, C 0.19 → 0.29,
+D 0.26 → 0.34, with false positives 585/457/801/256 → 200/147/235/92.
+
+Held out — fitted on the 37 even frames, scored on the 37 odd ones it never
+saw (start = the selection's leaves in the same renderer):
+
+| apex | PQ | F1 | SQ (IoU of matches) | SAM3 mask pixels covered | leaves |
+|---|---|---|---|---|---|
+| A | 0.16 → 0.37 | 0.26 → 0.55 | 0.60 → 0.67 | 0.44 → 0.60 | 9 → 10 |
+| B | 0.12 → 0.40 | 0.21 → 0.58 | 0.58 → 0.70 | 0.37 → 0.65 | 5 → 6 |
+| C | 0.10 → 0.29 | 0.16 → 0.45 | 0.60 → 0.66 | 0.46 → 0.65 | 9 → 7 |
+| D | 0.14 → 0.33 | 0.22 → 0.51 | 0.62 → 0.65 | 0.33 → 0.46 | 3 → 3 |
+
+Your lines (`$D/apex_labels/scores.json`):
+
+| method | found | tip | tip along your line / across |
+|---|---|---|---|
+| P5x | 34 % | 6.9 px | |
+| selection (start) | 58 % | 5.7 px | +0.5 / 2.6 px |
+| s2d one-curve, fair zoom | **67 %** | 5.7 px | +1.5 / 2.8 px |
+| fit, first version (54 leaves) | 62 % | 6.2 px | −1.0 / 4.2 px |
+| **fit** (`apex_fit`, 26 leaves) | 52 % | 9.1 px | −0.6 / 6.2 px |
+
+What the numbers and pictures say:
+- the blades lie on the leaves (`$D/apex_fit/apex_<X>.jpg`, third vs fourth
+  column), one blade per leaf, and that holds on frames the fit never saw;
+- two earlier fixes, both to the model: tips were 4–6 px short of yours —
+  (a) outlines allowed to go square-ended (taper bound now 0.5 = rounded),
+  (b) Gaussians on the blade's edge drew it half a Gaussian too big, so the
+  fit shrank it (now one Gaussian per cell centre). Tips land on yours along
+  the leaf;
+- **open — midribs:** against your lines the clean fit is below the
+  selection (52 % vs 58 %, tips 6.2 px off *sideways*). The outline is
+  matched; where the midrib runs inside it is not pinned by any term. The
+  selection's midribs come from SAM3's 2D centre lines, which is what you
+  draw. Next: a term pulling each matched leaf's visible midrib onto its
+  mask's 2D centre line (s2d's `evidence_2d.json`, identity-free like the
+  masks);
+- **open — small inner leaves:** C's bud leaves have masks but no leaf (no
+  candidate fits them). The opposite-pair prior (§3.4) would propose them
+  from the node layout instead of from the candidate pool.
+
+**Viewing** (bundle `$D/blender_bundle/vogelmeere_view_core_<stamp>.tar.gz`,
+built by `make_bundle.sh` beside it; VERSION.txt lists md5 + build stamp):
+`./scripts/view_in_blender.sh vogelmeere/plant --p5x --skeleton2d vogelmeere/plant/debug/apex_compare/p5x,vogelmeere/plant/debug/apex_compare/apex_select,vogelmeere/plant/debug/apex_compare/apex_fit_prev,vogelmeere/plant/debug/apex_compare/apex_fit`
+— the fitted surfaces are the `s2d_apex_fit_blades` collection (`s2d_apex_fit_prev_blades`: the first version).
+
+**Clean-up, same night:** removed from `$D` the step-0 runs (`apex_zoom`,
+`apex_zoom_clean`, `apex_zoom_probe`), the matching/lifting dead ends
+(`apex_match*`, `apex_lift_p2ev`), the pre-fix sweep (`apex_select_sweep`),
+`apex_look`, `stale_backup`, the old s2d without leaf curves
+(`apex_zoom_fair/s2d_zoom_fair`, its evidence is byte-identical to
+`s2d_curves_zoom_fair`'s), stale score pictures. `apex_select*` were re-run
+with only current candidate sources (same 26 leaves but one at A). The
+plant's root `skeleton.json`, `evidence_2d.json`, `scores.json`,
+`reprojection.jpg`, `p5x_vs_2d.jpg` (s2d of Oct 8, before the one-curve
+rules) were replaced by the current s2d run (`$D/s2d_curves_baseline`).
+`p5x/` was checked against a fresh retrace: identical. Sections 1–5 below
+still name some of the removed folders; they are the record, not paths to use.
+
+### 0.3 Pieces, rules and pitfalls (still valid)
 
 **What exists and works (reuse it):**
 
@@ -27,11 +259,16 @@ make them better.
 | renderer + selection (steps 1–2) | `scripts/apex_select.py` → `$D/apex_select/` (on P5x), `$D/apex_select_p4g/` (on P5x-on-P4g) | leaf strips drawn into all 74 views on the GPU (torch, depth-tested, SIMPLE_RADIAL camera), greedy subset explaining the zoomed masks; output = P5x with apex leaves replaced, each one smooth curve from its shoot to its tip |
 | structure rules | `stem_tree.end_axes`, `leaf_skeleton.smooth_curve`, apex node + "leads away" in `apex_select.py` | axes end at their last leaf / where they turn back; leaves one smooth curve, base at the stem, never folding back |
 | yardstick | `scripts/apex_labels.py --score <dirs> --annotate $D/apex_compare` | 105 hand-drawn leaf lines in 6 frames (`$P/p1/frames/frame_00{00,06,14,17,23,25}.json`); identity-free pairing per frame |
+| fit (step 3) | `scripts/apex_fit.py` → `$D/apex_fit_v3/` (all frames), `$D/apex_fit_v3_heldout/` (even frames) | §0.1: per apex leaf in its shoot's frame: attach, azimuth, elevation, incurve, width, tapers, roll, fold, `blade_mesh`; a bud per apex; each apex's fitted shoot in the stem tree |
+| fit check | `scripts/apex_fit_check.py --skeleton <fit dir>` | any version, same scorer: counts vs the user's, shape about the shoot axis (turn, in, sideways), PQ, F1, TP/FP/FN (TP by context leaves), per-leaf support, twins, tips vs labels |
 | Blender bundle | `$D/blender_bundle/vogelmeere_view_core_<stamp>.tar.gz` (+ clouds) | the user views locally; see "Viewing" below |
 
-**Current numbers** (your lines found / tip error; *precision is meaningless*:
+**Current numbers**: §0.0's table. Older summary, kept (your lines found / tip error; *precision is meaningless*:
 the labels are partial): P5x 34 % / 6.9 px · s2d one-curve on fair zoom 67 % /
-5.7 px · selection on P5x 58 % / 5.6 px · selection on P5x-on-P4g 57 % / 7.0 px.
+5.7 px · selection on P5x 58 % / 5.7 px · selection on P5x-on-P4g 57 % / 7.3 px ·
+**fit (step 3) 52 % / 9.1 px with 26 apex leaves**, held-out PQ 0.10–0.16 → 0.29–0.40 (§0.1; the first version, 54 leaves with split and ghost blades, 62 % / 6.2 px).
+
+*Written before step 3 was built, kept for the record (§0.1 is what was built):*
 
 **Why the selection stops short** (what step 3 must fix): its leaf shape is a
 crude strip (width ½ length, 4 fixed rolls), so real leaves that are wider or
@@ -71,6 +308,17 @@ over two young leaves pays only one leaf.
 - keep this doc's checklist current; plain words.
 
 **Pitfalls already paid for:**
+- an objective that lets leaves share a mask, or charges nothing for blades
+  on no mask, grows split and ghost leaves; more iterations do not help (J
+  had converged) — check with `apex_fit_check.py`, not only with IoU;
+- label "found %" rewards many leaves; the instance scores (PQ, FP) and the
+  per-leaf support show what found % hides — report both;
+- Gaussians placed *on* a surface's edge draw it too big by half a Gaussian
+  (fit then shrinks it): place them at cell centres;
+- `pkill -f`/`pgrep -f "<script>"` also matches the shell running it — use
+  `pgrep -f "[a]pex_fit.py"`, or wait on the log (`until grep -q wrote ...`);
+- `rm -rf $VAR/...` is refused by Claude Code's safety check — use literal
+  absolute paths;
 - P5x outputs on disk can predate the tracer (vogelmeere's did): retrace
   (`pose-leaf-instances --retrace`, seconds) before comparing;
 - crops for an apex come from the labelled regions, not stem-tree ends;
@@ -79,12 +327,19 @@ over two young leaves pays only one leaf.
 - `skeleton_2d.py` needs leaf masks inside the plant mask's box (fixed);
 - `pose` env: `./setup_env.sh --with-sam3` keeps `kernels` in transformers'
   window (SAM3 mask clean-up was silently off before);
-- other plants still need `--retrace` to get `end_axes`.
+- other plants still need `--retrace` to get `end_axes`;
+- a parameter clamped at a bound (`x.clamp(min=0)`) has no gradient past it:
+  once there, it never leaves (v2's leaf base, v3's first attach). Use a
+  sigmoid/softplus share instead;
+- an element that is never a false positive needs another bound, or it grows
+  onto real leaves' masks (the first structural bud);
+- `/root` is a tmpfs in these containers: the `pose` env, Claude's memory and
+  the scratchpad die with it (see `CLAUDE.md`).
 
-**Suggested first prompt for the new session:** "Read `docs/apex-plan.md`
-section 0 and the code it names. Then propose a concrete design for option 3
-step 3 on vogelmeere's 4 apices — model parameters, renderer, losses,
-evaluation — before writing code."
+**Suggested first prompt for the next session:** "Read `CLAUDE.md` and
+`docs/apex-plan.md` §0. I have looked at the 2026-10-13 bundle in Blender:
+<my verdict>. Then do open item 1 (next-pair-up proposals) and show me the
+counts and scores before and after."
 
 ---
 
@@ -509,9 +764,11 @@ key view (where zoomed SAM3 already does fairly well).
       `<method>_gt_found` collection. Overlays now also work on the cloud
       panels (`--clouds ... --skeleton2d A,B`).
 - [ ] Your look in Blender (commands below)
-- [ ] **Step 3, next:** fit each kept leaf's width, roll and bend to the masks
-      (differentiable, gsplat), and let a mask pay two leaves when both lie
-      on it side by side — the two reasons the selection stops early.
+- [x] **Step 3** (2026-10-12 night): fit each kept leaf's width, roll and bend
+      to the masks (differentiable, gsplat), a mask may pay two leaves side by
+      side, leaves added from the candidate pool and dropped by the same
+      objective → `scripts/apex_fit.py`, `$D/apex_fit/`. Design, numbers and
+      viewing in §0.1.
 
 - [x] **Fixes before step 3** (your review):
       - *P5x on disk was stale*: `p5x/` (15:01, Oct 9) and `p5x_p4g/` (14:24)
@@ -626,11 +883,15 @@ to 0.1 mm). Unpacked side by side they are a mini-repo:
 - [ ] Rerun P2 on vogelmeere with the clean-up on, into a copy, and compare
       masks before deciding whether to rerun P2 → P5x on all plants
 - [ ] Restart the queue for sugarbeet_x (P5x), thistle_x, weed_x
-- [ ] Step 1 — first guess per apex leaf (now: the key-view lifting of 0b)
-- [ ] Step 2 — virtual leaf + renderer (adds width, fold, occlusion to the
-      lifted midribs)
-- [ ] Step 3 — fit apex 08
-- [ ] Step 4 — all vogelmeere apices
+- [x] Step 1 — first guess per apex leaf: the selection (`apex_select.py`),
+      not the key-view lifting (dead end, 21–25 %)
+- [x] Step 2 — virtual leaf + renderer (`apex_fit.py`, §0.1)
+- [x] Step 3 — fit, all four vogelmeere apices at once (§0.1)
+- [x] Step 4 — leaf count by the objective, whole plant in Blender (§0.1)
+- [x] Opposite-pair prior (§3.4): partner proposals (2026-10-13, §0.1); A gained one
+- [x] Leaves in the shoot's frame, bud, context leaves (v3, 2026-10-13, §0.0–0.1)
+- [ ] Next-pair-up proposals (B's and C's missing inner leaves, §0.0 open 1)
+- [ ] Midline term (§0.0 open 3)
 - [ ] Step 5 — other plants
 
 ---

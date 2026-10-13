@@ -84,6 +84,15 @@ CROWN_RGBA = (1.0, 0.85, 0.10, 1.0)       # yellow: foot of the stem, above the 
 GT_FOUND_RGBA = (1.0, 0.0, 0.85, 1.0)    # magenta: an apex leaf that matches a hand-drawn line
 HEART_RGBA = (0.10, 0.75, 1.0, 1.0)       # cyan: top of the stem, where leaves start
 
+# The skeleton is what is judged, the cloud is its context: skeleton parts (curves,
+# balls, blade surfaces) are drawn in front of everything (--no-in-front turns it
+# off), and the P5x / --clouds point clouds as smaller translucent points
+# (--cloud-alpha, --cloud-size x the usual radius), so the skeleton shows through
+# without hiding the clouds. Set in main() from the command line.
+IN_FRONT = True
+CLOUD_ALPHA = 0.35
+CLOUD_SIZE = 0.5
+
 # The organ colours P5 writes into structure.ply (cli/structure.py's ROOT_RGB
 # and STEM_RGB), normalised the way read_ply returns them. Used only to split
 # the cloud into separate objects -- the colours themselves come from the file.
@@ -256,8 +265,20 @@ def emission_material(name, rgba, strength=1.0):
     return mat
 
 
-def vertex_colour_material(name, fallback=None):
-    """Emission driven by the mesh's own Color attribute.
+def translucent(mat, alpha):
+    """Let `mat` be see-through at `alpha` in Material Preview / EEVEE (both the
+    4.2+ and the older blend setting) and in Solid view (the viewport colour's alpha)."""
+    for attr, value in (("surface_render_method", "BLENDED"), ("blend_method", "BLEND")):
+        try:
+            setattr(mat, attr, value)
+        except (AttributeError, TypeError, ValueError):
+            pass
+    c = mat.diffuse_color
+    mat.diffuse_color = (c[0], c[1], c[2], alpha)
+
+
+def vertex_colour_material(name, fallback=None, alpha=1.0):
+    """Emission driven by the mesh's own Color attribute, mixed with transparency below alpha 1.
 
     `fallback` is what Blender's **Solid** viewport shows. Solid mode does not
     read the Color attribute -- it uses the material's `diffuse_color` -- so
@@ -274,10 +295,20 @@ def vertex_colour_material(name, fallback=None):
     attr = nodes.new("ShaderNodeAttribute")
     attr.attribute_name = "Color"
     links.new(attr.outputs["Color"], emit.inputs["Color"])
-    links.new(emit.outputs["Emission"], out.inputs["Surface"])
+    if alpha < 1.0:
+        clear = nodes.new("ShaderNodeBsdfTransparent")
+        mix = nodes.new("ShaderNodeMixShader")
+        mix.inputs["Fac"].default_value = alpha          # 0 = clear, 1 = the colour
+        links.new(clear.outputs[0], mix.inputs[1])
+        links.new(emit.outputs["Emission"], mix.inputs[2])
+        links.new(mix.outputs[0], out.inputs["Surface"])
+    else:
+        links.new(emit.outputs["Emission"], out.inputs["Surface"])
     if fallback is not None:
         mat.diffuse_color = (float(fallback[0]), float(fallback[1]),
                              float(fallback[2]), 1.0)
+    if alpha < 1.0:
+        translucent(mat, alpha)
     return mat
 
 
@@ -300,11 +331,15 @@ def _in_scene(coll):
     return coll is root or coll in root.children_recursive
 
 
-def _collection(name):
+def _collection(name, parent=None):
+    """The collection `name`, emptied on first touch this run; under the collection
+    `parent` when given (one per method, so a method is one line in the outliner),
+    else under the scene."""
+    holder = _collection(parent) if parent else bpy.context.scene.collection
     existing = bpy.data.collections.get(name)
     if existing is None:
         made = bpy.data.collections.new(name)
-        bpy.context.scene.collection.children.link(made)
+        holder.children.link(made)
         _PREPARED.add(name)
         return made
     if name not in _PREPARED:
@@ -314,9 +349,48 @@ def _collection(name):
         for obj in list(existing.objects):
             bpy.data.objects.remove(obj, do_unlink=True)
         _PREPARED.add(name)
+    root = bpy.context.scene.collection
+    if parent and existing.name in root.children:
+        root.children.unlink(existing)                 # left at the top by an older build
     if not _in_scene(existing):
-        bpy.context.scene.collection.children.link(existing)
+        holder.children.link(existing)
     return existing
+
+
+def collapse_outliner(delay=1.0):
+    """Close every collection in the outliner to one line once the window is drawn.
+
+    Blender opens a new collection's tree in the outliner, so a scene of five
+    methods opened as a wall of objects. There is no data API for the
+    outliner's open/closed state, so its own operators do it, from a timer:
+    a startup --python script runs before the first window exists, and the
+    outliner builds its tree only when it is drawn. Closed one level at a time
+    until nothing is open, then the top level opened again: the scene shows one
+    closed collection per method.
+    """
+    if bpy.app.background:
+        return
+
+    def run():
+        done = 0
+        try:
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type != "OUTLINER":
+                        continue
+                    region = next(r for r in area.regions if r.type == "WINDOW")
+                    with bpy.context.temp_override(window=window, area=area, region=region):
+                        for _ in range(8):
+                            bpy.ops.outliner.show_one_level(open=False)
+                        bpy.ops.outliner.show_one_level(open=True)
+                    done += 1
+            print(f"[plant] outliner collapsed to one line per collection ({done} outliner(s))")
+        except Exception as exc:                       # never fatal: the scene is built
+            print(f"[plant] NOTE: could not collapse the outliner ({exc}); collapse it by hand "
+                  "(Shift+click a collection's triangle closes it with everything inside)")
+        return None
+
+    bpy.app.timers.register(run, first_interval=delay)
 
 
 def _matches_colour(rgb, target, tolerance=1.5 / 255.0):
@@ -329,7 +403,7 @@ def _matches_colour(rgb, target, tolerance=1.5 / 255.0):
     return np.all(np.abs(np.asarray(rgb) - np.asarray(target)) <= tolerance, axis=1)
 
 
-def add_point_cloud(xyz, rgb, radius, into, name="plant_cloud", material=None):
+def add_point_cloud(xyz, rgb, radius, into, name="plant_cloud", material=None, alpha=1.0):
     mesh = bpy.data.meshes.new(f"{name}_points")
     # bulk upload: from_pydata walks a Python list of tuples, which takes
     # minutes on the multi-million-point clouds P4m/P4g write
@@ -338,8 +412,8 @@ def add_point_cloud(xyz, rgb, radius, into, name="plant_cloud", material=None):
     mesh.update()
 
     layer = mesh.color_attributes.new(name="Color", type="FLOAT_COLOR", domain="POINT")
-    alpha = np.ones((len(xyz), 1))
-    layer.data.foreach_set("color", np.hstack([rgb, alpha]).ravel())
+    opaque = np.ones((len(xyz), 1))
+    layer.data.foreach_set("color", np.hstack([rgb, opaque]).ravel())
 
     obj = bpy.data.objects.new(name, mesh)
     # The cloud's mean colour stands in for it in Solid shading, which cannot
@@ -347,7 +421,7 @@ def add_point_cloud(xyz, rgb, radius, into, name="plant_cloud", material=None):
     # mean *is* the colour, so Solid view becomes exact rather than merely
     # closer.
     material = material or vertex_colour_material(
-        f"{name}_mat", fallback=(np.asarray(rgb).mean(axis=0) if len(rgb) else None))
+        f"{name}_mat", fallback=(np.asarray(rgb).mean(axis=0) if len(rgb) else None), alpha=alpha)
     obj.data.materials.append(material)
     into.objects.link(obj)
 
@@ -385,6 +459,24 @@ def add_curve(points, name, rgba, radius, into, resolution=3):
 
     obj = bpy.data.objects.new(name, curve)
     obj.data.materials.append(emission_material(f"{name}_mat", rgba))
+    obj.show_in_front = IN_FRONT
+    into.objects.link(obj)
+    return obj
+
+
+def add_grid_mesh(grid, name, rgba, into):
+    """A surface from a rows x cols x 3 grid of points (a fitted leaf blade,
+    scripts/apex_fit.py `blade_mesh`), one quad per grid cell, both sides lit."""
+    rows, cols = grid.shape[:2]
+    verts = [tuple(float(c) for c in p) for p in grid.reshape(-1, 3)]
+    faces = [(i * cols + j, i * cols + j + 1, (i + 1) * cols + j + 1, (i + 1) * cols + j)
+             for i in range(rows - 1) for j in range(cols - 1)]
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    obj.data.materials.append(emission_material(f"{name}_mat", rgba, strength=0.8))
+    obj.show_in_front = IN_FRONT
     into.objects.link(obj)
     return obj
 
@@ -425,6 +517,7 @@ def add_sphere(centre, name, rgba, radius, into, segments=14, rings=7):
     obj = bpy.data.objects.new(name, mesh)
     obj.location = tuple(float(c) for c in centre)
     obj.data.materials.append(emission_material(f"{name}_mat", rgba))
+    obj.show_in_front = IN_FRONT
     into.objects.link(obj)
     return obj
 
@@ -471,6 +564,11 @@ def clear_startup_scene():
                             and obj.name in {"Camera", "Light"}):
             removed.append(obj.name)
             bpy.data.objects.remove(obj, do_unlink=True)
+    # and the startup file's own "Collection", once those three have left it empty
+    startup = bpy.data.collections.get("Collection")
+    if startup is not None and not startup.objects and not startup.children:
+        bpy.data.collections.remove(startup)
+        removed.append("Collection")
     if removed:
         print("[plant] cleared startup objects: " + ", ".join(removed))
 
@@ -842,23 +940,24 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True, folder="p5x", 
     # import the repo.
     SKELETON, ROOT = -2, -3
 
-    leaves_coll = _collection(f"{prefix}_leaves")
+    group = lambda part: _collection(f"{prefix}_{part}", parent=prefix)
+    leaves_coll = group("leaves")
     drawn = 0
     for leaf_id in sorted({int(v) for v in np.unique(label) if v >= 0}):
         keep = label == leaf_id
-        add_point_cloud(xyz[keep], rgb[keep], point_radius, leaves_coll,
-                        name=f"{prefix}_leaf_{leaf_id:03d}")
+        add_point_cloud(xyz[keep], rgb[keep], point_radius * CLOUD_SIZE, leaves_coll,
+                        name=f"{prefix}_leaf_{leaf_id:03d}", alpha=CLOUD_ALPHA)
         drawn += 1
 
     # Label -2 is the tissue that voted "stem" -- the stem cloud, the same
     # points P5 draws as plant_stem_cloud. It was drawn as "p5x_skeleton",
     # which read as the skeleton itself; the skeleton is the curves below.
-    for value, name, coll in ((SKELETON, f"{prefix}_stem_cloud", f"{prefix}_stem_cloud"),
-                              (ROOT, f"{prefix}_root", f"{prefix}_root")):
+    for value, name, coll in ((SKELETON, f"{prefix}_stem_cloud", "stem_cloud"),
+                              (ROOT, f"{prefix}_root", "root")):
         keep = label == value
         if keep.any():
-            add_point_cloud(xyz[keep], rgb[keep], point_radius,
-                            _collection(coll), name=name)
+            add_point_cloud(xyz[keep], rgb[keep], point_radius * CLOUD_SIZE,
+                            group(coll), name=name, alpha=CLOUD_ALPHA)
 
     # The traced skeleton: a midrib per leaf, the petiole that carries it, and
     # a ball on every tip. Drawn from p5x/skeleton.json rather than from the
@@ -869,9 +968,7 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True, folder="p5x", 
     if graph_path.exists():
         with open(graph_path) as f:
             graph = json.load(f)
-        ribs = _collection(f"{prefix}_midribs")
-        petioles = _collection(f"{prefix}_petioles")
-        tips = _collection(f"{prefix}_tips")
+        ribs, petioles, tips = group("midribs"), group("petioles"), group("tips")
         for leaf in graph.get("leaves", []):
             colour = LEAF_RGBA[leaf["id"] % len(LEAF_RGBA)]
             curve = np.asarray(leaf.get("curve") or [], float)
@@ -909,7 +1006,7 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True, folder="p5x", 
         stem = np.asarray(graph.get("stem") or [], float)
         stem = stem + off if len(stem) else stem
         if len(stem) >= 2:
-            add_curve(stem, f"{prefix}_stem", STEM_RGBA, point_radius * 2.2, _collection(f"{prefix}_stem"))
+            add_curve(stem, f"{prefix}_stem", STEM_RGBA, point_radius * 2.2, group("stem"))
         # The branches of the stem tree, thinner with each order. A stalk that
         # carries one leaf is that leaf's petiole and is drawn with it above.
         branches = [a for a in graph.get("axes") or [] if a.get("kind") == "branch"]
@@ -919,7 +1016,7 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True, folder="p5x", 
             if len(line) >= 2:
                 add_curve(line, f"{prefix}_branch_{axis['id']:02d}_order{axis['order']}", BRANCH_RGBA,
                           point_radius * max(1.9 - 0.3 * axis["order"], 1.0),
-                          _collection(f"{prefix}_branches"))
+                          group("branches"))
         if graph.get("stem_tree"):
             tree = graph["stem_tree"]
             print(f"[plant] stem tree: {len(branches)} branches, "
@@ -927,7 +1024,7 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True, folder="p5x", 
         crown = graph.get("crown")
         if crown:
             add_sphere(np.asarray(crown, float) + off, f"{prefix}_crown", CROWN_RGBA,
-                       point_radius * 4.5, _collection(f"{prefix}_crown"))
+                       point_radius * 4.5, group("crown"))
         print(f"[plant] {drawn_ribs} midribs, {len(graph.get('leaves', []))} tips, "
               f"crown {'placed' if crown else 'not found'}")
         if graph.get("unreachable"):
@@ -940,7 +1037,7 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True, folder="p5x", 
     print(f"[plant] P5x: {drawn} leaves, "
           f"{int((label == SKELETON).sum())} stem-cloud points, "
           f"{int((label == ROOT).sum())} root points")
-    print(f"[plant] each leaf is its own object under the '{prefix}_leaves' collection")
+    print(f"[plant] each leaf is its own object under '{prefix}' > '{prefix}_leaves'")
     print("[plant] if everything looks grey, the viewport is in Solid shading with")
     print("[plant] Color set to Material -- press Z and pick Material Preview, or set")
     print("[plant] Viewport Shading > Color > Attribute.")
@@ -1014,6 +1111,9 @@ def _shifted(graph: dict, offset) -> dict:
     out["leaves"] = [dict(l, **{k: move(l[k]) for k in ("midrib", "petiole", "curve") if l.get(k)},
                           tip=(np.asarray(l["tip"]) + offset).tolist())
                      for l in graph.get("leaves", [])]
+    for l in out["leaves"]:
+        if l.get("blade_mesh"):
+            l["blade_mesh"] = dict(l["blade_mesh"], points=move(l["blade_mesh"]["points"]))
     return out
 
 
@@ -1052,9 +1152,10 @@ def build_skeleton2d(path, point_radius=None, frame=True, clear=False, tag="s2d"
     if point_radius is None:
         point_radius = extent * 0.0022
 
+    group = lambda part: _collection(f"{tag}_{part}", parent=tag)
     stem = np.asarray(graph.get("stem") or [], float)
     if len(stem) >= 2:
-        add_curve(stem, f"{tag}_stem", STEM_RGBA, point_radius * 2.4, _collection(f"{tag}_stem"))
+        add_curve(stem, f"{tag}_stem", STEM_RGBA, point_radius * 2.4, group("stem"))
     # On a plant profiled "stem_tree" (vogelmeere) the stem is P5x's tree and
     # its branches come along; petioles join them rather than the main stem.
     for axis in graph.get("axes") or []:
@@ -1062,20 +1163,24 @@ def build_skeleton2d(path, point_radius=None, frame=True, clear=False, tag="s2d"
         if axis.get("kind") == "branch" and len(line) >= 2:
             add_curve(line, f"{tag}_branch_{axis['id']:02d}_order{axis['order']}", BRANCH_RGBA,
                       point_radius * max(2.0 - 0.3 * axis["order"], 1.0),
-                      _collection(f"{tag}_branches"))
-    ribs, petioles, tips = (_collection(f"{tag}_midribs"), _collection(f"{tag}_petioles"),
-                            _collection(f"{tag}_tips"))
+                      group("branches"))
+    ribs, petioles, tips = group("midribs"), group("petioles"), group("tips")
     # Leaves marked by scripts/apex_labels.py --annotate: those that paired with
     # a hand-drawn line in some labelled frame go magenta and thick, into their own
     # collection, so the found ones stand out and can be toggled on their own.
     found = None
     if any("gt_found" in leaf for leaf in graph.get("leaves", [])):
-        found = _collection(f"{tag}_gt_found")
+        found = group("gt_found")
     for leaf in graph.get("leaves", []):
         # P5x leaves carry no colour of their own; white would read as stem
         b, g, r = leaf.get("colour_bgr") or _leaf_bgr(int(leaf["id"]))
         colour = (r / 255.0, g / 255.0, b / 255.0, 1.0)
         name = "+".join(leaf.get("sam3_ids") or [str(leaf["id"])])
+        mesh = leaf.get("blade_mesh")
+        if mesh:
+            # the fitted blade (scripts/apex_fit.py): width, roll, fold as a surface
+            grid = np.asarray(mesh["points"], float).reshape(mesh["rows"], mesh["cols"], 3)
+            add_grid_mesh(grid, f"{tag}_blade_{leaf['id']:02d}_{name}", colour, group("blades"))
         if found is not None and leaf.get("gt_found"):
             midrib = np.asarray(leaf.get("curve") or leaf["midrib"], float)
             add_curve(midrib, f"{tag}_found_{leaf['id']:02d}_{leaf['gt_found']}of{leaf['gt_checked']}",
@@ -1106,13 +1211,13 @@ def build_skeleton2d(path, point_radius=None, frame=True, clear=False, tag="s2d"
                    point_radius * 3.2, tips)
     if graph.get("crown"):
         add_sphere(np.asarray(graph["crown"], float), f"{tag}_crown", CROWN_RGBA,
-                   point_radius * 4.5, _collection(f"{tag}_crown"))
+                   point_radius * 4.5, group("crown"))
     whole = sum(1 for leaf in graph.get("leaves", []) if len(leaf.get("curve") or []) >= 2)
     stamp = graph.get("annotated") or graph.get("built") or {}
     print(f"[plant] {tag}: {path}")
     print(f"[plant]   written {stamp.get('at', 'before build stamps (2026-10-12 21:00) -- an old file?')}; "
           f"{len(graph.get('leaves', []))} leaves, {whole} drawn as one curve stem -> tip, "
-          f"stem {'drawn' if len(stem) >= 2 else 'missing'} -- collections {tag}_*")
+          f"stem {'drawn' if len(stem) >= 2 else 'missing'} -- collection {tag} (> {tag}_*)")
     if frame:
         frame_view((low + high) / 2.0, extent)
     return {"leaves": len(graph.get("leaves", [])), "extent": extent}
@@ -1360,10 +1465,10 @@ def build_clouds(workdir, names, gap=1.2, max_points=4_000_000, frame=True):
     for index, (name, xyz, rgb, n, radius) in enumerate(clouds):
         offset = np.array([index * width * gap, 0.0, 0.0]) - [centre[0], 0.0, 0.0]
         placed.append((name, offset))
-        coll = _collection(f"cloud_{name}")
-        add_point_cloud(xyz + offset, rgb, radius, coll, name=f"cloud_{name}")
+        coll = _collection(f"cloud_{name}", parent="clouds")
+        add_point_cloud(xyz + offset, rgb, radius * CLOUD_SIZE, coll, name=f"cloud_{name}", alpha=CLOUD_ALPHA)
         add_label(f"{name}  ({n:,} pts)", (offset[0] + centre[0], centre[1], lo[2] - width * 0.12),
-                  width * 0.06, _collection("cloud_labels"), f"label_{name}")
+                  width * 0.06, _collection("cloud_labels", parent="clouds"), f"label_{name}")
         print(f"[plant] {name:<4} {n:>10,} points, radius {radius:.5f}, at x={offset[0]:.3f}")
     if frame:
         span = np.array([width * gap * (len(clouds) - 1) + width, hi[1] - lo[1], hi[2] - lo[2]])
@@ -1375,7 +1480,12 @@ def build_clouds(workdir, names, gap=1.2, max_points=4_000_000, frame=True):
 
 
 def main():
+    global IN_FRONT, CLOUD_ALPHA, CLOUD_SIZE
     hide_splash()
+    rest = script_args(list(sys.argv))
+    IN_FRONT = "--no-in-front" not in rest
+    CLOUD_ALPHA = float(_after(rest, "--cloud-alpha", CLOUD_ALPHA))
+    CLOUD_SIZE = float(_after(rest, "--cloud-size", CLOUD_SIZE))
     target = resolve_workdir(list(sys.argv))
     if not target:
         # Printed, never raised: SystemExit here would close Blender, which is
@@ -1388,6 +1498,10 @@ def main():
     backends, single, align = resolve_branches(list(sys.argv))
     want_p5x = ("--p5x" in script_args(list(sys.argv))
                 or os.environ.get("PLANT_P5X", "") not in ("", "0"))
+    # `--p5x <folder>`: the P5x result to draw as the base scene, e.g. p5x_p4g (P5x's
+    # leaf labels on the P4g cloud); plain `--p5x` is <workdir>/p5x
+    p5x_folder = _after(script_args(list(sys.argv)), "--p5x", "p5x")
+    p5x_folder = "p5x" if p5x_folder.startswith("--") else p5x_folder
     skeleton2d = _after(script_args(list(sys.argv)), "--skeleton2d",
                         os.environ.get("PLANT_SKELETON2D", ""))
     clouds = _after(script_args(list(sys.argv)), "--clouds", os.environ.get("PLANT_CLOUDS", ""))
@@ -1407,7 +1521,7 @@ def main():
             for i, (path, tag) in enumerate(skeleton2d_tags(skeleton2d)):
                 build_skeleton2d(path, clear=i == 0, frame=i == 0, tag=tag)
         elif want_p5x:
-            built = build_p5x(target)
+            built = build_p5x(target, folder=p5x_folder, prefix=p5x_folder)
             if skeleton2d:
                 radius = built["extent"] * 0.0022 if built else None
                 for path, tag in skeleton2d_tags(skeleton2d):
@@ -1420,6 +1534,7 @@ def main():
     except Exception:
         print("[plant] failed while building the scene:")
         traceback.print_exc()
+    collapse_outliner()
 
 
 if __name__ == "__main__":

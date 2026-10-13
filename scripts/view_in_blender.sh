@@ -18,6 +18,10 @@
 # Blender object per leaf, plus the skeleton points:
 #
 #   ./scripts/view_in_blender.sh runs/plant_9 --p5x
+#   ./scripts/view_in_blender.sh runs/plant_9 --p5x p5x_p4g    # P5x's labels on the P4g cloud
+#
+# Clouds are drawn as small translucent points and the skeleton in front of
+# them; --cloud-alpha 1 --cloud-size 1 --no-in-front draws them as before.
 #
 # The skeleton built in 2D and fused in 3D (scripts/skeleton_2d.py), over the
 # P5x scene so the two skeletons can be toggled against each other:
@@ -101,7 +105,16 @@ main() {
             # A script flag, not a Blender one: handed to Blender it would be
             # silently ignored and the P5 scene would open instead, which
             # looks exactly like P5x not working.
+            # `--p5x <folder>` draws that P5x result as the base scene instead,
+            # e.g. --p5x p5x_p4g (P5x's leaf labels on the P4g cloud).
             --p5x)
+                if [[ $# -ge 2 && "$2" != -* ]]; then SCRIPT_ARGS+=("$1" "$2"); shift 2
+                else SCRIPT_ARGS+=("$1"); shift; fi ;;
+            # Display: clouds' opacity and point size (x the usual), and
+            # whether the skeleton is drawn over everything (it is by default).
+            --cloud-alpha|--cloud-size)
+                SCRIPT_ARGS+=("$1" "$2"); shift 2 ;;
+            --no-in-front)
                 SCRIPT_ARGS+=("$1"); shift ;;
             # The geometry phases' clouds side by side (P4a, P4b, P4m, P4g),
             # or the comma list given: same units, same plant frame.
