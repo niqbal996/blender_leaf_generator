@@ -180,7 +180,7 @@ def main():
         else:
             node = run.to_world(np.median(np.stack([np.asarray(l["curve"][0]) for l in leaves]), axis=0))
             fr = af.apex_frame(node, [run.to_world(np.asarray(l["curve"][-1])) for l in leaves if not l.get("bud")],
-                               lines, reach, 1 / mpu)
+                               lines, reach, 1 / mpu, run.rotation[2])
             axis, which = fr["axis"] @ run.rotation.T, "the axis its leaves radiate round"
         bent = iter(bend([l for l in leaves if not l.get("bud")], axis / np.linalg.norm(axis), mpu))
         per = [None if l.get("bud") else next(bent) for l in leaves]          # aligned with `leaves`

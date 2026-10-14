@@ -72,12 +72,19 @@ class PlantProfile:
     #                   walking through the plant mask (gaensefuss).
     base_rule: str
     note: str = ""
+    # How leaves sit on the shoot, for the apex fit's leaf proposals
+    # (scripts/apex_fit.py): "opposite" -- two leaves at a node, the next pair
+    # turned 90 deg (decussate), so a fitted leaf proposes its partner across
+    # the shoot; "alternate" -- one leaf per node (also a rosette's spiral):
+    # no such partner.
+    phyllotaxis: str = "alternate"
 
 
 PROFILES = {
     "vogelmeere": PlantProfile(
         "vogelmeere", CAULESCENT, petiole_rule="stalk_2d", base_rule="stalk",
-        note="chickweed: branched shoots, opposite leaves, long petioles low down"),
+        note="chickweed: branched shoots, opposite leaves, long petioles low down",
+        phyllotaxis="opposite"),
     "gaensefuss": PlantProfile(
         "gaensefuss", CAULESCENT, petiole_rule="leaf_axis", base_rule="foot",
         note="goosefoot: one main stem with leaves along it"),
@@ -141,4 +148,5 @@ def describe(profile: PlantProfile, folder: Optional[str]) -> str:
     """One line for a log: which rules were picked, and from what."""
     source = f"from folder '{folder}'" if folder else "no folder name matched a profile"
     return (f"plant profile {profile.name} ({source}): architecture {profile.architecture}, "
-            f"petioles by {profile.petiole_rule}, base by {profile.base_rule}")
+            f"petioles by {profile.petiole_rule}, base by {profile.base_rule}, "
+            f"leaves {profile.phyllotaxis}")

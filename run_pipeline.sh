@@ -86,9 +86,30 @@
 #               LD_LIBRARY_PATH -- setup_env.sh arranges both. Without it,
 #               COLMAP still runs, just on CPU.
 #
-# Phases: p1p2 p3 p4a p4b p4c p5 p6.  --skip-to <phase> resumes partway on an
-# existing workdir; --stop-after <phase> ends early. P4c looks for clicked
-# seeds at <workdir>/p4c/seeds.json and uses them without being told.
+# Phases: p1p2 p3 p4a p4b p4c p5 p6, then the apex chain (baseline geometry only):
+#   scale  mm per unit from the ArUco tags (scripts/tag_scale.py, --tag-mm, default 8)
+#   p4m    full-resolution MVS, PatchMatch on the GPU (~2.5 h on 74 views of 6000 px)
+#   p4g    2DGS surface at full resolution, started from P4m (~45 min)
+#   p5x    leaf instances + traced skeleton on the P4b surface (p5x/) and on P4g (p5x_p4g/)
+#   s2d    the skeleton built in 2D, one curve per leaf (scripts/skeleton_2d.py -> s2d/)
+#   apex   young leaves at every shoot tip fitted to the photos (scripts/run_apex.sh ->
+#          apex/: regions, zoomed SAM3, selection, fit, check, and a Blender bundle in
+#          apex/bundle/); --apex-heldout adds a held-out fit beside it
+# --skip-to <phase> resumes partway on an existing workdir; --stop-after <phase>
+# ends early. P4c looks for clicked seeds at <workdir>/p4c/seeds.json and uses
+# them without being told.
+#
+# Stamps. Every phase writes <workdir>/stamps/<phase>.json: the content hash of
+# every repo file it imports, the stamps of the phases it reads, and its
+# settings (scripts/phase_stamp.py). Before running a phase, the pipeline keeps
+# its output when the stamp says this checkout would build the same thing, and
+# runs it otherwise -- so nothing is reused that stale code built, and nothing
+# current is rebuilt. Outputs from before stamps existed are kept only if they
+# are newer than every source file they import and than their inputs. Each
+# phase prints "kept -- current: ..." or why it runs. --rerun-from <phase>
+# re-runs that phase and everything after it regardless; --no-stamps turns the
+# check off (every phase in range runs, as before 2026-10-13).
+#   ./scripts/phase_stamp.py show <workdir>     when and by which commit each was built
 #
 #   --geometry-backend vggt|vggt_omega|mapanything   run P3 with a learned model
 #               instead of COLMAP, and run that branch all the way to P6.
@@ -259,6 +280,7 @@ SAM3_PLANT_PROMPTS=""; SAM3_HOLDER_PROMPTS=""; SAM3_ROOT_PROMPTS=""; SAM3_CROP_P
 CAMERAS=""; ALLOW_MIXED=0; STRICT_MIDRIBS=0
 GEOMETRY_BACKEND="colmap"; MODEL_PYTHON=""; IMAGE_RESOLUTION=""; BUNDLE_ADJUST=0
 CARVE_CHECK=0; INTRINSICS_FROM=""; POSES_FROM=""; REUSE_CLASS_MAPS=0; COMPARE=""
+TAG_MM=8; HF_HOME_ARG="${HF_HOME:-}"; APEX_HELDOUT=0; RERUN_FROM=""; STAMPS=1
 declare -A BRANCH_FLAGS=()
 DATASET=""; DRY_RUN=0; CONF_FILES=()
 
@@ -385,6 +407,11 @@ while [[ $# -gt 0 ]]; do
         --sam-checkpoint) SET[sam_checkpoint]=1; SAM_CHECKPOINT="$2"; shift 2 ;;
         --skip-p4b) SET[skip_p4b]=1;     SKIP_P4B=1; shift ;;
         --keep-going) SET[keep_going]=1;   KEEP_GOING=1; shift ;;
+        --rerun-from)   RERUN_FROM="$2"; shift 2 ;;
+        --no-stamps)    STAMPS=0; shift ;;
+        --tag-mm) SET[tag_mm]=1;        TAG_MM="$2"; shift 2 ;;
+        --hf-home) SET[hf_home]=1;      HF_HOME_ARG="$2"; shift 2 ;;
+        --apex-heldout) SET[apex_heldout]=1; APEX_HELDOUT=1; shift ;;
         --use-gpu)      USE_GPU=1; shift ;;
         --seeds)        shift; while [[ $# -gt 0 && "$1" != --* ]]; do SEEDS+=("$1"); shift; done ;;
         -h|--help)      usage 0 ;;
@@ -500,6 +527,9 @@ load_config() {
                 keep_going)    KEEP_GOING=$([[ "$value" == 1 || "$value" == true ]] && echo 1 || echo 0) ;;
                 strict_midribs) STRICT_MIDRIBS=$([[ "$value" == 1 || "$value" == true ]] && echo 1 || echo 0) ;;
                 allow_mixed_capture) ALLOW_MIXED=$([[ "$value" == 1 || "$value" == true ]] && echo 1 || echo 0) ;;
+                tag_mm)        TAG_MM="$value" ;;
+                hf_home)       HF_HOME_ARG="$value" ;;
+                apex_heldout)  APEX_HELDOUT=$([[ "$value" == 1 || "$value" == true ]] && echo 1 || echo 0) ;;
                 *) echo "$file:$line_no: unknown setting '$key'. Valid keys are the long" >&2
                    echo "  options with dashes as underscores: prompt_bank, seed_bank," >&2
                    echo "  architecture, hf_token, dino_model, backend, sam_checkpoint," >&2
@@ -508,7 +538,7 @@ load_config() {
                    echo "  sam3_crop_prompt," >&2
                    echo "  min_persistence_ratio," >&2
                    echo "  low_texture, use_gpu, skip_p4b, keep_going, allow_mixed_capture,
-                   strict_midribs." >&2
+                   strict_midribs, tag_mm, hf_home, apex_heldout." >&2
                    exit 1 ;;
             esac
         done < "$file"
@@ -572,7 +602,8 @@ print_plan() {
     [[ "$LOW_TEXTURE" == 1 ]] && echo "  low-texture   on"
     [[ "$USE_GPU" == 1 ]]     && echo "  gpu           on"
     [[ -z "$HF_TOKEN_ARG" ]] || echo "  hf token      set (${#HF_TOKEN_ARG} chars)"
-    echo "  phases        ${SKIP_TO:-p1p2} -> ${STOP_AFTER:-p6}"
+    echo "  phases        ${SKIP_TO:-p1p2} -> ${STOP_AFTER:-${ORDER[-1]}}$([[ -n "$RERUN_FROM" ]] && echo ", re-run from $RERUN_FROM")$([[ "$STAMPS" == 1 ]] && echo ", current ones kept (stamps)" || echo ", stamps off")"
+    [[ -z "$HF_HOME_ARG" ]] || echo "  hf home       $HF_HOME_ARG"
     echo "  geometry      $GEOMETRY_BACKEND$([[ "$BUNDLE_ADJUST" == 1 ]] && echo " + bundle adjustment")"
     [[ -z "$IMAGE_RESOLUTION" ]] || echo "  model res     $IMAGE_RESOLUTION"
     [[ -z "$MODEL_PYTHON" ]] || echo "  model python  $MODEL_PYTHON"
@@ -593,9 +624,9 @@ print_plan() {
 # Phases run in this order; --skip-to jumps in partway and --stop-after ends
 # early. Declared here because the phase range decides which dependencies,
 # config keys and QC gates this run needs, all of which are settled below.
-ORDER=(p1p2 p3 p4a p4b p4c p5 p6)
+ORDER=(p1p2 p3 p4a p4b p4c p5 p6 scale p4m p4g p5x s2d apex)
 
-for name in "$SKIP_TO" "$STOP_AFTER"; do
+for name in "$SKIP_TO" "$STOP_AFTER" "$RERUN_FROM"; do
     [[ -z "$name" ]] && continue
     [[ " ${ORDER[*]} " == *" $name "* ]] || {
         echo "unknown phase '$name' -- expected one of: ${ORDER[*]}" >&2; exit 1; }
@@ -614,9 +645,12 @@ will_run_phase() {
     done
     (( target >= 0 && from >= 0 && to >= 0 && target >= from && target <= to )) || return 1
     [[ "$phase" == "p4b" && "$SKIP_P4B" == 1 ]] && return 1
+    case "$phase" in scale|p4m|p4g|p5x|s2d|apex) [[ "$GEOMETRY_BACKEND" == "colmap" ]] || return 1 ;; esac
     # P4c skips itself when it has no labelled examples to classify against.
+    # (A SAM3 P2 hands P4c its organ classes: then it needs no seeds either.)
     if [[ "$phase" == "p4c" && "$BACKEND" != "sam" && -z "$SEEDS_FILE" \
-          && ${#SEEDS[@]} -eq 0 && -z "$SEED_BANK" ]]; then
+          && ${#SEEDS[@]} -eq 0 && -z "$SEED_BANK" && "$SEGMENT_BACKEND" != "sam3" \
+          && ! -d "$WORKDIR/p2/masks/stem" ]]; then
         return 1
     fi
     return 0
@@ -807,12 +841,118 @@ run_comparison() {
     return $status
 }
 
+# --- stamps: keep a phase's output only if this checkout would build the same -
+# What each phase runs (its code: modules or scripts, followed through their
+# imports by scripts/phase_stamp.py), which phases it reads, and the output
+# that says it finished. Baseline geometry only: a learned branch and --compare
+# run every phase in range, as they always did.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"     # (set again below, the same)
+PY="${POSE_PYTHON:-$(command -v python3 || command -v python)}"
+declare -A STAMP_CODE=(
+    [p1p2]="pose_estimator.cli.segment" [p3]="pose_estimator.cli.pose" [p4a]="pose_estimator.cli.hull"
+    [p4b]="pose_estimator.cli.surface" [p4c]="pose_estimator.cli.semantic pose_estimator.cli.fuse"
+    [p5]="pose_estimator.cli.structure" [p6]="pose_estimator.cli.leaf_model"
+    [scale]="scripts/tag_scale.py" [p4m]="pose_estimator.cli.mvs" [p4g]="pose_estimator.cli.gs_surface"
+    [p5x]="pose_estimator.cli.leaf_instances scripts/thin_cloud.py" [s2d]="scripts/skeleton_2d.py"
+    [apex]="scripts/run_apex.sh scripts/apex_regions.py scripts/apex_zoom.py scripts/skeleton_2d.py scripts/apex_select.py scripts/apex_fit.py scripts/apex_fit_check.py scripts/apex_labels.py scripts/make_bundle.sh scripts/blender_view_plant.py scripts/view_in_blender.sh"
+)
+declare -A STAMP_AFTER=(
+    [p1p2]="" [p3]="p1p2" [p4a]="p3" [p4b]="p4a" [p4c]="$([[ "$SKIP_P4B" == 1 ]] && echo p4a || echo p4b)"
+    [p5]="p4c" [p6]="p5" [scale]="p3" [p4m]="p4a" [p4g]="p4m" [p5x]="p5 p4g scale" [s2d]="p5x" [apex]="s2d"
+)
+declare -A STAMP_OUT=(
+    [p1p2]="p2/qc.json p2/masks/plant" [p3]="p3/poses.json" [p4a]="p4/hull.json" [p4b]="p4b/surface.ply"
+    [p4c]="p4c/labels.npy" [p5]="p5/stem_graph.json" [p6]="p6/p6.json" [scale]="tag_scale.json"
+    [p4m]="p4m/p4m.json p4m/surface.ply" [p4g]="p4g/p4g.json p4g/surface.ply"
+    [p5x]="p5x/skeleton.json p5x_p4g/skeleton.json" [s2d]="s2d/skeleton.json s2d/evidence_2d.json"
+    [apex]="apex/regions/apex_regions.json"
+)
+[[ "$GEOMETRY_BACKEND" == "colmap" && -z "$COMPARE" ]] || STAMPS=0
+KEPT=()
+rerun_asked() {   # is <phase> at or after --rerun-from?
+    local i from=-1 at=-1
+    [[ -n "$RERUN_FROM" ]] || return 1
+    for i in "${!ORDER[@]}"; do
+        [[ "${ORDER[$i]}" == "$RERUN_FROM" ]] && from=$i
+        [[ "${ORDER[$i]}" == "$1" ]] && at=$i
+    done
+    (( at >= from ))
+}
+stamp_tool() {    # stamp_tool check|write <phase> <settings> [extra flags]
+    # shellcheck disable=SC2086   # word lists on purpose
+    "$PY" "$REPO_ROOT/scripts/phase_stamp.py" "$1" "$WORKDIR" "$2" --code ${STAMP_CODE[$2]} \
+        --after ${STAMP_AFTER[$2]} --args "$3" --outputs ${STAMP_OUT[$2]} "${@:4}"
+}
+stamp_plan() {    # for --dry-run: per phase in range, kept or run, and why -- nothing written
+    local tmp ph why rc args
+    [[ "$STAMPS" == 1 ]] || { echo "  stamps off: every phase in range runs"; return 0; }
+    tmp="$(mktemp -d)"
+    [[ -d "$WORKDIR/stamps" ]] && cp "$WORKDIR"/stamps/*.json "$tmp"/ 2>/dev/null
+    echo "what this run would do (stamps; scripts/phase_stamp.py):"
+    for ph in "${ORDER[@]}"; do
+        will_run_phase "$ph" || continue
+        case "$ph" in
+            p1p2) args="$P1P2_ARGS" ;; p3) args="$P3_ARGS" ;; p4a) args="$P4A_ARGS" ;; p4b) args="$P4B_ARGS" ;;
+            p4c) args="$P4C_ARGS" ;; p5) args="$P5_ARGS" ;; p6) args="" ;; scale) args="tag_mm=$TAG_MM" ;;
+            p4m|p4g) args="default" ;; p5x) args="thin_mm=0.15" ;; s2d) args="tag_mm=$TAG_MM leaf_curves stem_tree=p5x" ;;
+            apex) args="heldout=$APEX_HELDOUT" ;;
+        esac
+        if rerun_asked "$ph"; then
+            printf '  %-6s run   re-run asked (--rerun-from %s)\n' "$ph" "$RERUN_FROM"
+            "$PY" "$REPO_ROOT/scripts/phase_stamp.py" check "$WORKDIR" "$ph" --code ${STAMP_CODE[$ph]} \
+                --after ${STAMP_AFTER[$ph]} --args "$args" --outputs __rerun__ --stamps-dir "$tmp" --simulate >/dev/null || true
+            continue
+        fi
+        rc=0; why="$(stamp_tool check "$ph" "$args" --stamps-dir "$tmp" --simulate)" || rc=$?
+        if [[ $rc -eq 0 ]]; then printf '  %-6s keep  %s\n' "$ph" "${why#current: }"
+        else printf '  %-6s run   %s\n' "$ph" "${why#stale: }"; fi
+    done
+    rm -rf "$tmp"
+}
+needs() {         # needs <phase> <settings>: run it (0), or its output is current: keep it (1)
+    local why rc=0
+    [[ "$STAMPS" == 1 ]] || return 0
+    if rerun_asked "$1"; then echo "  $1: re-run (--rerun-from $RERUN_FROM)"; return 0; fi
+    why="$(stamp_tool check "$1" "$2")" || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        phase "$1  kept -- ${why#current: }"
+        KEPT+=("$1")
+        case "$1" in       # its QC still has to pass, as on --skip-to
+            p1p2) gate p1p2 "$WORKDIR/p2/qc.json" ;;
+            p3)   gate p3 "$WORKDIR/p3/poses.json" ;;
+            p4a)  gate p4a "$WORKDIR/p4/hull.json" ;;
+        esac
+        return 1
+    fi
+    printf '\n  %s runs: %s\n' "$1" "${why#stale: }"
+    return 0
+}
+stamp() {         # stamp <phase> <settings>: record what built this output
+    [[ "$STAMPS" == 1 ]] || return 0
+    stamp_tool write "$1" "$2" || warn "  could not write the stamp for $1 -- it will run again next time"
+}
+# What, besides the code, decides each phase's result.
+SAM3_ENV="$("$PY" -c 'import importlib.metadata as m
+v = lambda p: (m.version(p) if p in {d.metadata["Name"].lower() for d in m.distributions()} else "none")
+print("transformers", v("transformers"), "kernels", v("kernels"))' 2>/dev/null || echo unknown)"
+P1P2_ARGS="segment=${SEGMENT_BACKEND:-sam2} plant=$SAM3_PLANT_PROMPTS holder=$SAM3_HOLDER_PROMPTS root=$SAM3_ROOT_PROMPTS crop=$SAM3_CROP_PROMPT prompt_bank=$PROMPT_BANK points=$PROMPT_POINTS mixed=$ALLOW_MIXED inputs=$(for d in ${PHOTOS[@]+"${PHOTOS[@]}"} ${VIDEOS[@]+"${VIDEOS[@]}"}; do printf '%s:%s ' "$(basename "$d")" "$( { find "$d" -maxdepth 1 -type f 2>/dev/null || echo "$d"; } | wc -l)"; done) env=$SAM3_ENV"
+P3_ARGS="cameras=$CAMERAS low_texture=$LOW_TEXTURE use_gpu=$USE_GPU"
+P4A_ARGS="resolution=256"; P4B_ARGS="iterations=5000"
+P5_ARGS="architecture=$ARCHITECTURE strict=$STRICT_MIDRIBS persistence=$PERSISTENCE"
+
 print_plan
 if [[ -n "$COMPARE" ]]; then
     run_comparison
     exit $?
 fi
 if [[ "$DRY_RUN" == 1 ]]; then
+    echo
+    P4C_BACKEND="$BACKEND"
+    if [[ -z "${SET[backend]:-}" ]] && compgen -G "$WORKDIR/p2/masks/stem/*.png" >/dev/null 2>&1; then
+        P4C_BACKEND="p2"
+    fi
+    P4C_ARGS="backend=$P4C_BACKEND dino=$DINO_MODEL seeds=$SEEDS_FILE ${SEEDS[*]+${SEEDS[*]}} bank=$SEED_BANK frame=$SEED_FRAME"
+    stamp_plan
     echo
     echo "--dry-run: nothing was run."
     exit 0
@@ -872,6 +1012,12 @@ phase_modules() {
         p4c)  echo "numpy cv2 torch $([[ "$BACKEND" == "sam" ]] && echo sam2 || echo transformers)" ;;
         p5)   echo "numpy pycolmap" ;;
         p6)   echo "numpy" ;;
+        scale) echo "numpy cv2 pycolmap" ;;
+        p4m)  echo "numpy pycolmap" ;;
+        p4g)  echo "numpy torch gsplat" ;;
+        p5x)  echo "numpy pycolmap cv2" ;;
+        s2d)  echo "numpy cv2 pycolmap scipy" ;;
+        apex) echo "numpy cv2 torch gsplat scipy transformers" ;;
     esac
 }
 
@@ -898,6 +1044,9 @@ phase_cli() {
         p4c)  echo "pose_estimator.cli.semantic" ;;
         p5)   echo "pose_estimator.cli.structure" ;;
         p6)   echo "pose_estimator.cli.leaf_model" ;;
+        p4m)  echo "pose_estimator.cli.mvs" ;;
+        p4g)  echo "pose_estimator.cli.gs_surface" ;;
+        p5x)  echo "pose_estimator.cli.leaf_instances" ;;
     esac
 }
 
@@ -1030,6 +1179,9 @@ fi
 # shellcheck source=scripts/sam_checkpoints.sh
 source "$REPO_ROOT/scripts/sam_checkpoints.sh"
 [[ -n "$HF_TOKEN_ARG" ]] && export HF_TOKEN="$HF_TOKEN_ARG"
+# Where SAM3's and DINOv3's weights are cached. Default is ~/.cache, which in a
+# container whose home is a tmpfs means a fresh 3 GB download every container.
+[[ -n "$HF_HOME_ARG" ]] && export HF_HOME="$HF_HOME_ARG"
 
 mkdir -p "$WORKDIR"
 LOG="$WORKDIR/pipeline.log"
@@ -1073,6 +1225,7 @@ else
     P5_DIR="$WORKDIR/p5/experiments/$GEOMETRY_BACKEND"
     P6_DIR="$WORKDIR/p6/experiments/$GEOMETRY_BACKEND"
 fi
+
 
 # Stop the run when a phase's QC shows a failure nothing downstream can
 # absorb. Only catastrophic signatures gate -- advisory failures happen on
@@ -1125,7 +1278,7 @@ if [[ -n "$SKIP_TO" ]]; then
     done
 fi
 
-if should_run p1p2; then
+if should_run p1p2 && needs p1p2 "$P1P2_ARGS"; then
     n_passes=$(( ${#VIDEOS[@]} + ${#PHOTOS[@]} ))
     if [[ "$SEGMENT_BACKEND" == "sam3" ]]; then
         phase "P1+P2  sharpest frames + SAM3 plant/holder masks   -> $WORKDIR/p1, p2"
@@ -1203,9 +1356,10 @@ if should_run p1p2; then
             $([[ "$ALLOW_MIXED" == 1 ]] && echo --allow-mixed-capture)
         gate p1p2 "$WORKDIR/p2/qc.json"
     fi
+    stamp p1p2 "$P1P2_ARGS"
 fi
 
-if should_run p3; then
+if should_run p3 && needs p3 "$P3_ARGS"; then
     if [[ "$GEOMETRY_BACKEND" == "colmap" ]]; then
         phase "P3     camera poses, masked COLMAP                 -> $WORKDIR/p3"
         $PY -m pose_estimator.cli.pose --workdir "$WORKDIR" \
@@ -1226,9 +1380,10 @@ if should_run p3; then
             $([[ "$BUNDLE_ADJUST" == 1 ]] && echo --bundle-adjust)
         gate p3 "$WORKDIR/p3/experiments/$GEOMETRY_BACKEND/poses.json"
     fi
+    stamp p3 "$P3_ARGS"
 fi
 
-if should_run p4a; then
+if should_run p4a && needs p4a "$P4A_ARGS"; then
     if [[ "$GEOMETRY_BACKEND" == "colmap" ]]; then
         phase "P4a    visual hull by silhouette carving           -> $WORKDIR/p4"
         $PY -m pose_estimator.cli.hull --workdir "$WORKDIR" --resolution 256
@@ -1247,32 +1402,38 @@ if should_run p4a; then
         echo "  already a surface sample, so P4c labels it directly. --carve-check carves"
         echo "  anyway, as an upper bound to judge the learned cloud against."
     fi
+    stamp p4a "$P4A_ARGS"
 fi
 
-if should_run p4b && [[ "$GEOMETRY_BACKEND" != "colmap" ]]; then
+# should_run is a one-shot state machine: asked twice, as this block once did,
+# --stop-after p4b ended the run before P4b could start.
+RUN_P4B=0; should_run p4b && RUN_P4B=1
+if [[ "$RUN_P4B" == 1 && "$GEOMETRY_BACKEND" != "colmap" ]]; then
     phase "P4b    SKIPPED -- $GEOMETRY_BACKEND needs no surfel pass"
     echo "  P4b refines the P4a hull into a thin surface. The learned cloud is already"
     echo "  a surface sample, so there is nothing to thin. Its normals are estimated by"
     echo "  local PCA in P4c rather than fitted against the photographs, which is the"
     echo "  real cost of skipping this."
-elif should_run p4b && [[ "$SKIP_P4B" == 0 ]]; then
+elif [[ "$RUN_P4B" == 1 && "$SKIP_P4B" == 0 ]] && needs p4b "$P4B_ARGS"; then
     phase "P4b    2DGS surfels -> carved thin surface         -> $WORKDIR/p4b"
     $PY -m pose_estimator.cli.surface --workdir "$WORKDIR" --iterations 5000
+    stamp p4b "$P4B_ARGS"
 elif [[ "$SKIP_P4B" == 1 ]]; then
     phase "P4b    SKIPPED (--skip-p4b) -- P4c will label the P4a hull instead"
     echo "  Halves the runtime. The hull is a solid, so the cloud is blobbier,"
     echo "  and P5 could not skeletonise it later without re-running P4b."
 fi
 
-if should_run p4c; then
-    # A SAM3 P2 has already separated the plant into leaf, stem-and-petiole and
-    # root on every frame, so the organ classes are on disk and there is
-    # nothing left for an appearance classifier to infer. Take them unless a
-    # backend was asked for explicitly.
-    P4C_BACKEND="$BACKEND"
-    if [[ -z "${SET[backend]:-}" ]] && compgen -G "$WORKDIR/p2/masks/stem/*.png" >/dev/null 2>&1; then
-        P4C_BACKEND="p2"
-    fi
+# A SAM3 P2 has already separated the plant into leaf, stem-and-petiole and
+# root on every frame, so the organ classes are on disk and there is nothing
+# left for an appearance classifier to infer. Take them unless a backend was
+# asked for explicitly. (Decided before the phase, as its stamp depends on it.)
+P4C_BACKEND="$BACKEND"
+if [[ -z "${SET[backend]:-}" ]] && compgen -G "$WORKDIR/p2/masks/stem/*.png" >/dev/null 2>&1; then
+    P4C_BACKEND="p2"
+fi
+P4C_ARGS="backend=$P4C_BACKEND dino=$DINO_MODEL seeds=$SEEDS_FILE ${SEEDS[*]+${SEEDS[*]}} bank=$SEED_BANK frame=$SEED_FRAME"
+if should_run p4c && needs p4c "$P4C_ARGS"; then
     if [[ "$P4C_BACKEND" != "sam" && "$P4C_BACKEND" != "p2" \
           && -z "$SEEDS_FILE" && ${#SEEDS[@]} -eq 0 && -z "$SEED_BANK" ]]; then
         phase "P4c    SKIPPED -- no seeds given"
@@ -1323,10 +1484,11 @@ if should_run p4c; then
                 ${SEED_FRAME:+--seed-frame "$SEED_FRAME"} \
                 ${SEEDS[0]:+--seeds} ${SEEDS[@]+"${SEEDS[@]}"}
         fi
+        stamp p4c "$P4C_ARGS"
     fi
 fi
 
-if should_run p5; then
+if should_run p5 && needs p5 "$P5_ARGS"; then
     if [[ -f "$P4C_DIR/labels.npy" ]]; then
         phase "P5     stem centreline + leaf instances           -> $P5_DIR"
         $PY -m pose_estimator.cli.structure --workdir "$WORKDIR" \
@@ -1334,24 +1496,77 @@ if should_run p5; then
             ${ARCHITECTURE:+--architecture "$ARCHITECTURE"} \
             $([[ "$STRICT_MIDRIBS" == 1 ]] && echo --strict-midribs) \
             ${PERSISTENCE:+--min-persistence-ratio "$PERSISTENCE"}
+        stamp p5 "$P5_ARGS"
     else
         phase "P5     SKIPPED -- no $P4C_DIR/labels.npy"
         echo "  P5 is driven by the P4c organ labels; run P4c first."
     fi
 fi
 
-if should_run p6; then
+if should_run p6 && needs p6 ""; then
     if [[ -f "$P5_DIR/leaf_points.npy" ]]; then
         phase "P6     per-leaf midrib, curvature, width          -> $P6_DIR"
         $PY -m pose_estimator.cli.leaf_model --workdir "$WORKDIR" \
             --geometry-backend "$GEOMETRY_BACKEND"
+        stamp p6 ""
     else
         phase "P6     SKIPPED -- no $P5_DIR/leaf_points.npy"
         echo "  P6 fits midribs to P5's per-leaf point subsets; run P5 first."
     fi
 fi
 
+# --- the apex chain: fine clouds, P5x, s2d, the apex fit (baseline only) -------
+if should_run scale && will_run_phase scale && needs scale "tag_mm=$TAG_MM"; then
+    phase "scale  mm per unit from the ArUco tags ($TAG_MM mm) -> $WORKDIR/tag_scale.json"
+    $PY "$REPO_ROOT/scripts/tag_scale.py" --workdir "$WORKDIR" --tag-mm "$TAG_MM"
+    stamp scale "tag_mm=$TAG_MM"
+fi
+if should_run p4m && will_run_phase p4m && needs p4m "default"; then
+    phase "P4m    full-resolution MVS, PatchMatch on the GPU     -> $WORKDIR/p4m  (the long one: ~2.5 h)"
+    mkdir -p "$WORKDIR/p4m"
+    # --redo-patch-match: depth maps left from an earlier P3 must not be reused
+    $PY -m pose_estimator.cli.mvs --workdir "$WORKDIR" --redo-patch-match 2>&1 | tee "$WORKDIR/p4m/run.log"
+    stamp p4m "default"
+fi
+if should_run p4g && will_run_phase p4g && needs p4g "default"; then
+    phase "P4g    2DGS surface at full resolution, from P4m      -> $WORKDIR/p4g  (~45 min)"
+    mkdir -p "$WORKDIR/p4g"
+    $PY -m pose_estimator.cli.gs_surface --workdir "$WORKDIR" 2>&1 | tee "$WORKDIR/p4g/run.log"
+    stamp p4g "default"
+fi
+if should_run p5x && will_run_phase p5x && needs p5x "thin_mm=0.15"; then
+    phase "P5x    leaf instances + skeleton on P4b and on P4g   -> $WORKDIR/p5x, p5x_p4g"
+    $PY -m pose_estimator.cli.leaf_instances --workdir "$WORKDIR" 2>&1 | tee "$WORKDIR/p5x.log"
+    MPU="$($PY -c 'import json,sys; print(json.load(open(sys.argv[1]))["mm_per_unit"])' "$WORKDIR/tag_scale.json")"
+    $PY "$REPO_ROOT/scripts/thin_cloud.py" "$WORKDIR/p4g/surface.ply" "$WORKDIR/p4g/surface_p5x.ply" \
+        --mm 0.15 --mm-per-unit "$MPU"
+    $PY -m pose_estimator.cli.leaf_instances --workdir "$WORKDIR" --cloud "$WORKDIR/p4g/surface_p5x.ply" \
+        --out p5x_p4g 2>&1 | tee "$WORKDIR/p5x_p4g.log"
+    stamp p5x "thin_mm=0.15"
+fi
+if should_run s2d && will_run_phase s2d && needs s2d "tag_mm=$TAG_MM leaf_curves stem_tree=p5x"; then
+    phase "s2d    skeleton built in 2D, one curve per leaf      -> $WORKDIR/s2d"
+    mkdir -p "$WORKDIR/s2d"
+    $PY "$REPO_ROOT/scripts/skeleton_2d.py" --workdir "$WORKDIR" --tag-mm "$TAG_MM" --leaf-curves \
+        --stem-tree "$WORKDIR/p5x/skeleton.json" --out "$WORKDIR/s2d" 2>&1 | tee "$WORKDIR/s2d/run.log"
+    stamp s2d "tag_mm=$TAG_MM leaf_curves stem_tree=p5x"
+fi
+if should_run apex && will_run_phase apex && needs apex "heldout=$APEX_HELDOUT"; then
+    phase "apex   young leaves at each shoot tip, fitted to the photos -> $WORKDIR/apex"
+    PY="$PY" TAG_MM="$TAG_MM" APEX_HELDOUT="$APEX_HELDOUT" "$REPO_ROOT/scripts/run_apex.sh" "$WORKDIR"
+    stamp apex "heldout=$APEX_HELDOUT"
+fi
+if [[ ${#KEPT[@]} -gt 0 ]]; then
+    echo ""
+    echo "  kept, current (built by this code from current inputs): ${KEPT[*]}"
+fi
+
 phase "done"
+if [[ -d "$WORKDIR/apex/bundle" ]]; then
+    echo "Apex result, for Blender on your machine: $(ls -t "$WORKDIR"/apex/bundle/*.tar.gz 2>/dev/null | head -1)"
+    echo "  (VERSION.txt inside says how to open it; pictures in $WORKDIR/apex/fit/, numbers in"
+    echo "   $WORKDIR/apex/fit/check.log)"
+fi
 cat <<EOF
 Open in Blender:
   ./scripts/view_in_blender.sh $WORKDIR$([[ "$GEOMETRY_BACKEND" == "colmap" ]] || echo " --geometry-backend $GEOMETRY_BACKEND")

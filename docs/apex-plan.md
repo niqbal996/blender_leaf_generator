@@ -135,6 +135,77 @@ a function), `blender_view_plant.py` + `view_in_blender.sh` (nested and
 collapsed collections, translucent clouds, skeleton in front, `--p5x
 <folder>`), `CLAUDE.md` (new), this doc.
 
+### 0.0b The whole pipeline on every plant (2026-10-13, evening)
+
+The user's ask: one runnable pipeline, run on all five plants of the session
+(gf_1, vogelmeere upright; sugarbeet_x, thistle_x, weed_x rosettes), with no
+output built by stale code.
+
+**What `./run_pipeline.sh <dataset>` now runs:** P1 → P6, then
+`scale p4m p4g p5x s2d apex` (header of `run_pipeline.sh`). `apex` is
+`scripts/run_apex.sh`: `apex_regions.py` → `apex_zoom.py` → `skeleton_2d.py`
+on the zoomed masks → `apex_select.py` → `apex_fit.py` (+ held-out with
+`--apex-heldout`) → `apex_fit_check.py` → `apex_labels.py` (where hand labels
+exist) → `make_bundle.sh`. Everything lands in `<workdir>/apex/`; the bundle
+in `<workdir>/apex/bundle/<specimen>_view_<stamp>.tar.gz`.
+
+**Stale code, guarded** (`scripts/phase_stamp.py`): each phase stamps the
+content hash of every repo file it imports (followed through imports), its
+upstream stamps and its settings; a phase is kept only when all match. Legacy
+outputs are adopted only if newer than every source file they import and than
+their inputs. On 2026-10-13 that rule reruns **everything on all five plants**:
+`ply_io.py` (imported by every phase) changed 10-09, after every P1-P4 run of
+10-07 -- and every P2 ran without SAM3's clean-up (kernels missing until
+10-12), which a fresh P2 now has. `--dry-run` prints the plan per phase.
+
+**Apex regions without hand labels** (`apex_regions.py`): an apex is a shoot's
+end -- every stem/branch end of P5x's tree, or a rosette's crown; its region,
+the points within one median P5x leaf length of the end and nearer it than
+any other end; no P5x leaf mostly inside → no apex. Against vogelmeere's hand
+regions: the four ends are the four apices; IoU 0.85 / 0.74 / 0.55 / 0.25 for
+A / B / C / D. (Points *beyond* each end held only 0-32 % of the hand
+regions.) Rosettes: one apex at the crown, axis = plant up, no stem to join
+(leaves start at the crown). Pair proposals only for opposite-leaved species
+(`plant_profiles.phyllotaxis`; vogelmeere only).
+
+**Configs:** `/netscratch/naeem/blender_assets/pipeline.conf` (root: sam3,
+use_gpu, `architecture = upright` for all!), the session's (`segment_backend`,
+`hf_home`), and one per specimen with its `architecture` (rosette for
+sugarbeet_x, thistle_x, weed_x; caulescent for gf_1, vogelmeere) -- the old
+rosette runs had it typed by hand, and the repo's `pipeline.conf` says rosette.
+
+**Measured costs per plant** (H100, 26 cores): P1-P6 6.5 min; P5x on P4b and
+P4g ~20 min; s2d 3 min; apex: zoom 10 min, s2d 4 min, select ~5, fit ~17.
+P4m (from the 10-09 logs and a timed sample): 40 s per view and pass, 144 of
+them, ~2.5-3 h in all with fusion -- the GPU is busy all of it (100 %, 4.5 GB):
+two PatchMatch workers on it (`--gpu-index 0,0`) took 80 s per view each, no
+gain. P4g 40-52 min. **~4.5 h per plant, ~22 h for five, one by one.**
+A P4m killed mid-kernel hung in uninterruptible exit (`exit_mm`) for > 30 min,
+and `ps`/`pgrep` blocked on it.
+
+**Before the campaign:** `vogelmeere/plant_baseline_2026-10-13/` is a frozen
+copy of vogelmeere's workdir (no `p4m/dense`): the inputs of `$D/apex_fit_v3`,
+which the campaign's fresh vogelmeere run will not reproduce byte for byte.
+Tests: `_campaign/test/` (fresh gf_1 P1-P6 in 6.5 min; a re-run keeps all
+seven by stamp, `--rerun-from p5` forces from P5: passed);
+`_campaign/regress/vogelmeere/` (P5x → apex through the pipeline on
+vogelmeere's 10-07 geometry and hand labels, fresh P5x/s2d with the current
+code): **reproduces v3** -- leaves 9 / 4 / 6 / 4 (v3 the same), PQ 0.410 /
+0.408 / 0.373 / 0.352 (v3 0.412 / 0.410 / 0.374 / 0.348), 22 of 23 curl in,
+sideways 0.02, tips across 5.1 px, the user's lines found 62 % (v3 63 %).
+Apex stage 22 min for 4 apices (zoom 10, s2d 4, select 1.5, fit 6.5).
+The whole apex phase again through `run_pipeline.sh --skip-to apex` (end to
+end, stamp written, bundle built): exit 0 -- but leaves 12 / 4 / 7 / 3, and
+the fit repeated on *those same inputs* gave 9 / 4 / 6 / 4 again. **The leaf
+count is not reproducible run to run** (A ±3): gsplat's backward pass is not
+deterministic, J moves by ~0.01 per view, and "add a leaf if J rises at all"
+took three leaves at A for +0.006-0.010 each -- less than one view's true
+positive. Shape and tips do not move (turn 33-36°, 22-25 of 23-26 curl in,
+sideways 0.01-0.02, tips across 5.1 px). **Fix first** (next session): judge
+an added or dropped leaf on held-out frames (fit on even, J on odd -- §3.8's
+own rule), or demand it be a true positive in more views than it is a false
+positive; and seed/determinism where gsplat allows.
+
 ### 0.1 v3 as built (2026-10-13) — `scripts/apex_fit.py` → `$D/apex_fit_v3/`
 
 Same renderer, masks, on-plant and away terms, one-to-one instance scores and

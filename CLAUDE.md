@@ -25,6 +25,20 @@ scratchpad from the last container are gone.
 3. Read `docs/apex-plan.md` section 0: the current state of the work, numbers, next steps,
    how to run everything.
 
+## Running the whole pipeline (since 2026-10-13)
+
+`./run_pipeline.sh <dataset>` runs P1 -> P6, then `scale p4m p4g p5x s2d apex`, ending in a
+Blender bundle at `<dataset>/plant/apex/bundle/`. Every phase writes a stamp
+(`<workdir>/stamps/`, `scripts/phase_stamp.py`): a phase whose stamp matches this checkout's
+code, its inputs and its settings is kept, anything else runs -- `--dry-run` prints which and
+why, `--rerun-from <phase>` forces, `./scripts/phase_stamp.py show <workdir>` lists them.
+Many plants: `./batch_run_plants.sh <specimen>... --log-dir <dir>` (one by one by default).
+Configs: the repo's `./pipeline.conf` (token), `/netscratch/naeem/blender_assets/pipeline.conf`,
+the session's and the specimen's (`architecture = caulescent | rosette` per specimen).
+Do not edit `run_pipeline.sh` while a run is going: bash reads it as it runs.
+A P4m (COLMAP PatchMatch) killed mid-kernel can hang in uninterruptible exit for a long time;
+`ps`/`pgrep` then block on it -- read `/proc/<pid>/status` instead.
+
 ## Standing facts
 
 - Python: `/root/miniconda3/envs/pose/bin/python`, with `PYTHONPATH=src` from the repo root.

@@ -151,6 +151,7 @@ START_INCURVE = np.radians(10)  # where a leaf whose start curve is straight or 
                                 # a start value inside the range the fit explores, not a bound
 BUD_FOLD = np.radians(70)       # the bud starts closed; fitted like any fold
 SAMPLE_TRACK = re.compile(r"sel_(apex_[A-Za-z0-9]+)_(\d+)_")
+PAIRS = True        # partner proposals; main() sets it from the plant profile (opposite leaves only)
 
 
 # --------------------------------------------------------------------------
@@ -664,7 +665,7 @@ def trunk_lines(run: Run, skeleton: dict):
             if a["kind"] != "petiole" and len(a["points"]) >= 2]
 
 
-def apex_frame(node, tips, lines, reach, unit):
+def apex_frame(node, tips, lines, reach, unit, up):
     """The apex's starting frame: tip O = node, and the axis. An apex is the end of a shoot, so
     its axis continues the shoot's last stretch: the direction, over its last `reach`, of the
     stem or branch of P5x's tree (`lines`, ended by end_axes where the cloud closes over the
@@ -674,18 +675,22 @@ def apex_frame(node, tips, lines, reach, unit):
     hands on is no guide here: it joins each node to the nearest trunk, sideways where the node
     is beside it -- 47-90 deg off on B and D. The cone alone was 61-82 deg off on A and D,
     whose leaves stand at 3-80 deg to the axis.)"""
-    ends = [(float(np.linalg.norm(line[-1] - node)), line) for line in lines]
-    d_end, line = min(ends, key=lambda e: e[0])
-    cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(line, axis=0), axis=1))]
-    back = np.array([np.interp(max(cum[-1] - reach, 0.0), cum, line[:, d]) for d in range(3)])
-    shoot = unit_vec(line[-1] - back)
+    if lines:
+        ends = [(float(np.linalg.norm(line[-1] - node)), line) for line in lines]
+        d_end, line = min(ends, key=lambda e: e[0])
+        cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(line, axis=0), axis=1))]
+        back = np.array([np.interp(max(cum[-1] - reach, 0.0), cum, line[:, d]) for d in range(3)])
+        shoot = unit_vec(line[-1] - back)
+    else:                                        # a rosette: no stem, its shoot points up
+        d_end, shoot = 0.0, unit_vec(np.asarray(up, float))
     U = np.stack([unit_vec(t - node) for t in tips])
     cone = np.linalg.eigh(np.cov(U.T))[1][:, 0] if len(U) >= 3 else shoot
     cone = cone if cone @ shoot >= 0 else -cone
-    a = shoot if d_end <= reach else cone
+    a = shoot if d_end <= reach else cone          # (a rosette: always its up)
     ref = np.array([0.0, 0.0, 1.0]) if abs(a[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
     return {"node": node, "axis": a, "e1": unit_vec(np.cross(a, ref)), "reach_mm": reach / unit,
-            "from": "shoot end" if d_end <= reach else "leaf cone", "shoot_end_mm": d_end / unit,
+            "from": ("plant up (rosette)" if not lines else "shoot end") if d_end <= reach else "leaf cone",
+            "shoot_end_mm": d_end / unit,
             "cone_vs_shoot_deg": float(np.degrees(np.arccos(np.clip(cone @ shoot, -1, 1))))}
 
 
@@ -737,7 +742,7 @@ def pool(run, skeleton, frame, name, unit, cands, sel_curves):
         blade = (leaf.get("blade_start") or 0) / max(len(leaf["curve"]) - 1, 1)
         rows.append(to_row(curve, frame, unit, blade, active=True, source=leaf.get("source"),
                            track=leaf["track"]))
-    for i in range(len(rows)):
+    for i in range(len(rows) if PAIRS else 0):
         rows.append(dict(rows[i], phi=rows[i]["phi"] + np.pi, active=False, group=f"pair_{i}",
                          source="pair", partner_of=i, track=None))
     shortest = min(sum(r["legs_mm"]) for r in rows)
@@ -847,6 +852,11 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     if args.recurve:
         Apex.INCURVE = (-0.5 * np.pi, np.pi)
+    global PAIRS
+    from pose_estimator import plant_profiles
+    profile, _ = plant_profiles.profile_for(args.workdir)
+    PAIRS = profile.phyllotaxis == "opposite"
+    print(f"  {plant_profiles.describe(profile, _)}: partner proposals {'on' if PAIRS else 'off'}", flush=True)
     dev = "cuda"
     torch.manual_seed(0)
     mpu = json.loads((args.workdir / "tag_scale.json").read_text())["mm_per_unit"]
@@ -880,14 +890,15 @@ def main():
         if not sel:
             continue
         node = np.median(np.stack([c[0] for c, _ in sel]), axis=0)
-        frame = apex_frame(node, [c[-1] for c, _ in sel], lines, reach, unit)
+        frame = apex_frame(node, [c[-1] for c, _ in sel], lines, reach, unit, run.rotation[2])
         rows = pool(run, skeleton, frame, name, unit, cands.get(name, []), sel)
         views = Views(run, args.zoom, apex, train, dev)
         ctx = context(run, views, rows_in(run.points, pts), dev)
         model = Apex(frame, rows, unit, 0.5 * run.voxel, dev)
         n_start = int((model.active & ~model.bud).sum())
-        log(f"  {name}: {n_start} leaves from the selection + bud, {n_start} partners and "
-            f"{len(rows) - 2 * n_start - 1} candidates in the pool, "
+        n_pairs = sum(r.get("partner_of") is not None for r in rows)
+        log(f"  {name}: {n_start} leaves from the selection + bud, {n_pairs} partners and "
+            f"{len(rows) - n_start - n_pairs - 1} candidates in the pool, "
             f"{len(views.frames)} views, {sum(views.n_masks)} SAM3 apex masks; context: {ctx.n} P5x leaves "
             f"as instances, {len(ctx.dropped)} replaced (mostly in the region), {len(ctx.X)} points; "
             f"axis from the {frame['from']} ({frame['shoot_end_mm']:.1f} mm from the node; the leaf cone "
@@ -972,11 +983,12 @@ def main():
         tip, axis = to_plant(f["O"]), f["axis"] @ run.rotation.T
         low = tip - float(sh["attach_mm"].max()) * unit * axis
         trunks = [i for i, x in enumerate(axes) if x["kind"] != "petiole" and len(x["points"]) >= 2]
-        (_, near, d), i = min(((stem_tree._on_polyline(np.asarray(axes[i]["points"], float), low), i)
-                               for i in trunks), key=lambda h: h[0][2])
-        shoot = np.vstack([near, low, tip] if d > 0 else [low, tip])
-        axes.append({"id": len(axes), "order": axes[i]["order"] + 1, "parent": i, "kind": "branch",
-                     "leaf": None, "apex": name, "points": shoot.round(6).tolist()})
+        if trunks:                                   # a rosette has no stem to join
+            (_, near, d), i = min(((stem_tree._on_polyline(np.asarray(axes[i]["points"], float), low), i)
+                                   for i in trunks), key=lambda h: h[0][2])
+            shoot = np.vstack([near, low, tip] if d > 0 else [low, tip])
+            axes.append({"id": len(axes), "order": axes[i]["order"] + 1, "parent": i, "kind": "branch",
+                         "leaf": None, "apex": name, "points": shoot.round(6).tolist()})
         apices[name] = {"tip": tip.round(6).tolist(), "axis": axis.round(6).tolist(),
                         "leaves": int(sum(not r.get("bud") for r in f["rows"])),
                         "bud": any(r.get("bud") for r in f["rows"])}
@@ -994,7 +1006,7 @@ def main():
                 "tip": curve[-1].tolist(), "base": curve[bi].tolist(), "curve": curve.round(6).tolist(),
                 "blade_start": bi, "midrib": curve[bi:].round(6).tolist(),
                 "petiole": curve[:bi + 1].round(6).tolist() if bi > 0 else [],
-                "starts_on": "stem", "colour_bgr": list(f["colours"][j]),
+                "starts_on": "stem" if trunks else "crown", "colour_bgr": list(f["colours"][j]),
                 "midrib_mm": float(f["L"][j] * (1 - b) * mpu),
                 "blade": {"length_mm": round(float(f["L"][j] * (1 - b) * mpu), 3),
                           "width_mm": round(float(2 * f["half"][j].max() * mpu), 3),
