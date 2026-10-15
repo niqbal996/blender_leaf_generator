@@ -321,7 +321,7 @@ summary() {
     echo "================================================================"
     echo "  batch summary  ($(date '+%H:%M:%S'))"
     echo "================================================================"
-    cut -f1-5 "$LOG_DIR/summary.tsv" | column -t -s $'\t'
+    cut -f1-5 "$LOG_DIR/summary.tsv" | { command -v column > /dev/null && column -t -s $'\t' || cat; }
     echo ""
     echo "  $LOG_DIR/summary.tsv"
     [[ -n "$LAUNCHER" ]] || echo "  $LOG_DIR/resources.csv"
@@ -341,6 +341,19 @@ echo ""
 echo "batch logs: $LOG_DIR"
 (( JOBS == 1 )) || echo "follow one:  tail -f $LOG_DIR/<session>__<name>.log"
 echo ""
+
+# Side by side, the specimens' first gsplat use (P4b, P4g, apex) would compile its CUDA kernels
+# all at once, over each other: gsplat's import deletes the build lock, and on a cold cache the
+# build folder (2026-10-14). Built once here, they find them built.
+if (( JOBS > 1 )) && [[ -z "$LAUNCHER" && "$DRY_RUN" != 1 ]]; then
+    TX="${TORCH_EXTENSIONS_DIR:-$HOME/.cache/torch_extensions}"
+    mkdir -p "$TX"
+    echo "gsplat: building its CUDA kernels once, before the specimens start (minutes on a new container)"
+    flock "$TX/gsplat_build.lock" "${POSE_PYTHON:-python3}" -c \
+        "import gsplat.cuda._backend as b; raise SystemExit(b._C is None)" \
+        || echo "gsplat: its kernels did not build here -- each specimen will try on its own" >&2
+    echo ""
+fi
 
 PIDS=()
 running=0

@@ -52,6 +52,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -69,6 +70,11 @@ GRID = 128          # px of an apex square in the renderer
 ROLLS = (0, 45, 90, 135)
 WIDTH = 0.5         # widest blade / curve length (vogelmeere: ovate, ~0.5-0.7)
 STALK = 0.15        # share of the curve, from its base, that is stalk
+# The plant's own leaf when its profile's leaf_shape is "from_base" (rosettes): main() sets it
+# from leaf_shape_prior -- half-width at the widest over the blade's length, and where along the
+# blade the widest lies. The strip is then drawn with no stalk and that outline. None: the
+# chickweed strip above (WIDTH, STALK).
+SHAPE = None
 ALONG, ACROSS = 64, 21
 ALPHA = 0.5         # cost of a visible leaf pixel off its best mask, per pixel
 LEAF_COST = 0.0     # cost per leaf, px summed over views: 0, 150, 300 kept 26, 24, 23 leaves on
@@ -90,6 +96,29 @@ def region_reach(regions):
 def in_region(curve_w, reach):
     c, r = reach
     return np.linalg.norm(curve_w[len(curve_w) // 2] - c) < r
+
+
+def rows_in(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Which rows of `a` are rows of `b` (the regions are carved out of the same cloud)."""
+    v = lambda x: np.ascontiguousarray(x, np.float64).view(np.dtype((np.void, 24))).ravel()
+    return np.isin(v(a), v(b))
+
+
+def replaced_by_apex(run: Run, regions: dict, base_dir: Path, args) -> callable:
+    """leaf -> True if an apex replaces this --base leaf. On P5x (whose points `run` holds): more
+    than half of the leaf's points lie in a carved region -- apex_fit's rule, which renders every
+    other P5x leaf as context and keeps it. (Its curve's middle within the region's reach, the
+    test for candidates, also took leaves lying mostly outside: neither fitted nor kept, 18 of
+    gf_1's 25 on 2026-10-14.) Another base has no point labels here: that test, as before."""
+    if Path(base_dir).resolve() != (args.workdir / "p5x").resolve():
+        reach = region_reach(regions)
+        return lambda leaf: any(in_region(leaf_world(run, leaf), reach[n]) for n in regions)
+    lab = run.assignment
+    apex = set()
+    for pts in regions.values():
+        here = rows_in(run.points, pts)
+        apex |= {int(i) for i in np.unique(lab[lab >= 0]) if here[lab == i].mean() > 0.5}
+    return lambda leaf: int(leaf["id"]) in apex
 
 
 def leaf_world(run: Run, leaf: dict) -> np.ndarray:
@@ -131,6 +160,54 @@ def candidates(run: Run, regions: dict, reach: dict, evidence: Path | None, dirs
     return per
 
 
+def leaf_shape_prior(run: Run) -> Optional[dict]:
+    """The plant's own leaf, measured on its P5x leaves: each leaf's points against its blade's
+    midrib -- along it (share of its length) and off it (distance) -- give a width profile
+    (90th percentile of the distance in ten stretches); its widest stretch gives the half-width
+    over the blade's length and where the widest lies. The medians over the leaves are returned
+    (`half_share`, `widest_at`, `leaves`), or None with fewer than two leaves to measure.
+    A start for the fit and the selection's strip, measured rather than chickweed's."""
+    from scipy.spatial import cKDTree
+
+    shares, widest = [], []
+    lab = run.assignment
+    for leaf in run.skeleton.get("leaves", []):
+        rib = np.asarray(leaf.get("midrib") or [], float)
+        pts = run.points[lab == int(leaf["id"])]
+        if len(rib) < 4 or len(pts) < 100:
+            continue
+        C = resample(run.to_world(rib), 64)
+        cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(C, axis=0), axis=1))]
+        if cum[-1] <= 0:
+            continue
+        d, j = cKDTree(C).query(pts)
+        t = cum[j] / cum[-1]
+        w = [np.percentile(d[(t >= a) & (t < a + 0.1)], 90) if ((t >= a) & (t < a + 0.1)).sum() >= 10 else 0.0
+             for a in np.arange(0, 1, 0.1)]
+        k = int(np.argmax(w))
+        if w[k] > 0:
+            shares.append(w[k] / cum[-1])
+            widest.append((k + 0.5) / 10)
+    if len(shares) < 2:
+        return None
+    # at most half the blade's length, the fit's own bound (weed_x measures 0.65: round leaves
+    # on short traced midribs)
+    return {"half_share": float(min(np.median(shares), 0.5)), "widest_at": float(np.median(widest)),
+            "leaves": len(shares)}
+
+
+def outline_tapers(widest_at: float, lo: float = 0.5, hi: float = 2.0, tip: float = 0.7):
+    """(a, b) of an outline t^a (1-t)^b whose widest lies at `widest_at` (a / (a + b)): the tip
+    taper `tip` as the fit starts it and the base taper set to match -- or, where that leaves
+    the fit's bounds, the base taper at the bound and the tip taper set to match."""
+    w = float(np.clip(widest_at, lo / (lo + hi), hi / (lo + hi)))
+    a = tip * w / (1 - w)
+    if a < lo or a > hi:
+        a = float(np.clip(a, lo, hi))
+        return a, float(np.clip(a * (1 - w) / w, lo, hi))
+    return float(a), tip
+
+
 def strip(curve_w: np.ndarray, roll_deg: float) -> np.ndarray:
     """(ALONG * ACROSS, 3) points of a leaf-shaped strip along the curve."""
     C = resample(curve_w, ALONG)
@@ -148,8 +225,14 @@ def strip(curve_w: np.ndarray, roll_deg: float) -> np.ndarray:
     th = np.radians(roll_deg)
     W = np.cos(th) * N + np.sin(th) * np.cross(T, N)
     s = np.linspace(0.0, 1.0, ALONG)
-    blade = np.clip((s - STALK) / (1 - STALK), 0, 1)
-    half = 0.5 * WIDTH * length * np.where(s < STALK, 0.06, np.sin(np.pi * blade) ** 0.7 + 0.06)
+    if SHAPE is None:
+        blade = np.clip((s - STALK) / (1 - STALK), 0, 1)
+        half = 0.5 * WIDTH * length * np.where(s < STALK, 0.06, np.sin(np.pi * blade) ** 0.7 + 0.06)
+    else:                                            # from the base, widest where the plant's are
+        a, b = outline_tapers(SHAPE["widest_at"])
+        t = np.clip(s, 1e-4, 1 - 1e-4)
+        peak = a / (a + b)
+        half = SHAPE["half_share"] * length * ((t ** a * (1 - t) ** b) / (peak ** a * (1 - peak) ** b) + 0.06)
     u = np.linspace(-1.0, 1.0, ACROSS)
     return (C[:, None] + (half[:, None] * u[None])[..., None] * W[:, None]).reshape(-1, 3)
 
@@ -310,7 +393,7 @@ def montage(path: Path, run: Run, views: Views, slots: torch.Tensor, kept_colour
 
 
 def main():
-    global ALPHA, LEAF_COST
+    global ALPHA, LEAF_COST, SHAPE
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--workdir", type=Path, required=True)
@@ -331,6 +414,14 @@ def main():
     dev = "cuda"
     mpu = json.loads((args.workdir / "tag_scale.json").read_text())["mm_per_unit"]
     run = Run(args.workdir)
+    from pose_estimator import plant_profiles
+    profile, folder = plant_profiles.profile_for(args.workdir)
+    if profile.leaf_shape == "from_base":
+        SHAPE = leaf_shape_prior(run)
+        print(f"  {plant_profiles.describe(profile, folder)}; leaf shape from the base" + (
+            f", measured on {SHAPE['leaves']} P5x leaves: half-width {SHAPE['half_share']:.2f} of the "
+            f"blade's length, widest at {SHAPE['widest_at']:.2f} of it" if SHAPE else
+            ": too few P5x leaves to measure, chickweed's strip"), flush=True)
     regions = dict(np.load(args.regions))
     reach = region_reach(regions)
     base_dir = args.base or args.workdir / "p5x"
@@ -338,8 +429,8 @@ def main():
 
     leaf_curve = lambda leaf: leaf_world(run, leaf)
     per = candidates(run, regions, reach, args.evidence, args.candidates, mpu)
-    occluders = [leaf_curve(l) for l in base["leaves"]
-                 if not any(in_region(leaf_curve(l), reach[n]) for n in regions)]
+    replaced_leaf = replaced_by_apex(run, regions, base_dir, args)
+    occluders = [leaf_curve(l) for l in base["leaves"] if not replaced_leaf(l)]
 
     report, kept_all = {}, []
     log = lambda s: print(s, flush=True)
@@ -370,8 +461,7 @@ def main():
 
     # the result: --base with its apex leaves replaced, one curve per leaf
     to_plant = lambda X: ((np.atleast_2d(X) - run.origin) @ run.rotation.T)
-    leaves = [dict(l) for l in base["leaves"]
-              if not any(in_region(leaf_curve(l), reach[n]) for n in regions)]
+    leaves = [dict(l) for l in base["leaves"] if not replaced_leaf(l)]
     replaced = len(base["leaves"]) - len(leaves)
     from pose_estimator import stem_tree
     from pose_estimator.leaf_skeleton import smooth_curve

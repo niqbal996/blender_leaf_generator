@@ -854,7 +854,7 @@ declare -A STAMP_CODE=(
     [p5]="pose_estimator.cli.structure" [p6]="pose_estimator.cli.leaf_model"
     [scale]="scripts/tag_scale.py" [p4m]="pose_estimator.cli.mvs" [p4g]="pose_estimator.cli.gs_surface"
     [p5x]="pose_estimator.cli.leaf_instances scripts/thin_cloud.py" [s2d]="scripts/skeleton_2d.py"
-    [apex]="scripts/run_apex.sh scripts/apex_regions.py scripts/apex_zoom.py scripts/skeleton_2d.py scripts/apex_select.py scripts/apex_fit.py scripts/apex_fit_check.py scripts/apex_labels.py scripts/make_bundle.sh scripts/blender_view_plant.py scripts/view_in_blender.sh"
+    [apex]="scripts/run_apex.sh scripts/apex_regions.py scripts/apex_zoom.py scripts/skeleton_2d.py scripts/apex_select.py scripts/apex_fit.py scripts/apex_fit_check.py scripts/apex_labels.py scripts/leaf_margins.py scripts/leaf_curvature.py scripts/flatlay_match.py scripts/template_fit.py scripts/make_bundle.sh scripts/blender_view_plant.py scripts/view_in_blender.sh"
 )
 declare -A STAMP_AFTER=(
     [p1p2]="" [p3]="p1p2" [p4a]="p3" [p4b]="p4a" [p4c]="$([[ "$SKIP_P4B" == 1 ]] && echo p4a || echo p4b)"
@@ -883,6 +883,11 @@ stamp_tool() {    # stamp_tool check|write <phase> <settings> [extra flags]
     "$PY" "$REPO_ROOT/scripts/phase_stamp.py" "$1" "$WORKDIR" "$2" --code ${STAMP_CODE[$2]} \
         --after ${STAMP_AFTER[$2]} --args "$3" --outputs ${STAMP_OUT[$2]} "${@:4}"
 }
+apex_args() {    # the apex phase's settings: the held-out run, and the plant's flat-lay leaves (leaf_pose/
+    #                 leaves.json, by content): a flat-lay added or replaced later reruns apex
+    local f="$(dirname "$WORKDIR")/leaf_pose/leaves.json"
+    echo "heldout=$APEX_HELDOUT flat=$([[ -f "$f" ]] && md5sum "$f" | cut -c1-12 || echo none)"
+}
 stamp_plan() {    # for --dry-run: per phase in range, kept or run, and why -- nothing written
     local tmp ph why rc args
     [[ "$STAMPS" == 1 ]] || { echo "  stamps off: every phase in range runs"; return 0; }
@@ -895,7 +900,7 @@ stamp_plan() {    # for --dry-run: per phase in range, kept or run, and why -- n
             p1p2) args="$P1P2_ARGS" ;; p3) args="$P3_ARGS" ;; p4a) args="$P4A_ARGS" ;; p4b) args="$P4B_ARGS" ;;
             p4c) args="$P4C_ARGS" ;; p5) args="$P5_ARGS" ;; p6) args="" ;; scale) args="tag_mm=$TAG_MM" ;;
             p4m|p4g) args="default" ;; p5x) args="thin_mm=0.15" ;; s2d) args="tag_mm=$TAG_MM leaf_curves stem_tree=p5x" ;;
-            apex) args="heldout=$APEX_HELDOUT" ;;
+            apex) args="$(apex_args)" ;;
         esac
         if rerun_asked "$ph"; then
             printf '  %-6s run   re-run asked (--rerun-from %s)\n' "$ph" "$RERUN_FROM"
@@ -1551,10 +1556,10 @@ if should_run s2d && will_run_phase s2d && needs s2d "tag_mm=$TAG_MM leaf_curves
         --stem-tree "$WORKDIR/p5x/skeleton.json" --out "$WORKDIR/s2d" 2>&1 | tee "$WORKDIR/s2d/run.log"
     stamp s2d "tag_mm=$TAG_MM leaf_curves stem_tree=p5x"
 fi
-if should_run apex && will_run_phase apex && needs apex "heldout=$APEX_HELDOUT"; then
+if should_run apex && will_run_phase apex && needs apex "$(apex_args)"; then
     phase "apex   young leaves at each shoot tip, fitted to the photos -> $WORKDIR/apex"
     PY="$PY" TAG_MM="$TAG_MM" APEX_HELDOUT="$APEX_HELDOUT" "$REPO_ROOT/scripts/run_apex.sh" "$WORKDIR"
-    stamp apex "heldout=$APEX_HELDOUT"
+    stamp apex "$(apex_args)"
 fi
 if [[ ${#KEPT[@]} -gt 0 ]]; then
     echo ""

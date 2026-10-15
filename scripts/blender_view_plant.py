@@ -80,7 +80,8 @@ BRANCH_RGBA = (1.0, 0.55, 0.12, 1.0)
 PETIOLE_RGBA = (0.62, 0.95, 0.50, 1.0)
 # The two ends of the stem line, drawn as balls in colours nothing else uses,
 # so "is the crown in the right place?" can be answered by looking.
-CROWN_RGBA = (1.0, 0.85, 0.10, 1.0)       # yellow: foot of the stem, above the root
+CROWN_RGBA = (1.0, 0.85, 0.10, 1.0)       # yellow: the plant's origin (a rosette's leaves start
+                                          # there; else the foot of the stem, above the root)
 GT_FOUND_RGBA = (1.0, 0.0, 0.85, 1.0)    # magenta: an apex leaf that matches a hand-drawn line
 HEART_RGBA = (0.10, 0.75, 1.0, 1.0)       # cyan: top of the stem, where leaves start
 
@@ -938,7 +939,7 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True, folder="p5x", 
     # Matches the sentinels in cli/leaf_instances.py. Spelled out rather than
     # imported: this file runs inside Blender's bundled Python, which cannot
     # import the repo.
-    SKELETON, ROOT = -2, -3
+    SKELETON, ROOT, UNASSIGNED = -2, -3, -4
 
     group = lambda part: _collection(f"{prefix}_{part}", parent=prefix)
     leaves_coll = group("leaves")
@@ -952,7 +953,10 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True, folder="p5x", 
     # Label -2 is the tissue that voted "stem" -- the stem cloud, the same
     # points P5 draws as plant_stem_cloud. It was drawn as "p5x_skeleton",
     # which read as the skeleton itself; the skeleton is the curves below.
+    # Label -4: a rosette has no stem -- its tissue no leaf mask claimed (leaf bases, the heart) is
+    # leaf tissue of no known leaf (cli/leaf_instances.no_stem_on_rosette), drawn as such.
     for value, name, coll in ((SKELETON, f"{prefix}_stem_cloud", "stem_cloud"),
+                              (UNASSIGNED, f"{prefix}_unassigned_leaf_tissue", "unassigned_leaf_tissue"),
                               (ROOT, f"{prefix}_root", "root")):
         keep = label == value
         if keep.any():
@@ -1021,12 +1025,14 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True, folder="p5x", 
             tree = graph["stem_tree"]
             print(f"[plant] stem tree: {len(branches)} branches, "
                   f"{tree['axes'].get('petiole', 0)} leaf stalks, {tree['forks']} forks")
-        crown = graph.get("crown")
-        if crown:
-            add_sphere(np.asarray(crown, float) + off, f"{prefix}_crown", CROWN_RGBA,
-                       point_radius * 4.5, group("crown"))
+        # the plant's origin: where its leaves start (a rosette) or the foot of its stem --
+        # "crown" in the skeleton files, which read as a botanical crown (the user, 2026-10-14)
+        origin = graph.get("origin") or graph.get("crown")
+        if origin:
+            add_sphere(np.asarray(origin, float) + off, f"{prefix}_origin", CROWN_RGBA,
+                       point_radius * 4.5, group("origin"))
         print(f"[plant] {drawn_ribs} midribs, {len(graph.get('leaves', []))} tips, "
-              f"crown {'placed' if crown else 'not found'}")
+              f"origin {'placed' if origin else 'not found'}")
         if graph.get("unreachable"):
             print(f"[plant] no midrib for leaves {graph['unreachable']} -- they never")
             print("[plant] reach the crown through the cloud")
@@ -1036,6 +1042,7 @@ def build_p5x(workdir, point_radius=None, frame=True, clear=True, folder="p5x", 
 
     print(f"[plant] P5x: {drawn} leaves, "
           f"{int((label == SKELETON).sum())} stem-cloud points, "
+          f"{int((label == UNASSIGNED).sum())} unassigned leaf-tissue points (a rosette: no stem), "
           f"{int((label == ROOT).sum())} root points")
     print(f"[plant] each leaf is its own object under '{prefix}' > '{prefix}_leaves'")
     print("[plant] if everything looks grey, the viewport is in Solid shading with")
@@ -1104,7 +1111,7 @@ def _shifted(graph: dict, offset) -> dict:
     cloud panel that --clouds placed off the origin."""
     move = lambda pts: (np.asarray(pts, float).reshape(-1, 3) + offset).tolist() if len(pts) else pts
     out = dict(graph)
-    for key in ("stem", "crown"):
+    for key in ("stem", "crown", "origin"):
         if graph.get(key):
             out[key] = move(graph[key]) if key == "stem" else (np.asarray(graph[key]) + offset).tolist()
     out["axes"] = [dict(a, points=move(a["points"])) for a in graph.get("axes") or []]
@@ -1209,9 +1216,10 @@ def build_skeleton2d(path, point_radius=None, frame=True, clear=False, tag="s2d"
                       point_radius * 1.2, petioles)
         add_sphere(np.asarray(leaf["tip"], float), f"{tag}_tip_{leaf['id']:02d}", colour,
                    point_radius * 3.2, tips)
-    if graph.get("crown"):
-        add_sphere(np.asarray(graph["crown"], float), f"{tag}_crown", CROWN_RGBA,
-                   point_radius * 4.5, group("crown"))
+    origin = graph.get("origin") or graph.get("crown")
+    if origin:
+        add_sphere(np.asarray(origin, float), f"{tag}_origin", CROWN_RGBA,
+                   point_radius * 4.5, group("origin"))
     whole = sum(1 for leaf in graph.get("leaves", []) if len(leaf.get("curve") or []) >= 2)
     stamp = graph.get("annotated") or graph.get("built") or {}
     print(f"[plant] {tag}: {path}")

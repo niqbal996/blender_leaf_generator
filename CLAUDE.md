@@ -34,7 +34,12 @@ code, its inputs and its settings is kept, anything else runs -- `--dry-run` pri
 why, `--rerun-from <phase>` forces, `./scripts/phase_stamp.py show <workdir>` lists them.
 Many plants: `./batch_run_plants.sh <specimen>... --log-dir <dir>` (one by one by default).
 Configs: the repo's `./pipeline.conf` (token), `/netscratch/naeem/blender_assets/pipeline.conf`,
-the session's and the specimen's (`architecture = caulescent | rosette` per specimen).
+the session's and the specimen's. `architecture` comes from the species profile
+(`plant_profiles.py`: vogelmeere/gaensefuss upright, sugarbeet/thistle/weed rosette) unless a
+session's or specimen's file (or `--architecture`) sets it; the shared files no longer do.
+The apex phase also reads each leaf's curvature (`apex/curvature/`) and, when the specimen has a
+`leaf_pose/` (its leaves laid flat after the capture), places every flat-lay leaf on the plant
+(`apex/flatlay/`, `apex/templates/`). A rosette has no stem: P5x writes that tissue as label -4.
 Do not edit `run_pipeline.sh` while a run is going: bash reads it as it runs.
 A P4m (COLMAP PatchMatch) killed mid-kernel can hang in uninterruptible exit for a long time;
 `ps`/`pgrep` then block on it -- read `/proc/<pid>/status` instead.
@@ -42,6 +47,10 @@ A P4m (COLMAP PatchMatch) killed mid-kernel can hang in uninterruptible exit for
 ## Standing facts
 
 - Python: `/root/miniconda3/envs/pose/bin/python`, with `PYTHONPATH=src` from the repo root.
+  Run the pipeline and anything using gsplat from an *activated* env
+  (`source /root/miniconda3/etc/profile.d/conda.sh && conda activate pose`): activation sets
+  `TORCH_CUDA_ARCH_LIST=9.0` and `CUDA_HOME`; without it gsplat builds for six archs with
+  another nvcc, and every switch between the two rebuilds its kernels (5+ min, under a lock).
 - Test plant: `P=/netscratch/naeem/blender_assets/06-10-2026-Naeem/vogelmeere/plant`, `D=$P/debug`.
 - Experiments and outputs go to `$D/<experiment>/`, never into the repo (disk quota).
   Diagnostic scripts go into `scripts/` or next to their output in `$D/<experiment>/` --

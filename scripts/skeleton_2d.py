@@ -38,6 +38,7 @@ import json
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -216,7 +217,8 @@ def stem_contact(stem: np.ndarray, rc, radius: float) -> int:
     return int((window & ((yy - r0) ** 2 + (xx - c0) ** 2 <= radius ** 2)).sum())
 
 
-def extract_2d(run: Run, masks, frames, junk, cache: Path, base_rule: str = "foot"):
+def extract_2d(run: Run, masks, frames, junk, cache: Path, base_rule: str = "foot",
+               masks_file: Optional[Path] = None):
     """Per mask: tip, base, midrib (full-frame x,y). Per frame: stem path and apex.
 
     `base_rule` (the plant profile's) decides which end of a mask is the base:
@@ -235,17 +237,24 @@ def extract_2d(run: Run, masks, frames, junk, cache: Path, base_rule: str = "foo
                       corner and its ends move with the view: vogelmeere_x_1
                       split 13 blades into 36 "leaves" that way. Falls back to
                       "foot" on a mask with no stem contact.
-    The cache records the rule it was built with and is rebuilt for another.
+    The cache records the rule it was built with and is rebuilt for another. It is also
+    rebuilt when it is older than P2 or than `masks_file` (the --masks it was read from), or
+    names a track those masks do not hold: the apex stage re-runs SAM3 on the zoomed squares
+    every time, and its 2D lines were read from the first run's masks for the day's later ones
+    (2026-10-14) until SAM3 numbered a track differently and the colours lookup failed.
     """
     p2_written = run.workdir / "p2" / "prompts.json"
     if cache.exists():
         data = json.loads(cache.read_text())
-        stale = p2_written.exists() and p2_written.stat().st_mtime > cache.stat().st_mtime
-        if data.get("base_rule", "foot") == base_rule and not stale:
+        newer = [f for f in (p2_written, masks_file)
+                 if f is not None and Path(f).exists() and Path(f).stat().st_mtime > cache.stat().st_mtime]
+        unknown = {str(r["track"]) for r in data["leaves"]} - {str(t) for t in masks["track"]}
+        if data.get("base_rule", "foot") == base_rule and not newer and not unknown:
             return data["leaves"], data["stems"]
-        print(f"  {cache.name} " + (f"predates this P2 ({p2_written})" if stale else
-              f"was built with base rule {data.get('base_rule', 'foot')}, not {base_rule}")
-              + " -- rebuilding it")
+        why = (f"predates {newer[0]}" if newer else
+               f"names {len(unknown)} tracks the masks do not hold" if unknown else
+               f"was built with base rule {data.get('base_rule', 'foot')}, not {base_rule}")
+        print(f"  {cache.name} {why} -- rebuilding it")
     boxes = frame_boxes(run.workdir)
     crown = run.to_world(run.skeleton["crown"])
     by_frame = defaultdict(list)
@@ -986,7 +995,7 @@ def main():
         life[str(t)].add(str(f))
     base_rule = args.base_rule or profile.base_rule
     leaves2d, stems2d = extract_2d(run, masks, set(frames), junk, args.out / "evidence_2d.json",
-                                   base_rule=base_rule)
+                                   base_rule=base_rule, masks_file=args.masks)
 
     # 0. the scale, before anything that thresholds in mm. Fitted against the
     # flat lay it is circular -- the merges it sets decide which midribs the fit

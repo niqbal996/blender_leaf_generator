@@ -55,6 +55,9 @@ CROSSING_NODES = 3
 # Sentinels shared with cli/leaf_instances.py.
 UNSEEN = -1
 SKELETON = -2
+# A rosette has no stem: the plant tissue no leaf mask claimed (leaf bases, the heart) is leaf tissue
+# of no known leaf. It carries the crown and the leaves' routes to it as stem tissue does elsewhere.
+UNASSIGNED = -4
 ROOT = -3
 
 
@@ -100,7 +103,7 @@ def find_crown(points: np.ndarray, assignment: np.ndarray,
     hanging below it, so taking the foot of the stem is a refinement of a
     known answer rather than a search.
     """
-    for support in (assignment == SKELETON, np.isin(assignment, (SKELETON, ROOT)),
+    for support in (np.isin(assignment, (SKELETON, UNASSIGNED)), np.isin(assignment, (SKELETON, UNASSIGNED, ROOT)),
                     assignment != UNSEEN):
         if support.any():
             break
@@ -439,7 +442,7 @@ def _stem_route(graph, labels: np.ndarray, leaf_id: int, target: int, on_trunk: 
     and this leaf's own points only (crown-first order), or None."""
     from scipy.sparse.csgraph import dijkstra
 
-    allowed = np.flatnonzero((labels == SKELETON) | (labels == leaf_id))
+    allowed = np.flatnonzero((labels == SKELETON) | (labels == UNASSIGNED) | (labels == leaf_id))
     pos = np.searchsorted(allowed, target)
     if pos >= len(allowed) or allowed[pos] != target:
         return None

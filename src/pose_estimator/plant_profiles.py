@@ -78,6 +78,15 @@ class PlantProfile:
     # the shoot; "alternate" -- one leaf per node (also a rosette's spiral):
     # no such partner.
     phyllotaxis: str = "alternate"
+    # The leaf the apex stage fits (scripts/apex_select.py, apex_fit.py):
+    #   "stalked"    a stalk, then an ovate blade, widest anywhere along it -- chickweed's,
+    #                the template the fit was built on (vogelmeere)
+    #   "from_base"  the blade starts at the leaf's base, no stalk, narrow there and widest
+    #                beyond its middle; its width and widest point are measured on the
+    #                plant's own P5x leaves (the user, 2026-10-14: sugar beet and thistle
+    #                leaves run from the origin, narrow near it, broader away from it --
+    #                elongated rather than oval, on no petiole)
+    leaf_shape: str = "stalked"
 
 
 PROFILES = {
@@ -90,10 +99,14 @@ PROFILES = {
         note="goosefoot: one main stem with leaves along it"),
     "sugarbeet": PlantProfile(
         "sugarbeet", ROSETTE, petiole_rule="crown", base_rule="foot",
-        note="rosette: leaves meet at a crown, no stem"),
+        note="rosette: leaves meet at a crown, no stem", leaf_shape="from_base"),
     "thistle": PlantProfile(
         "thistle", ROSETTE, petiole_rule="crown", base_rule="foot",
-        note="rosette: leaves meet at a crown, no stem"),
+        note="rosette: leaves meet at a crown, no stem", leaf_shape="from_base"),
+    # A weed of unnamed species: a rosette (the user, 2026-10-14 -- weed_x is one).
+    "weed": PlantProfile(
+        "weed", ROSETTE, petiole_rule="crown", base_rule="foot",
+        note="weed, species not named: taken as a rosette", leaf_shape="from_base"),
 }
 
 # Other names the same species turns up under.
@@ -102,6 +115,7 @@ ALIASES = {
     "gaensefuss": "gaensefuss", "goosefoot": "gaensefuss", "chenopodium": "gaensefuss",
     "zuckerruebe": "sugarbeet", "beet": "sugarbeet",
     "distel": "thistle",
+    "weeds": "weed", "unkraut": "weed",
 }
 
 # The rules every plant had before profiles: a stem, gaensefuss's petiole rule.

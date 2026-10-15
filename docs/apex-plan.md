@@ -6,13 +6,183 @@ Every experiment writes into `<plant>/debug/<experiment>/`, never into the repo.
 
 ---
 
-## 0. Start here — handoff (updated 2026-10-13, evening)
+## 0. Start here — handoff (updated 2026-10-15)
 
 Sections 1–6 below are the log, including dead ends and numbers that were
 later corrected. **This section is the current truth.**
 `P=/netscratch/naeem/blender_assets/06-10-2026-Naeem/vogelmeere/plant`, `D=$P/debug`.
 Sessions run in replaceable containers: read the repo's `CLAUDE.md` first (the
 `pose` env and Claude's memory live on a tmpfs; how to restore both).
+
+### 0.0f 2026-10-15: the rosettes' heart, and a leaf curvature model for flat leaves
+
+**The 16-09 Slurm jobs died overnight** because `run_pipeline.sh` was rewritten (10-14 20:04) while they
+ran: gaensefuss_1 (started 19:15) at 02:33 after 6.8 h of P4m (`line 1532: syntax error near 'fi'`),
+sugarbeet_2 at 20:07 (`mp: command not found`); sugarbeet_1 failed its own P2 check (pass 1 off its circle,
+19 % RMS). Nothing ran on 10-15. Rerun them from P4m / P2 (stamps keep the rest).
+
+**The heart (sugarbeet, thistle, weed): there is no per-leaf evidence to fit to** (`scripts/heart_evidence.py`,
+outputs `<plant>/debug/heart_evidence/`; `_campaign/heart_stem_points.jpg`):
+- P2's *stem* mask covers the heart in every view (young folded leaves look like stems), so P5x labels the
+  heart's P4g points stem (24-49 % of the points within 10 mm of the origin on thistle and weed).
+- Those stem points form a hollow **vase**: the outer leaves' sheathing bases are its wall; inside it P4g has
+  almost nothing -- few views see in (the steepest look down is 48-50 deg). Sugarbeet's "stem" there is its
+  petioles; its heart is a small knot where they meet.
+- Stem and leaf labels are interleaved at the heart (median 0.2-0.4 mm apart, no gap in the distribution):
+  "stem points off the outer leaves" cannot be cut out by distance (`_dev/repo/scripts/heart_fit.py`, stage 1
+  only, not kept).
+- SAM3 zoomed tightly on the heart (`<plant>/debug/heart_zoom/`, a 7/4/7 mm region): thistle's young
+  leaves come back as **one blob** with an outer leaf (`sam3_all_masks.jpg`); weed's kept masks are its
+  cotyledons; sugarbeet none.
+- The outer leaves show no spiral to extend inwards: ordered by size (age unknown), the best turn angles are
+  78 / 218 / 260 deg with 10-30 deg median error, none near 137.5.
+So option 3 at the heart has, per view, only the heart's outline (the blob, the stem mask) to match; any
+leaves drawn there would be chosen by the outline and a rule, not seen one by one. **The user's call**
+(asked 2026-10-15): fit young leaves to the heart's outline (count by held-out views); hand-label a few heart
+leaves in the top views; a camera pass looking straight down into the heart; or keep the bud only.
+
+**Leaf curvature: each leaf's cup and wavy edge, read off P4g, and put on a flat leaf** (the user's
+wording, 2026-10-15: not "relief"; `scripts/leaf_curvature.py` -> `<workdir>/apex/curvature/` in the
+pipeline -- the first runs, under the old name, in `<plant>/debug/leaf_relief_model/`;
+`scripts/blender_leaf_curvature.py` puts it on a flat leaf in Blender). Per P5x-on-P4g
+leaf: a frame along the blade's own midline, the mid-sheet between P4g's two skins, each cross-section
+unrolled -- the leaf flattened -- and its height there split into the cup (smooth across) and the wave (the
+rest); the wave's size from midrib to margin, its wavelength along the margin, the two sides' correlation.
+- **P5x's midribs run 1-3 mm off the blade's midline** (median per leaf, all three plants; thistle leaf 1's
+  V-fold 4-6 mm off it): `p5x_midrib_off_midline_mm` in curvature.json. The curvature is read about the midline.
+- thistle_x: the wave grows towards the margin (shares of the margin's: 0.25 / 0.28 / 0.35 / 0.65 / 1.0 in
+  five bands), 0.2-0.45 mm at the margin of the big leaves (median 2.4 % of the half-width), wavelength
+  0.7 half-widths (8-12 mm), the two sides independent (correlation 0.12); cups up by 8 % of the half-width.
+  sugarbeet_x: 0.26-0.31 mm on its big leaves, longer waves (1.7 half-widths, ~20 mm), cupped 6 %. weed_x:
+  flat within the reading's noise (<= 0.1 mm).
+- Leave one out: wavelength predicted within ~30 %; amplitude not (thistle leaf 2: 0.21 mm measured, 0.39
+  predicted) -- the leaves of one plant differ in how wavy they are. The model gives the character;
+  `--map curvature_<id>.json` gives one real leaf's own waves.
+- Rules (no tuned numbers): the frame smoothed over one half-width (a frame per 0.5 mm stretch turns with each
+  wave and hides it); a one- or two-row feature along the leaf is not the blade (P5x leaks); a cell off its
+  neighbours by more than the leaf's own skin gap is not the sheet (>70 deg slope; the waves stand < 30); the
+  margin spectrum's white floor (median power over its shorter half) is taken off before synthesis.
+- Open: measured maps hang thin "curtains" at some margins (the outermost cell sees one skin); the leaf
+  base where P5x leaks (thistle leaf 1's outline spike).
+- Blender: `blender leaves.blend --python scripts/blender_leaf_curvature.py -- --curvature <curvature.json>
+  --objects "*_leaf_*" [--map curvature_<id>.json] [--scale 1]` -- each flat leaf (base at its
+  `<leaf>_attachment` Empty) gets a `<name>_curvature` copy, a dense grid with the same UVs lifted along its
+  normal. `--demo --save x.blend` builds flat | measured | model | model x3 per measured leaf.
+  Headless Blender 4.2.3: `/netscratch/naeem/_dev/blender/blender-4.2.3-linux-x64/blender` (persistent).
+
+**The flat-lay leaves** (the user, 2026-10-15: after the capture each plant is taken apart and its leaves
+shot flat, `<specimen>/leaf_pose/`, src/leaf_pose; on 06-10 only thistle_x and vogelmeere). They give
+each leaf's true outline in mm, and the plant's leaf count. `scripts/flatlay_match.py` matches them to the
+flattened P5x-on-P4g leaves (outline IoU, slid along the midrib, mirrored; Hungarian): thistle_x's big
+leaves flat 3/4/6 = P5x 2/1/0 (IoU 0.84/0.76/0.86: the flattening is right), flat 7 = P5x 3 (0.79),
+cotyledons flat 5 = P5x 4 and 8 = P5x 6 (seen in the photos), heart leaf flat 2 ~ P5x 5 (0.71; P5x 5 also
+holds other points of the heart), **heart leaf flat 1 (12 mm) has no 3D leaf**: 8 real leaves, 7 in P5x.
+The user's heart leaves are flat 1 and 2. A pair counts only above IoU 1/2 (apex_fit's TP_IOU): flat 1
+went to the cotyledon P5x 4 at 0.39 before that rule; now flat 1 and 5 are unmatched.
+
+**Every leaf placed from its flat-lay twin** (`scripts/template_fit.py`, thistle_x ->
+`thistle_x/plant/debug/template_fit_all/`; nothing names the heart: every flat-lay leaf is a template).
+A first version (only flat 1 and 2, added to the crown fit) gave the user (2026-10-15): two blades on
+heart leaf 2 (the crown fit's round `fit_apex_A_4` beside the saw-toothed template -- a twin), and the
+small leaf's wings closed (a free fold shut it to fit the crowded heart). Now:
+- every flat-lay leaf once, the crown fit's leaves not kept: no twins. Its outline and length are the
+  flat-lay's, its blade flat across (the plant's leaves measure nearly flat: cup rise 6-8 % of the
+  half-width), only its pose fitted: azimuth, elevation, incurve (towards the axis or away to 90 deg:
+  rosette leaves arch out), the Bezier's split, roll (+-90 deg).
+- the base: a matched leaf's slides along its P5x curve (P5x's curves run 10-13 mm longer than the
+  flat-lay leaves from P5x's crown: route through the plant's base); the skeleton draws each leaf from
+  **P5x's crown** (the user: that origin is right, the fit's rosette origin is not) along that route.
+- stage 1: matched flat-lay leaves on their P5x leaf's points (two-sided: on them and covering them),
+  off every other leaf. Stage 2: each unmatched flat-lay leaf either on a P5x leaf left unpaired (a
+  small leaf's outline match can fail) or in the heart -- base at the middle of the ring of matched
+  bases, on the stem points within its length; every assignment fitted, the best J kept. thistle_x:
+  flat 5 -> P5x 4 (the cotyledon, right), flat 1 -> heart (right), chosen with no names given (one-sided
+  cost had chosen the reverse: a 12 mm leaf lies wholly on a 23 mm leaf's points).
+- surface on its own points: flat 2/3/4/6/7/8 73/71/78/92/84/100 %, flat 5 (on P5x 4) 85 %, flat 1
+  (heart) 70 %. Heart leaf 1 lies 82 deg from the axis, curled back 113 deg, rolled edge-on (-80 deg),
+  36 % of it on other leaves' points: the heart's own points are not in P4g (the vase is hollow), so the
+  stem points it is fitted to are the vase's wall. Its pose would need the photos (the heart's blob in
+  the top views). 313 s on the A100.
+- bundle `_bundles/thistle_templates_20261015_1820.tar.gz` (link-only shadow `debug/view_templates/`,
+  the real `apex/bundle` untouched): P5x as it is, the crown fit, `s2d_flatlay_templates`; headless OK.
+
+**Template fit, the user's second look** (2026-10-15 evening): no petioles on a rosette; leaves shifted
+up off the origin and past their tips; the heart leaf's midrib a U-turn. Done: no petiole is written
+(each leaf from the origin, `petiole: []`); a midrib turns at most 90 deg either way (no U-turn); and
+`--base origin|slide`. **origin** (the user's ask: every template from P5x's crown) fits worse --
+template tip to P5x tip 5-11 mm (slide: 1.2-5.5, leaf 3 10), surface on its points 36-63 % (slide
+62-100 %), the cotyledon went to the heart -- because every P5x tip lies 3-9 mm further from the crown
+in a straight line than the whole flat-lay leaf is long (true leaves 5.5-9, cotyledons ~3: they start
+above the crown, or were picked off above their base). **slide** keeps the fit's base on the P5x curve
+and draws the stretch from the crown as the leaf's own narrow base (midrib + a strip at the template's
+first width), no petiole object. Heart leaf: no U-turn now, but still curled (49 / 74 deg) and edge-on:
+its 3D evidence is the vase's wall. Outputs `thistle_x/plant/debug/template_fit_{origin,slide}/`; bundle
+`_bundles/thistle_templates_20261015_1855.tar.gz` (P5x, crown fit, both variants).
+
+**In the repo and the pipeline** (2026-10-15 evening, committed). The no-stem rule (P5x) and the viewer's
+label -4; `run_apex.sh` gains three steps after `margins`: `curvature/` (every P5x-on-P4g leaf), and when
+`<specimen>/leaf_pose/leaves.json` exists `flatlay/` (flatlay_match.py) and `templates/`
+(template_fit.py --base slide), whose skeleton joins the bundle. On a plant that is no rosette the
+template fit has no heart, slides every base along its P5x curve (from the stem) and draws that stretch
+as the petiole; unmatched flat-lay leaves go to unpaired P5x leaves only (each fitted alone on each
+candidate, assigned one to one, refitted together: every combination did not scale). The apex phase's
+settings carry the flat-lay's digest (`apex_args`): a new or replaced leaf_pose reruns apex. Smoke runs
+(`<plant>/debug/apex_tail_smoke/`): thistle_x as before (5.5 min); vogelmeere 33 flat-lay / 34 P5x leaves,
+25 matched, 8 placed on unpaired P5x leaves (10 min). Tests 440 pass (the one known config failure).
+`--dry-run` on thistle_x: scale, p5x, s2d, apex rerun; P1-P4g kept.
+
+**No stem on a rosette** (the user, 2026-10-15: "it's all leaves", fix it first). P5x rule
+`no_stem_on_rosette` (cli/leaf_instances.py): on a rosette the stem
+votes become UNASSIGNED (-4, "leaf tissue of no known leaf"), never SKELETON; the tracer stands the crown
+on it and routes the leaves through it as before (find_crown, the leaf route); `--retrace` rewrites
+segmented.ply / instances.npy / skeleton.ply to match; the viewer draws it as
+`<p5x>_unassigned_leaf_tissue` (muted green), no stem cloud. No P2 rerun: only P5x and what follows.
+thistle_x (`debug/p5x_nostem/`, retrace): 26,516 points relabelled, crown moved 0.0000 mm, midribs at most
+0.0001 mm, 7 of 7 leaves reach the crown. Tests: 77 existing + 3 new (`test_rosette_no_stem.py`) pass.
+In the repo it changes P5x's stamp for every plant (P5x -> apex rerun on the next run; upright plants
+come out the same).
+
+**Template tips** (the user: P5x's tips as the extremities): a leaf placed on a P5x leaf pays for its
+surface past the plane through that leaf's tip (across the curve's last stretch). thistle_x slide,
+on the no-stem P5x (`debug/template_fit_slide_tip/`): tip to P5x tip 3.8 mm for flat 3 (= p5x_p4g leaf
+002; 10.0 before), 0.4-1.6 for flat 4-8, 5.9 for flat 2; at most 2.8 mm past a tip; surface on its own
+points 73-99 % (heart leaf 1 58 %, now level, roll 6 deg). Bundle
+`_bundles/thistle_nostem_templates_20261015_1920.tar.gz` (no-stem P5x, crown fit, templates; dev viewer).
+Open: blades are flat sheets; the real leaves are not (each leaf's curvature or a per-vertex pull onto
+the cloud could bend them -- not built). P5x's own skeleton still draws its crown-to-leaf routes on a
+rosette as petioles.
+
+**Rosettes have no stem -- does P2's stem mask hide leaf points?** (the user's question, measured
+`_campaign/stem_on_rosettes/stem_overlap.py` + P2's prompts.json): P5x paints the stem over the leaf
+masks, but the saved stem mask lies on 0 % of the saved leaf masks; P2 itself trims each leaf mask by
+SAM3's "stem" session before saving: thistle_x 7,292 px over 76 frames, weed_x 5,063 px (+2 masks
+dropped), sugarbeet_x 191,699 px (its petioles). The stem mask (8 / 11 / 15 % of the plant) is mostly
+P2's residual: plant pixels SAM3's leaf prompt never claimed (heart, leaf bases). Without a stem class
+those points would be unlabelled, not leaf: semantically right, not more leaf points, no heart leaves;
+sugarbeet would get its petiole pixels back. Not changed (a P5x-only rule reruns P5x -> apex; a P2 one
+reruns everything after P2).
+
+**P5x midribs: tried and reverted** (2026-10-15). A re-centring on the blade (`centre_on_blade`, dev copy
+only) moved thistle_x's midribs 1-3 mm to the blade's middle (flat-lay split 0.50 matched better, crown fit
+PQ 0.378 -> 0.439); the user judged P5x's own midribs more correct in Blender and asked for it reverted and
+the midribs left alone. The dev copy's `leaf_skeleton.py` is the repo's again; nothing reached the repo.
+Shadow outputs left in `thistle_x/plant/debug/p5x_midline/` for the record.
+
+**Origin, and one model from the three** (the user, 2026-10-15; to think about, not built): P5x's crown is
+the right origin and its leaves join it well; the crown fit's blades give better midribs, but its rosette
+origin (where the base lines meet, 3 mm off the crown) is wrong. Today's template fit is a step that way:
+P5x's crown and routes, flat-lay blades, poses from P4g. What it lacks: the crown fit's photo term (SAM3
+masks, PQ) on the template leaves, and for plants without a flat-lay the crown fit's own leaf.
+
+Bundle: `06-10-2026-Naeem/_bundles/relief_heart_20261015_1626.tar.gz` (README inside): per plant
+`leaf_relief/relief_demo.blend` (open directly; made before the rename), relief.json, pictures; `heart/`
+the evidence pictures.
+New scripts: `heart_evidence.py`, `leaf_curvature.py`, `blender_leaf_curvature.py`,
+`blender_curvature_render.py`, `flatlay_match.py`, `template_fit.py` (+ `heart_fit.py`: its `Plant` and
+`skin_gap`; its own heart-point cut is the dropped stage 1); developed in `/netscratch/naeem/_dev/repo`
+(same as the repo for these).
+Container note: this one has an A100 (sm_80) and `pose` was built for 8.6 (an A40): export
+`TORCH_CUDA_ARCH_LIST=8.0` after `conda activate pose` before anything using gsplat.
 
 ### 0.0 Where things stand (2026-10-13)
 
@@ -205,6 +375,205 @@ sideways 0.01-0.02, tips across 5.1 px). **Fix first** (next session): judge
 an added or dropped leaf on held-out frames (fit on even, J on odd -- §3.8's
 own rule), or demand it be a true positive in more views than it is a false
 positive; and seed/determinism where gsplat allows.
+
+### 0.0c The campaign's night, and apex through the pipeline (2026-10-14)
+
+SLURM logs: `06-10-2026-Naeem/_slurm_logs/`. gf_1, sugarbeet_x, thistle_x, weed_x: P1 → s2d
+done and stamped overnight; **apex failed on all four**. vogelmeere failed at P1
+(`CaptureMismatch`: pass2 shot 9 min before pass1 ended); rerun on 10-14 with
+`--allow-mixed-capture` (P4m from 14:09).
+
+The apex chain had only ever run on vogelmeere's hand-made workdir, which held root-level
+copies of s2d's files. Four faults, all fixed on 10-14:
+1. `apex_zoom.py` read `<workdir>/skeleton.json` and `<workdir>/masks.npz`; `run_apex.sh`
+   now passes `s2d/skeleton.json` and `s2d/masks.npz` (and checks `s2d/masks.npz` exists).
+2. **gsplat builds over itself when plants run side by side:** its import deletes the build
+   lock, and on a cold cache (every new container: `/root` is a tmpfs) the build folder too.
+   Three fits started within 20 s built at once; the checks then rebuilt it three at once.
+   `run_apex.sh` now imports gsplat once under `flock ~/.cache/torch_extensions/gsplat_build.lock`
+   before the fit; `batch_run_plants.sh --jobs N>1` does the same before starting the
+   specimens (P4b/P4g use gsplat too). Cold build alone: 5.3 min. **Run from an activated
+   `pose`** (`conda activate pose`): activation sets `TORCH_CUDA_ARCH_LIST=9.0` and
+   `CUDA_HOME` to the env's nvcc; a shell with only the env's python on PATH builds for six
+   archs with /usr/local/cuda, and each switch between the two rebuilds the kernels.
+3. **Leaves lost from the fit's skeleton:** apex_select replaced every P5x leaf whose curve's
+   middle lay within a sphere round the region (95th-percentile radius); apex_fit replaces
+   only those with most of their points in the carved region and renders the rest as
+   context. A leaf the first took and the second did not was neither fitted nor kept
+   (`scripts/apex_membership.py`): gf_1 18 of 25, weed_x 5 of 12, sugarbeet_x 2 of 5,
+   thistle_x 1 of 8, and vogelmeere 4 of 45 (A: 4, 29; C: 11; D: 42) -- v3's bundle lacked
+   those too. apex_select now uses apex_fit's rule for P5x leaves (`replaced_by_apex`);
+   the sphere stays for candidate curves, which have no point labels.
+4. `batch_run_plants.sh`'s summary needs `column`, missing in the container: falls back to cat.
+
+Run from the `pose` env (`conda activate pose`, or `POSE_PYTHON=`): from any other python
+the env probe reads `transformers none` and **reruns everything from P1**. Apex only:
+`./batch_run_plants.sh <specimens> --jobs 4 --log-dir <dir>` keeps P1 → s2d by stamp.
+Logs of today's runs: `06-10-2026-Naeem/_campaign/apex_20261014{,b,c}/`.
+
+**Results** (all through `run_pipeline.sh`, stamped; `<workdir>/apex/fit/check.log`,
+`apex_<X>.jpg`). Download: `06-10-2026-Naeem/_bundles/session_view_20261014_1547.tar.gz`
+(46 MB, the four per-plant bundles in one, README inside; every scene built headless from it).
+
+| plant | P5x leaves | replaced at the apices | selected → fitted | fit skeleton | PQ |
+|---|---|---|---|---|---|
+| gf_1 (A-E) | 25 | 11 | 31 → 11 (2/2/2/3/2) + 5 buds | 30 | 0.31 / 0.36 / 0.27 / 0.17 / 0.17 |
+| sugarbeet_x | 5 | 3 | 2 → 1 + bud | 4 | 0.24 |
+| thistle_x | 8 | 7 | 5 → 5 + bud | 7 | 0.40 |
+| weed_x | 12 | 7 | 7 → 3 + bud | 9 | 0.23 |
+
+gf_1: its apices show 8-10 young-leaf masks per view; the selection's leaves mostly miss
+them, and the fit drops them (E: 9 → 2, FN 7.5 per view) -- open items 1-2 at scale.
+On the rosettes the apex is the crown, whose region (within one median leaf of it) is
+nearly the whole plant, and the fit loses leaves there: v3's leaf is a young apex leaf (midrib curls only towards
+the shoot axis), and grown rosette leaves arch outwards and down; growing stops at the first
+rejected candidate (open item 2). FN 2.5-4 per view: most SAM3 masks at the crown have no
+leaf. Open: what the apex stage should do on a rosette (a smaller crown region of the young
+leaves only, `--recurve` there, or no fit) -- the user's call.
+
+### 0.0e Overnight 2026-10-14 -> 15: the user's items 4-6 (done 21:20)
+
+The user queues a job to start ~09:00 on 2026-10-15: **the repo must be final and untouched
+from then on.** Asked for (the user's words: rosette blades more realistic from the fit; the
+small leaves at the heart of sugarbeet and thistle represented; unknown weeds are rosettes).
+
+**Built** (in the repo since 20:10; developed in `/netscratch/naeem/_dev/repo`, which
+`/netscratch/naeem/_dev/devrun_apex.sh <workdir> [from step]` runs into `<workdir>/debug/apexdev/`):
+- profiles (`plant_profiles.py`): `weed` (+ `weeds`, `unkraut`) = rosette; a `leaf_shape`
+  field -- `stalked` (chickweed's, vogelmeere/gaensefuss/DEFAULT) or `from_base` (sugarbeet,
+  thistle, weed): the blade starts at the leaf's base, no stalk.
+- `apex_select.leaf_shape_prior`: the plant's own leaf, measured on its P5x leaves (width
+  profile against each midrib, ten stretches, 90th percentile): half-width/length and widest
+  point, medians -- sugarbeet_x 0.14 at 0.65, thistle_x 0.23 at 0.65, weed_x 0.65 (capped at the
+  fit's 0.5) at 0.25. On `from_base` plants the selection's strip and the fit's start use it.
+- rosette origin (`apex_regions.rosette_origin`): where the P5x leaves' base lines meet,
+  Weiszfeld (sum of distances): weed_x within 1.7 mm (median), thistle 1.6, sugarbeet 2.4. The
+  rosette apex is centred there (`end: origin` in apex_regions.json); apex_fit holds O there
+  (not optimised), attach 0, and joins every output leaf to it (kept P5x leaves too, blade from
+  the base); skeleton.json gets `origin` (and `crown` = origin). Viewer: `<tag>_origin`.
+- on a rosette the midrib may bend away from the axis as well (`Apex.INCURVE` = --recurve's):
+  with every leaf held at the origin, curling only in left thistle's leaves straight -- PQ 0.22
+  against 0.38 (E1 `--recurve`) and 0.36 (E2 `--free-origin`, kept as an experiment switch).
+- margin reader `scripts/leaf_margins.py` (run_apex step `margins` -> `apex/margins/`, in the
+  bundle): per P5x-on-P4g leaf, along its midrib (points placed by tangent projection, across
+  and normal directions over five 0.5 mm stretches): width profile, widest, outline wave and
+  edge-height wave about the margin's running median over one half-width -- amplitude as a
+  robust standard deviation (margin gaps are spikes, not waves), dominant wavelength.
+  First reader: sugarbeet edge waves 0.05-0.41 mm at 3-9 mm; thistle outline (lobes) to
+  0.78 mm, edge to 1.0 mm at 5-11 mm.
+- shared configs: `architecture` no longer set in `/netscratch/naeem/blender_assets/pipeline.conf`
+  or the repo's `./pipeline.conf` (old copies in /netscratch/naeem/_dev/): the profile
+  decides (16-09's sugarbeets were going to run upright); `hf_home` added to the shared one.
+- tests: `test_apex_rosette.py` (origin, outlier leaf, tapers, strip, model), profile tests.
+
+**Through the pipeline** (20:14-21:19, all five 06-10 plants, stamped; logs
+`06-10-2026-Naeem/_campaign/rosette_20261014/`): sugarbeet_x 2 + bud PQ 0.37, thistle_x 6 + bud
+0.38, weed_x 6 + bud 0.39 (this morning 1/5/3 + bud, 0.24/0.40/0.23); gf_1 A-E 1/1/4/1/3,
+PQ 0.15-0.24 and vogelmeere A-G 2/3/1/2/5/5/5 + buds, PQ 0.20-0.43 -- unchanged by tonight's
+rosette work (both stalked, caulescent). Bundle: `06-10-2026-Naeem/_bundles/session_view_20261014_2120.tar.gz`
+(118 MB, five plants, each with `p5x_p4g_before` and `apex/fit_before` = this morning's state;
+`_bundles/pack_20261014.sh` packs it; all ten scenes built headless). Tests: 437 pass, 1 fails
+(`test_a_dataset_config_overrides_a_session_config`: run from inside a dataset, its own
+pipeline.conf is read first and the session's then wins -- plant_job.sh runs from the repo, so
+the Slurm jobs are not affected; open).
+
+**Tried and dropped**: judging every growth candidate instead of stopping at the first
+rejected one: 165 more candidates judged on the three rosettes, none kept, ~25 min an apex.
+
+**Dev results (fit only, before the pipeline rerun)**, PQ: weed_x 0.27 -> 0.39 (4 -> 6 leaves +
+bud), sugarbeet_x 0.27 -> 0.37 (1 -> 2 + bud), thistle_x 0.40 -> 0.38 (5 -> 6 + bud), every
+rosette leaf from the origin; gf_1 unchanged (stalked, caulescent: none of this applies).
+gf_1's drop since the 15:47 bundle is its apices moving with its P5x tree after the P5x fix
+(stem 0, branches 1/6/7/9 instead of 4/5/7/9/10), not the fit.
+
+**Tried and not adopted -- the heart as its own apex** (`/netscratch/naeem/_dev/heart_experiment/`,
+README there; runs in `<plant>/plant/debug/apexdev_heart/`): a second rosette region within the
+shortest P5x leaf of the origin (thistle 17 mm, weed 5, sugarbeet 46 against crowns of 50, 15,
+71), fitted after the crown with the crown's fitted blades as context, the bud moved to it. SAM3
+does mask the heart up close (thistle: 98 masks, 1.3 per view), but the fit kept one weak leaf
+per heart -- PQ 0.06-0.12 there (thistle: 5 TP, 93 of 98 masks missed), sugarbeet's crown fell
+0.37 -> 0.33, weed's heart leaf twinned a crown leaf. The heart's masks lack candidates: the
+pool comes from the whole plant's sources. **Next for the heart**: candidates from the heart's
+own zoomed masks (s2d on them alone), then this experiment again.
+
+### 0.0d The user's Blender look at the four plants (2026-10-14) -- what causes what
+
+Measured with `scripts/p5x_passes.py` (P5x's vote re-run, kept per pass: which SAM3 ids make
+each leaf; reproduces `p5x_p4g` exactly) and `scripts/leaf_margin.py`; outputs in
+`<workdir>/debug/p5x_passes/`, `debug/leaf_relief/`.
+
+- **P4g's leaves are closed shells**: every slab across a leaf is a loop, top and bottom skins
+  1 mm (thistle) to 2-4 mm (sugarbeet) apart, meeting at the margin (`sections_<leaf>.png`).
+  P4g's points are each view's rendered median depth; views above land on the top, views
+  below on the underside of Gaussians that fill a slab. P5x's occlusion tolerance (0.28 mm,
+  2x the sheet thickness) lets a view vote only for the skin facing it.
+- **Two passes cannot outvote each other**: P5x takes each pass's argmax, then the majority
+  over passes, ties to the *lowest leaf id* (`_combine_passes`). With two passes every
+  disagreement is a tie: weed_x 37% of the points both passes label, thistle 5%. Leaks:
+  weed_x leaf 6 won 279 points of leaf 10; thistle leaf 5 lost 2616 to leaves 0-2, 18% of them
+  beyond its traced tip -- its last 2-3 mm (the user's 1b).
+- **SAM3 id switch** (thistle 6/7, the user's 1a): pass 0 followed one leaf as id 4 on frames
+  0-24 and id 8 on 23-36; both on screen on 23-24 makes them a cannot-link pair (>= 2 frames),
+  so they never merge; id 4 overlaps pass 1's id of that leaf by 0.19 (< 0.30) as they sit on
+  opposite skins (1.3 mm apart along the normal).
+- weed_x leaves 3/10 (the user's 1f, under "thistle"; thistle has leaves 0-7 only): one leaf,
+  two skins 1.1 mm apart; pass 1 tracked it as two simultaneous ids (cannot-link), pass 0 as
+  one overlapping both (0.71, 0.77): one link taken, the other refused.
+- Tips: the far end of the leaf's own points along its own graph (k 12, edges <= 3 voxels; not
+  tuned on vogelmeere). Wrong tips come from the labels (above), not the tracer.
+- **The fit's leaf is chickweed's**: start width 1/2 the blade, widest in the middle (tapers
+  0.7/0.7), `TAPER` bound justified by ovate chickweed leaves, a stalk up to a free blade start.
+  Rosette leaves (sugarbeet, thistle) are blade from the base, widest beyond the middle,
+  elongated. weed_x has no profile (DEFAULT: caulescent, gaensefuss's petiole rule).
+- **Rosette origin**: the fit's O starts at the median of the starting leaves' bases (weed_x:
+  6-7 mm above P5x's crown), and nothing ties it to the plant. The P5x leaves' base lines
+  (base end, base direction) meet near one point: weed_x within 1.2 mm median (2.0 max),
+  thistle 1.7 (3.3), sugarbeet 3.9 (7.3); a leaf held low by the pliers does not move it.
+- **Margins** (the user's point 3): a skin's scatter is 0.04 mm at 0.12 mm spacing; sugarbeet
+  margins wave 0.1-1 mm RMS at 6-10 mm wavelength (both sides, three leaves). Thistle's lobes
+  defeat the slab method -- a margin read along the midrib is needed.
+
+**Fixed in P5x the same evening** (`cli/leaf_instances.py`, tests `test_leaf_skins.py`):
+1. `skin_partners`: each seen point's partner on its leaf's other skin -- the first seen point
+   along its normal line either way (normal over 16 seen neighbours; the stored ones are
+   14-19 deg off), mutual only, no distance bound. The unseen points (36-69% of P4g) lie just
+   inside the skins and must be left out, or the search stops on them at 0.3 mm. Partner gaps
+   found: sugarbeet 2-4 mm, thistle 1-2, weed 0.5-1.5, gf_1 0.5-3; 70-84% of seen points paired.
+   Each point adds its partner's votes, per pass.
+2. `face_links`: two ids of one pass whose points are each other's skin partners -- share of
+   one id's points whose partner carries the other >= the merge's 30% -- are linked, the
+   cannot-link pair lifted, ranked with the cross-pass links strongest first. (A first version
+   added the two directions over the smaller id: 70% for weed_x's ids 0/13, which outranked
+   id 13's own cross-pass link and split leaf 2; the share of one id, 38%, does not.)
+3. `_pool_passes`: the passes' weighted votes summed in the merged vocabulary, then the argmax.
+4. (found on the rerun) `skeleton_2d.py` reused `<out>/evidence_2d.json` unless P2 was newer,
+   never checking the `--masks` it was read from: apex's `s2d_zoom` kept the 2D lines of the
+   day's first zoom (14:41) through every rerun -- the 15:27-15:47 fits read them beside fresh
+   zoomed masks -- until SAM3 numbered a zoomed track differently and the colour lookup failed
+   (weed_x, `KeyError: 'zAp0_10'`). Now rebuilt when older than P2 or the given masks, or when
+   it names a track the masks do not hold.
+Dev runs (`<workdir>/debug/p5x_fix/`): weed_x 11 -> 9 leaves (3+10 and 1+11 joined, each two
+skins: same extent, ~1 mm apart along the normal; leaf 9 got back 156 points leaf 1 had won by
+ties); thistle_x 8 -> 7 (6+7 joined by the face link, 58%); sugarbeet_x 5 -> 5 (~99% each);
+gf_1 27 -> 20 (every merged pair overlaps 85-100% in extent, 0.3-1.8 mm apart: skins).
+Thistle leaf 5's tip moved 1.1 mm out (27.0 -> 28.1 mm along the leaf), its strays gone -- the
+tip fix is partial: the lost ties lay mostly beside the tip, not beyond it.
+The pre-fix P5x-on-P4g and fit are kept in `<workdir>/debug/before_fix_20261014/`.
+
+Still open (the user's call): a profile leaf shape for rosettes (no stalk, widest beyond the
+middle, start measured on the plant's own P5x leaves); a weed profile; rosette O at the base
+lines' meeting point, attach 0; viewer `crown` -> `origin` (the viewer is in apex's stamp
+list, so changing it reruns apex); `test_run_pipeline_inputs.py::test_a_dataset_config_
+overrides_a_session_config` fails (run_pipeline.sh's config resolution, not P5x).
+
+Viewing: `scripts/viewer_test.py` builds a bundle's scene headless in a Linux Blender
+(4.2.3; header says how). The viewer's "written before build stamps -- an old file?" is
+false for P5x/s2d skeletons: they carry no `built` stamp.
+
+**`$D` is gone:** `vogelmeere/plant` is the fresh run; `plant_archived/debug` is an older
+subset (no `apex_fit_v3`, `apex_labels`, `apex_zoom_fair`, ...). What is left of v3: the
+annotated skeletons in the unpacked core bundle (`plant_archived/debug/blender_bundle/`)
+and `_campaign/regress/vogelmeere/plant/apex/` (the pipeline's reproduction of v3).
 
 ### 0.1 v3 as built (2026-10-13) — `scripts/apex_fit.py` → `$D/apex_fit_v3/`
 

@@ -273,9 +273,14 @@ class Apex(torch.nn.Module):
     # incurve: 0 (straight) .. 180 deg towards the axis; with --recurve also up to 90 deg away
     INCURVE = (0.0, np.pi)
 
-    def __init__(self, frame, rows, unit, stalk_half, dev):
+    def __init__(self, frame, rows, unit, stalk_half, dev, prior=None, fixed_origin=False):
+        """`prior` (apex_select.leaf_shape_prior, profiles whose leaf_shape is "from_base"): the
+        blade starts at the leaf's base -- no stalk -- with the plant's measured half-width and
+        widest point as its start. `fixed_origin` (rosettes): O stays where the leaves' base
+        lines meet and every leaf joins there (attach 0)."""
         super().__init__()
         self.unit, self.stalk_half = unit, stalk_half                      # world units per mm
+        self.from_base, self.fixed_origin = prior is not None, bool(fixed_origin)
         self.reach_mm = float(frame["reach_mm"])
         t = lambda a: torch.tensor(np.asarray(a, np.float32), device=dev)
         p = lambda a: torch.nn.Parameter(t(a))
@@ -291,9 +296,16 @@ class Apex(torch.nn.Module):
         self.p_kappa = p([logit((r["kappa"] - k0) / (k1 - k0)) for r in rows])
         self.p_legs = p([np.log(r["legs_mm"]) for r in rows])               # (n, 2)
         self.p_blade = p([logit(r["blade"]) for r in rows])
-        self.p_width = p([0.0] * n)                                         # half-width 1/4 of the blade
-        self.p_base = p([logit((0.7 - lo) / (hi - lo))] * n)
-        self.p_tip = p([logit((0.7 - lo) / (hi - lo))] * n)
+        if prior is None:
+            self.p_width = p([0.0] * n)                                     # half-width 1/4 of the blade
+            self.p_base = p([logit((0.7 - lo) / (hi - lo))] * n)
+            self.p_tip = p([logit((0.7 - lo) / (hi - lo))] * n)
+        else:                                                               # the plant's own leaf
+            a0, b0 = apex_select.outline_tapers(prior["widest_at"], lo, hi)
+            share = lambda v: logit(float(np.clip(v, 0.02, 0.98)))
+            self.p_width = p([share(2 * prior["half_share"])] * n)
+            self.p_base = p([share((a0 - lo) / (hi - lo))] * n)
+            self.p_tip = p([share((b0 - lo) / (hi - lo))] * n)
         self.p_roll = p([0.0] * n)                                          # level, upper face to the shoot
         self.p_fold = p([logit(r["fold"] / (0.5 * np.pi)) for r in rows])
         self.active = torch.tensor([bool(r["active"]) for r in rows], device=dev)
@@ -309,12 +321,17 @@ class Apex(torch.nn.Module):
     def shape(self, sel=slice(None)):
         lo, hi = self.TAPER
         attach = self.reach_mm * torch.sigmoid(self.p_h[sel])
+        if self.fixed_origin:                                               # every leaf joins at O
+            attach = torch.zeros_like(attach)
+        blade = torch.sigmoid(self.p_blade[sel])
+        if self.from_base:                                                  # no stalk
+            blade = torch.zeros_like(blade)
         return {"attach_mm": torch.where(self.bud[sel], torch.zeros_like(attach), attach),   # the bud: at O
                 "azimuth": self.phi[sel],
                 "elevation": np.pi * torch.sigmoid(self.p_psi[sel]),
                 "incurve": self.INCURVE[0] + (self.INCURVE[1] - self.INCURVE[0]) * torch.sigmoid(self.p_kappa[sel]),
                 "legs_mm": torch.exp(self.p_legs[sel]),
-                "blade": torch.sigmoid(self.p_blade[sel]),
+                "blade": blade,
                 "half_share": 0.5 * torch.sigmoid(self.p_width[sel]),
                 "a": lo + (hi - lo) * torch.sigmoid(self.p_base[sel]),
                 "b": lo + (hi - lo) * torch.sigmoid(self.p_tip[sel]),
@@ -396,10 +413,7 @@ class Apex(torch.nn.Module):
 # --------------------------------------------------------------------------
 
 
-def rows_in(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Which rows of `a` are rows of `b` (the regions are carved out of the same cloud)."""
-    v = lambda x: np.ascontiguousarray(x, np.float64).view(np.dtype((np.void, 24))).ravel()
-    return np.isin(v(a), v(b))
+rows_in = apex_select.rows_in       # which cloud rows lie in a carved region
 
 
 def context(run: Run, views: Views, in_region: np.ndarray, dev):
@@ -547,8 +561,7 @@ def evaluate(model, views, ctx, keep):
 
 
 def fit(model, views, ctx, iters, log, tag):
-    opt = torch.optim.Adam([
-        {"params": [model.dO], "lr": LR},                                                   # mm
+    opt = torch.optim.Adam(([] if model.fixed_origin else [{"params": [model.dO], "lr": LR}]) + [   # mm
         {"params": [model.p_legs], "lr": LR / 3},                                           # log mm
         {"params": [model.p_h, model.phi, model.p_psi, model.p_kappa, model.a_raw, model.p_roll], "lr": LR},
         {"params": [model.p_blade, model.p_width, model.p_base, model.p_tip, model.p_fold], "lr": 2 * LR}])
@@ -617,7 +630,9 @@ def grow(model, views, ctx, rows, log):
     """Add candidates while one raises J. The candidate ranked best by J as it starts is added
     and everything re-fitted; it stays if the fitted J is higher than before it, else it goes
     and the growing stops. A raw candidate rarely reaches a true positive by itself, so judging
-    it unfitted turned away real leaves."""
+    it unfitted turned away real leaves. (Judging every candidate instead kept none of the 165
+    beyond the first rejected one on 06-10-2026's three rosettes, 2026-10-14, at ~25 min an
+    apex: the ranking by J as they start already puts the useful ones first.)"""
     added, used = [], set()
     while True:
         options = [i for i, r in enumerate(rows) if r.get("group") is not None and r.get("partner_of") is None
@@ -704,7 +719,7 @@ def to_row(curve, frame, unit, blade, **extra):
     O, a, e1 = frame["node"], frame["axis"], frame["e1"]
     e2 = np.cross(a, e1)
     X = resample(curve, 32)
-    h = float(np.clip(-((X[0] - O) @ a) / unit, 0.0, frame["reach_mm"]))
+    h = 0.0 if frame.get("fixed_origin") else float(np.clip(-((X[0] - O) @ a) / unit, 0.0, frame["reach_mm"]))
     v = X[-1] - O
     v = v - (v @ a) * a
     phi = float(np.arctan2(v @ e2, v @ e1))
@@ -847,6 +862,8 @@ def main():
     ap.add_argument("--iters", type=int, default=ITERS)
     ap.add_argument("--recurve", action="store_true",
                     help="let a midrib also bend away from the shoot (to 90 deg), not only towards it")
+    ap.add_argument("--free-origin", action="store_true",
+                    help="a rosette's O and its leaves' attach fitted, not fixed at its origin (experiments)")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -863,6 +880,24 @@ def main():
     unit = 1.0 / mpu                                                        # world units per mm
     run = Run(args.workdir)
     regions = dict(np.load(args.regions))
+    # the plant's own leaf (profiles whose leaf_shape is "from_base": blade from the base)
+    prior = apex_select.leaf_shape_prior(run) if profile.leaf_shape == "from_base" else None
+    if prior:
+        apex_select.SHAPE = prior
+        print(f"  leaf shape from the base, measured on {prior['leaves']} P5x leaves: half-width "
+              f"{prior['half_share']:.2f} of the blade's length, widest at {prior['widest_at']:.2f} of it", flush=True)
+    # a rosette's apex is its origin (apex_regions.rosette_origin): O stays there, leaves join it
+    info = Path(args.regions).with_suffix(".json")
+    ends = json.loads(info.read_text()).get("apices", {}) if info.exists() else {}
+    origin = {k: np.asarray(v["end_world"], float) for k, v in ends.items()
+              if v.get("end") == "origin" and not args.free_origin}
+    # A rosette's leaves arch out from its origin: their midribs bend away from the axis as well
+    # as towards it. (Curling only in is a young apex leaf's, wrapped over the bud; with every
+    # thistle_x leaf held at the origin it left them straight and missed the arching ones --
+    # PQ 0.22 against 0.38 with both ways, 2026-10-14.)
+    if any(v.get("end") == "origin" for v in ends.values()):
+        Apex.INCURVE = (-0.5 * np.pi, np.pi)
+        print("  a rosette: midribs may bend away from the axis as well as towards it", flush=True)
     skeleton = json.loads((args.init / "skeleton.json").read_text())
     lines = trunk_lines(run, run.skeleton)                                   # P5x's own tree
     log = lambda s: print(s, flush=True)
@@ -889,12 +924,15 @@ def main():
                 sel.append((run.to_world(np.asarray(leaf["curve"], float)), leaf))
         if not sel:
             continue
-        node = np.median(np.stack([c[0] for c, _ in sel]), axis=0)
+        node = origin.get(name)
+        if node is None:
+            node = np.median(np.stack([c[0] for c, _ in sel]), axis=0)
         frame = apex_frame(node, [c[-1] for c, _ in sel], lines, reach, unit, run.rotation[2])
+        frame["fixed_origin"] = name in origin
         rows = pool(run, skeleton, frame, name, unit, cands.get(name, []), sel)
         views = Views(run, args.zoom, apex, train, dev)
         ctx = context(run, views, rows_in(run.points, pts), dev)
-        model = Apex(frame, rows, unit, 0.5 * run.voxel, dev)
+        model = Apex(frame, rows, unit, 0.5 * run.voxel, dev, prior=prior, fixed_origin=frame["fixed_origin"])
         n_start = int((model.active & ~model.bud).sum())
         n_pairs = sum(r.get("partner_of") is not None for r in rows)
         log(f"  {name}: {n_start} leaves from the selection + bud, {n_pairs} partners and "
@@ -1006,7 +1044,8 @@ def main():
                 "tip": curve[-1].tolist(), "base": curve[bi].tolist(), "curve": curve.round(6).tolist(),
                 "blade_start": bi, "midrib": curve[bi:].round(6).tolist(),
                 "petiole": curve[:bi + 1].round(6).tolist() if bi > 0 else [],
-                "starts_on": "stem" if trunks else "crown", "colour_bgr": list(f["colours"][j]),
+                "starts_on": "stem" if trunks else ("origin" if name in origin else "crown"),
+                "colour_bgr": list(f["colours"][j]),
                 "midrib_mm": float(f["L"][j] * (1 - b) * mpu),
                 "blade": {"length_mm": round(float(f["L"][j] * (1 - b) * mpu), 3),
                           "width_mm": round(float(2 * f["half"][j].max() * mpu), 3),
@@ -1032,10 +1071,30 @@ def main():
             b = int(np.argmin(np.linalg.norm(curve - blade_at, axis=1)))
             l.update(curve=curve.tolist(), blade_start=b, base=curve[b].tolist(),
                      midrib=curve[b:].tolist(), petiole=curve[:b + 1].tolist() if b > 0 else [])
+    # a rosette: every leaf starts at its origin -- the P5x leaves kept beside the fitted ones
+    # too, which P5x traced from where its graph first reaches them (weed_x: 8-12 mm off it)
+    plant_origin = None
+    if origin:
+        plant_origin = to_plant(next(iter(origin.values())))
+        for l in out:
+            C = np.asarray(l.get("curve") or [], float)
+            if l.get("apex") or len(C) < 2 or np.linalg.norm(C[0] - plant_origin) <= run.voxel:
+                continue
+            curve = smooth_curve(np.vstack([plant_origin, C]), run.voxel)
+            if prior:                                # the blade runs from the base: no petiole
+                l.update(curve=curve.tolist(), blade_start=0, base=curve[0].tolist(),
+                         midrib=curve.tolist(), petiole=[], starts_on="origin")
+            else:
+                blade_at = C[int(l.get("blade_start") or 0)]
+                b = int(np.argmin(np.linalg.norm(curve - blade_at, axis=1)))
+                l.update(curve=curve.tolist(), blade_start=b, base=curve[b].tolist(), midrib=curve[b:].tolist(),
+                         petiole=curve[:b + 1].tolist() if b > 0 else [], starts_on="origin")
     for i, l in enumerate(out):
         l["id"] = i
     main_axis = next((x for x in axes if x["kind"] == "stem"), None)
-    doc = dict(skeleton, leaves=out, axes=axes, apices=apices,
+    extra = {"origin": plant_origin.round(6).tolist(), "crown": plant_origin.round(6).tolist()} \
+        if plant_origin is not None else {}
+    doc = dict(skeleton, leaves=out, axes=axes, apices=apices, **extra,
                stem=main_axis["points"] if main_axis else skeleton.get("stem", []),
                built={"by": "scripts/apex_fit.py", "at": time.strftime("%Y-%m-%d %H:%M:%S"),
                       "init": str(args.init), "train": args.train})
@@ -1044,6 +1103,8 @@ def main():
                           "iters": args.iters, "refit": REFIT, "add_refit": ADD_REFIT, "lr": LR,
                           "train": args.train, "init": str(args.init), "evidence": str(args.evidence),
                           "incurve_range_deg": [round(float(np.degrees(x))) for x in Apex.INCURVE],
+                          "leaf_shape": profile.leaf_shape, "leaf_shape_prior": prior,
+                          "origin_fixed": sorted(origin),
                           "candidates": [str(c) for c in args.candidates]}
     (args.out / "fit.json").write_text(json.dumps(report, indent=1))
     n_leaves = sum(a["leaves"] for a in apices.values())

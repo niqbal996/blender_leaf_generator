@@ -14,6 +14,13 @@
 #   fit/       apex_fit.py       the fitted leaves: skeleton.json, apex_<X>.jpg, fit.json,
 #                                leaf_support.txt (apex_fit_check.py)
 #   fit_heldout/                 with APEX_HELDOUT=1: fitted on even frames, scored on odd
+#   margins/   leaf_margins.py   per P5x-on-P4g leaf: width profile, outline and edge-height waves
+#   curvature/ leaf_curvature.py each P5x-on-P4g leaf flattened: its cup across and its wavy edge,
+#                                and the plant's model of them (for flat leaf assets in Blender)
+#   flatlay/   flatlay_match.py  with <specimen>/leaf_pose (the leaves laid flat after the capture):
+#                                each flat-lay leaf matched to a P5x leaf by outline
+#   templates/ template_fit.py   every flat-lay leaf placed on the plant -- its true outline and
+#                                length, its pose fitted to P4g -- skeleton.json, template_fit.jpg
 #   labels/    apex_labels.py    scores against hand-drawn leaf lines, where there are any
 #   bundle/    make_bundle.sh    <plant>_view_<stamp>.tar.gz for Blender, and how to open it
 #
@@ -33,7 +40,7 @@ A="$WD/apex"
 mkdir -p "$A"
 step() { echo "--- $(date '+%H:%M:%S') $1"; }
 
-for need in p5x/skeleton.json p5x_p4g/skeleton.json s2d/skeleton.json tag_scale.json; do
+for need in p5x/skeleton.json p5x_p4g/skeleton.json s2d/skeleton.json s2d/masks.npz tag_scale.json; do
     [[ -f "$WD/$need" ]] || { echo "run_apex: no $WD/$need -- run the phases before apex first" >&2; exit 1; }
 done
 
@@ -49,7 +56,8 @@ R="$A/regions/apex_regions.npz"
 
 step "zoom: SAM3 on each apex's square, every frame ($N apices)"
 mkdir -p "$A/zoom"
-"$PY" "$REPO/scripts/apex_zoom.py" --workdir "$WD" --out "$A/zoom" --regions "$R" 2>&1 | tee "$A/zoom/run.log"
+"$PY" "$REPO/scripts/apex_zoom.py" --workdir "$WD" --skeleton "$WD/s2d/skeleton.json" \
+    --masks "$WD/s2d/masks.npz" --out "$A/zoom" --regions "$R" 2>&1 | tee "$A/zoom/run.log"
 
 step "s2d_zoom: 2D leaf lines on the zoomed masks"
 mkdir -p "$A/s2d_zoom"
@@ -69,6 +77,14 @@ fit() {   # fit <out> <train>
         --evidence "$A/s2d_zoom/evidence_2d.json" --candidates "${CANDS[@]}" --train "$2" --out "$1" \
         > "$1/run.log" 2>&1
 }
+# gsplat compiles its CUDA kernels on first use, and its import deletes the build lock (and, on
+# a cold cache, the build folder): plants run side by side built over each other on 2026-10-14.
+# One import under a lock of our own builds them once; the fits after it find them built.
+TX="${TORCH_EXTENSIONS_DIR:-$HOME/.cache/torch_extensions}"
+mkdir -p "$TX"
+flock "$TX/gsplat_build.lock" "$PY" -c "import gsplat.cuda._backend as b; raise SystemExit(b._C is None)" \
+    || { echo "run_apex: gsplat's CUDA kernels did not build" >&2; exit 1; }
+
 step "fit: every apex leaf shaped to the photos$([[ "$APEX_HELDOUT" == 1 ]] && echo ', and a held-out run beside it')"
 held=""
 if [[ "$APEX_HELDOUT" == 1 ]]; then
@@ -86,7 +102,34 @@ step "check: counts, shape, instance scores, per-leaf support"
     > "$A/fit/check.full.log" 2>&1 || { tail -20 "$A/fit/check.full.log"; exit 1; }
 grep -v "^  fit_apex" "$A/fit/check.full.log" | tee "$A/fit/check.log"
 
+step "margins: each leaf's width, teeth and wavy edge, read off P4g's leaf shell"
+mkdir -p "$A/margins"
+"$PY" "$REPO/scripts/leaf_margins.py" --workdir "$WD" --out "$A/margins" > "$A/margins/run.log" 2>&1 \
+    || { tail -20 "$A/margins/run.log"; exit 1; }
+tail -1 "$A/margins/run.log"
+
+step "curvature: each leaf flattened, its cup and its wavy edge"
+mkdir -p "$A/curvature"
+"$PY" "$REPO/scripts/leaf_curvature.py" --workdir "$WD" --out "$A/curvature" > "$A/curvature/run.log" 2>&1 \
+    || { tail -20 "$A/curvature/run.log"; exit 1; }
+grep -E "plant model|wrote" "$A/curvature/run.log" | cut -c1-200 || true
+
 SKEL=("$WD/p5x" "$A/select" "$A/fit")
+FLAT="$(dirname "$WD")/leaf_pose"
+TEMPLATES=""
+if [[ -f "$FLAT/leaves.json" ]]; then
+    step "templates: every leaf of the flat-lay ($FLAT) placed on the plant"
+    mkdir -p "$A/flatlay" "$A/templates"
+    "$PY" "$REPO/scripts/flatlay_match.py" --workdir "$WD" --flat "$FLAT" --curvature "$A/curvature" \
+        --out "$A/flatlay" > "$A/flatlay/run.log" 2>&1 || { tail -20 "$A/flatlay/run.log"; exit 1; }
+    grep -E "<->|no P5x" "$A/flatlay/run.log" || true
+    "$PY" "$REPO/scripts/template_fit.py" --workdir "$WD" --flat "$FLAT" --match "$A/flatlay/flatlay_match.json" \
+        --base slide --out "$A/templates" > "$A/templates/run.log" 2>&1 || { tail -20 "$A/templates/run.log"; exit 1; }
+    grep -E "^  flat-lay|stage|wrote" "$A/templates/run.log" | cut -c1-220 || true
+    TEMPLATES="$A/templates"
+else
+    echo "  (no $FLAT/leaves.json: no flat-lay templates)"
+fi
 if compgen -G "$WD/p1/frames/frame_*.json" > /dev/null; then
     step "labels: scored against the hand-drawn leaf lines"
     mkdir -p "$A/labels"
@@ -96,4 +139,4 @@ if compgen -G "$WD/p1/frames/frame_*.json" > /dev/null; then
 fi
 
 step "bundle: for Blender"
-"$REPO/scripts/make_bundle.sh" "$WD" "${SKEL[@]}"
+"$REPO/scripts/make_bundle.sh" "$WD" "${SKEL[@]}" ${TEMPLATES:+"$TEMPLATES"}

@@ -59,10 +59,51 @@ def leaf_length(run: Run) -> float:
     return float(np.median(L)) if L else 0.0
 
 
+def rosette_origin(run: Run):
+    """Where a rosette's leaves start: the point nearest every P5x leaf's base line -- its blade's
+    base end, and the direction from a sixth of the way up the blade back to it -- in the sum
+    of distances (Weiszfeld's iteration, so a leaf held off its line by the pliers does not pull
+    it), or None with fewer than two leaves. Measured on 06-10-2026 (2026-10-14): weed_x's 11
+    base lines pass within 1.2 mm of it (median; 2.0 max), thistle_x 1.7, sugarbeet_x 3.9 --
+    4-7 mm from P5x's crown, which is the foot of the stem tissue, not where the leaves meet.
+    Returns (origin, each line's distance from it) in world units."""
+    P, D = [], []
+    for leaf in run.skeleton.get("leaves", []):
+        m = np.asarray(leaf.get("midrib") or [], float)
+        if len(m) < 4:
+            continue
+        m = run.to_world(m)
+        base, up = m[0], m[min(len(m) - 1, max(2, len(m) // 6))]
+        d = base - up
+        if np.linalg.norm(d) > 0:
+            P.append(base)
+            D.append(d / np.linalg.norm(d))
+    if len(P) < 2:
+        return None
+    P, D = np.asarray(P), np.asarray(D)
+    proj = np.eye(3)[None] - D[:, :, None] * D[:, None, :]          # onto each line's normal plane
+    dist = lambda x: np.linalg.norm(np.einsum("nij,nj->ni", proj, x - P), axis=1)
+    x = np.linalg.solve(proj.sum(0), np.einsum("nij,nj->i", proj, P))   # least squares to start
+    for _ in range(50):
+        w = 1.0 / np.maximum(dist(x), 1e-9)
+        x_new = np.linalg.solve((w[:, None, None] * proj).sum(0), np.einsum("n,nij,nj->i", w, proj, P))
+        if np.linalg.norm(x_new - x) < 1e-12:
+            break
+        x = x_new
+    return x, dist(x)
+
+
 def automatic(run: Run, arch: str, mpu: float):
     sk = run.skeleton
     if arch == "rosette":
-        ends = [("crown", run.to_world(np.asarray(sk["crown"], float).reshape(1, 3))[0])] if sk.get("crown") else []
+        found = rosette_origin(run)
+        if found is not None:
+            o, d = found
+            print(f"  the rosette's origin: where its {len(d)} leaves' base lines meet, each within "
+                  f"{np.median(d) * mpu:.1f} mm of it (median; {d.max() * mpu:.1f} max)")
+            ends = [("origin", o)]
+        else:
+            ends = [("crown", run.to_world(np.asarray(sk["crown"], float).reshape(1, 3))[0])] if sk.get("crown") else []
     else:
         ends = [(f"{a['kind']} {a['id']}", run.to_world(a["points"])[-1]) for a in sk.get("axes") or []
                 if a["kind"] in ("stem", "branch") and len(a["points"]) >= 2]
@@ -80,7 +121,7 @@ def automatic(run: Run, arch: str, mpu: float):
         if leaves:
             found.append((run.points[region], {"rule": f"automatic: the {what} end, within one median leaf "
                                                        f"({R * mpu:.1f} mm)", "end_world": e.tolist(),
-                                               "p5x_leaves": leaves}))
+                                               "end": what, "p5x_leaves": leaves}))
         else:
             print(f"  the {what} end: no P5x leaf mostly within {R * mpu:.1f} mm -- not an apex")
     return {f"apex_{string.ascii_uppercase[k]}": v for k, v in enumerate(found)}

@@ -45,6 +45,15 @@ per pass for a plant the flat lay counts at 34 leaves -- and the dominant
 error was the cross-pass merge chaining *distinct* leaves together; see
 `merge_across_passes`.
 
+**Two skins, two passes, one vote.** A fine cloud (P4g) draws each leaf as a closed shell,
+a top and a bottom skin that a view sees one at a time. Each seen point takes the votes of
+its partner on the other skin (`skin_partners`), so both skins carry the ids seen from above
+and from below; two ids of one pass that are a leaf's two faces -- SAM3 renames a leaf when
+it turns its underside to the camera -- are linked although SAM3 showed them apart
+(`face_links`); and the passes' votes are pooled in the merged vocabulary before the argmax
+(`_pool_passes`), where a per-pass winner and a majority made every two-pass disagreement a
+tie for the lower id.
+
 Reads:
     p2/masks/leaf_instances/<id>/*.png   the 2D ids, from --backend sam3
     p2/masks/stem/*.png, masks/root/*.png
@@ -78,13 +87,12 @@ from pose_estimator.semantic import (
     cast_votes,
     colors_from_surfels,
     estimate_normals,
-    finalise_votes,
     render_points,
     surface_scale,
     view_weights,
     visible_only,
 )
-from pose_estimator.leaf_skeleton import trace
+from pose_estimator.leaf_skeleton import UNASSIGNED, trace
 from pose_estimator.cli.report import print_checks
 
 # Sentinels in instances.npy, chosen so a leaf index stays a plain 0-based
@@ -95,11 +103,24 @@ ROOT = -3
 
 SKELETON_RGB = (200, 200, 200)
 ROOT_RGB = (240, 140, 40)
+UNASSIGNED_RGB = (120, 150, 105)          # a rosette's leaf tissue of no known leaf: leaf-ish, muted
 
-# finalise_votes returns int8 labels, so the vote can distinguish at most 127
-# classes and two of those are the stem and root. Well clear of any real leaf
-# count, but a fragmented run can produce more ids than leaves, so it is
-# checked rather than assumed.
+
+def no_stem_on_rosette(assignment: np.ndarray, architecture: Optional[str]) -> int:
+    """A rosette has no stem (the user, 2026-10-15). What P2's stem mask covers on one is the plant
+    tissue SAM3's leaf prompt left unclaimed -- leaf bases, the heart's young leaves -- and what SAM3's
+    "stem" phrase grabs there (thick midribs, sheathing bases): leaf tissue, of no known leaf. So on a
+    rosette the stem votes become UNASSIGNED, not SKELETON: the cloud has no stem, and the tracer still
+    stands the crown on that tissue and routes the leaves through it, as before. Returns how many."""
+    if architecture != "rosette":
+        return 0
+    stem = assignment == SKELETON
+    assignment[stem] = UNASSIGNED
+    return int(stem.sum())
+
+# More ids in one pass than this is fragmentation, not leaves (the bound the int8
+# labels of finalise_votes once set, kept as that check: well clear of any real
+# leaf count, but a fragmented run can produce more ids than leaves).
 MAX_VOTED_CLASSES = 127
 
 # Two ids of one pass that SAM3 shows on the same frame overlapping less than
@@ -241,7 +262,8 @@ def cannot_link_pairs(co_visible: Dict[str, Dict[tuple, int]],
 
 def merge_across_passes(per_pass: Dict[str, np.ndarray], counts: Dict[str, int],
                         overlap_fraction: float, cannot_link: Optional[set] = None,
-                        stats: Optional[dict] = None) -> Dict[tuple, int]:
+                        stats: Optional[dict] = None,
+                        extra_links: Sequence[tuple] = ()) -> Dict[tuple, int]:
     """Match each pass's leaf labels to the other passes', by 3D overlap.
 
     Every pass labels the *same* cloud, so the correspondence the 2D tracker
@@ -266,6 +288,10 @@ def merge_across_passes(per_pass: Dict[str, np.ndarray], counts: Dict[str, int],
 
     `stats`, if given, receives the number of links refused.
 
+    `extra_links` are more (share, shared points, key, key) links to rank with these, e.g.
+    two ids of one pass that are the two faces of one leaf (`face_links`); a link whose key
+    won no points is skipped.
+
     Returns {(pass, local index) -> merged leaf id}.
     """
     cannot_link = cannot_link or set()
@@ -286,6 +312,8 @@ def merge_across_passes(per_pass: Dict[str, np.ndarray], counts: Dict[str, int],
                 smaller = min(counts.get(ka, 0), counts.get(kb, 0))
                 if smaller and n >= overlap_fraction * smaller:
                     links.append((n / smaller, int(n), ka, kb))
+    links += [link for link in extra_links
+              if counts.get(link[2], 0) > 0 and counts.get(link[3], 0) > 0]
     # Strongest share first, larger absolute overlap breaking ties, then the
     # keys themselves so the result never depends on dict order.
     links.sort(key=lambda link: (-link[0], -link[1], link[2], link[3]))
@@ -482,6 +510,149 @@ def frames_by_pass(workdir: Path, by_pass: Dict[str, List[Path]]) -> Dict[str, s
     return out
 
 
+def skin_partners(points: np.ndarray, seen: np.ndarray, k: int = 16) -> np.ndarray:
+    """Each seen point's partner on the other skin of its leaf, or -1.
+
+    P4g draws a leaf as a closed shell: every cut across it is a loop, a top and a bottom
+    skin 1-4 mm apart that meet at the margin (06-10-2026 session, 2026-10-14: thistle 1-2 mm,
+    weed_x 0.5-1.5, sugarbeet 2-4). Its points are each view's rendered depth, so a view
+    from above lands on one skin and one from below on the other, and the occlusion test --
+    rightly -- lets a view vote only for the skin facing it. Each skin then carries only its
+    own side's ids: a leaf SAM3 renamed when it turned its underside to the camera arrives as
+    two leaves, one per skin, sharing no points to merge them by.
+
+    The partner is the first seen point along the point's normal line, either way: past its
+    own sheet (one point spacing beyond the sheet's thickness), within one spacing of the
+    line, nearer than anything the other way. Only seen points take part: the unseen ones
+    lie just inside the skins (median 0.13-0.26 mm from a seen point) and stop the search at
+    once. A pair is kept only if mutual -- the partner's own first hit lands nearer to the
+    point than the partner is -- so a skin facing another leaf across open air keeps none.
+    Normals are each point's least-variance axis over its `k` nearest seen points (the
+    stored ones are 14-19 deg off, median, on P4g). No distance bound: a search that meets
+    nothing ends at the cloud's extent.
+    """
+    from scipy.spatial import cKDTree
+
+    out = np.full(len(points), -1, np.int64)
+    idx = np.flatnonzero(seen)
+    if len(idx) < k + 1:
+        return out
+    P = points[idx]
+    tree = cKDTree(P)
+    spacing = float(np.median(tree.query(P, k=2, workers=-1)[0][:, 1]))
+    normals = np.empty_like(P)
+    least = np.empty(len(P))
+    for a in range(0, len(P), 200_000):
+        _, nb = tree.query(P[a:a + 200_000], k=k, workers=-1)
+        Q = P[nb] - P[nb].mean(axis=1, keepdims=True)
+        w, v = np.linalg.eigh(np.einsum("nki,nkj->nij", Q, Q) / (k - 1))
+        normals[a:a + 200_000], least[a:a + 200_000] = v[:, :, 0], w[:, 0]
+    thickness = float(np.median(2.0 * np.sqrt(np.maximum(least, 0.0))))
+    reach = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0)))
+
+    best = np.full(len(P), np.inf)
+    hit = np.full(len(P), -1, np.int64)
+    for sign in (1.0, -1.0):
+        todo, s = np.arange(len(P)), thickness + spacing
+        while len(todo) and s <= reach:
+            d, q = tree.query(P[todo] + sign * s * normals[todo], distance_upper_bound=spacing,
+                              workers=-1)
+            found = np.isfinite(d)
+            better = found & (s < best[todo])
+            best[todo[better]], hit[todo[better]] = s, q[better]
+            todo = todo[~found & (s + spacing < best[todo])]
+            s += spacing
+    has = np.flatnonzero(hit >= 0)
+    back = hit[hit[has]]
+    mutual = (back >= 0) & (np.linalg.norm(P[np.maximum(back, 0)] - P[has], axis=1)
+                            < np.linalg.norm(P[hit[has]] - P[has], axis=1))
+    out[idx[has[mutual]]] = idx[hit[has[mutual]]]
+    return out
+
+
+def face_links(raw: Dict[str, np.ndarray], partners: np.ndarray, counts: Dict[tuple, int],
+               share: float) -> List[tuple]:
+    """Links between two ids of one pass that are the two faces of one leaf.
+
+    SAM3 gives a leaf a new id when it turns from its upper face to its underside (thistle_x,
+    pass 0: id 4 on frames 0-24, shrinking to a sliver, id 8 from frame 23, growing; on 23-24
+    both on screen, disjoint). Being on screen together makes them a cannot-link pair, so
+    nothing could ever join them. In 3D the evidence is plain: one id's points are the other
+    id's skin partners. Two ids are linked here when the share of one id's points whose
+    partner carries the other reaches `share` -- the bar the cross-pass merge uses for "the
+    same leaf", and ranked with its links by that share, strongest first. (weed_x: pass 1's
+    id 14 lies on the other face of id 5, 62% of its points; id 13, 38%, lies partly on leaf
+    5's underside and partly on leaf 2, and its cross-pass link to leaf 2, 52%, comes first.)
+    `raw` is each pass's labels before the skins share votes.
+
+    Returns (share, pairs, key, key) links for `merge_across_passes`.
+    """
+    links = []
+    has = partners >= 0
+    for prefix, labels in raw.items():
+        a, b = labels[has], labels[partners[has]]
+        keep = (a >= 0) & (b >= 0) & (a != b)
+        if not keep.any():
+            continue
+        pairs, n = np.unique(np.stack([a[keep], b[keep]], axis=1), axis=0, return_counts=True)
+        directed = {(int(x), int(y)): int(k) for (x, y), k in zip(pairs.tolist(), n.tolist())}
+        for x, y in sorted({tuple(sorted(xy)) for xy in directed}):
+            ka, kb = (prefix, x), (prefix, y)
+            shares = [(directed.get((x, y), 0) / counts[ka], directed.get((x, y), 0))
+                      if counts.get(ka) else (0.0, 0),
+                      (directed.get((y, x), 0) / counts[kb], directed.get((y, x), 0))
+                      if counts.get(kb) else (0.0, 0)]
+            best, k = max(shares)
+            if best >= share:
+                links.append((best, k, ka, kb))
+    return links
+
+
+def _pool_passes(weights: Dict[str, np.ndarray], merged: Dict[tuple, int],
+                 n_points: int) -> np.ndarray:
+    """One label per point: every pass's weighted votes, in the merged vocabulary, summed.
+
+    Each pass's ids are translated to the leaf they merged into and its votes added up, stem
+    and root alike, then the argmax -- one vote per view over the whole capture. Taking each
+    pass's own winner and then the majority over passes (`_combine_passes`) made every
+    disagreement between two passes a 1:1 tie, settled toward the lower leaf id: 37% of the
+    points both passes call a leaf on weed_x, 12% on sugarbeet_x, 5% on thistle_x
+    (2026-10-14). Lower-numbered leaves spread over their neighbours (weed_x leaf 6 over 10),
+    and higher-numbered ones lost their tips (thistle_x leaf 5, its last 2-3 mm).
+    `weights[prefix]` is (points, ids + 2): that pass's ids, then stem, then root.
+    """
+    groups = (max(merged.values()) + 1) if merged else 0
+    total = np.zeros((n_points, groups + 2), np.float32)
+    for prefix, W in weights.items():
+        n_leaf = W.shape[1] - 2
+        for index in range(n_leaf):
+            group = merged.get((prefix, index))
+            if group is not None:
+                total[:, group] += W[:, index]
+        total[:, groups] += W[:, n_leaf]
+        total[:, groups + 1] += W[:, n_leaf + 1]
+    assignment = np.full(n_points, UNSEEN, np.int32)
+    decided = total.sum(axis=1) > 0
+    best = total.argmax(axis=1)
+    leaf = decided & (best < groups)
+    assignment[leaf] = best[leaf]
+    assignment[decided & (best == groups)] = SKELETON
+    assignment[decided & (best == groups + 1)] = ROOT
+    return assignment
+
+
+def _pass_labels(W: np.ndarray, n_leaf: int) -> np.ndarray:
+    """A pass's own winner per point: its leaf index, SKELETON, ROOT, or UNSEEN."""
+    labels = np.full(len(W), UNSEEN, np.int32)
+    decided = W.sum(axis=1) > 0
+    best = W.argmax(axis=1)
+    leaf = decided & (best < n_leaf)
+    labels[leaf] = best[leaf]
+    labels[decided & (best == n_leaf)] = SKELETON
+    labels[decided & (best == n_leaf + 1)] = ROOT
+    return labels
+
+
 def _combine_passes(per_pass: Dict[str, np.ndarray], merged: Dict[tuple, int],
                     n_points: int) -> np.ndarray:
     """One label per point, from what each pass said about it.
@@ -628,6 +799,7 @@ def run(
     # leaves arguing over the same class index.
     per_pass: Dict[str, np.ndarray] = {}
     leaf_counts: Dict[tuple, int] = {}
+    pass_votes: Dict[str, np.ndarray] = {}        # each pass's weighted votes, kept to pool
     co_visible: Dict[str, Dict[tuple, int]] = {}
     used = 0
     for prefix, dirs in sorted(by_pass.items()):
@@ -665,15 +837,8 @@ def run(
             seen_here += 1
         used += seen_here
 
-        voted = finalise_votes(tally).labels.astype(np.int32)
-        labels = np.full(len(points), UNSEEN, np.int32)
-        is_leaf = (voted >= 0) & (voted < len(dirs))
-        labels[is_leaf] = voted[is_leaf]
-        labels[voted == stem_class] = SKELETON
-        labels[voted == root_class] = ROOT
-        per_pass[prefix] = labels
-        for index in range(len(dirs)):
-            leaf_counts[(prefix, index)] = int((labels == index).sum())
+        pass_votes[prefix] = tally["weight"].astype(np.float32)
+        labels = _pass_labels(pass_votes[prefix], len(dirs))
         print(f"    pass {prefix or '(single)'}: {len(dirs)} ids over {seen_here} views, "
               f"{int((labels >= 0).sum())} leaf points")
 
@@ -687,10 +852,38 @@ def run(
               "hidden behind the visible surface, which would have voted for what is in front")
 
     total_views = sum(len(frames_of_pass.get(prefix, image_ids)) for prefix in by_pass)
+
+    # A leaf's two skins are one leaf: each takes its partner's votes too (`skin_partners`),
+    # so both carry the ids of the views above and below it.
+    raw = {prefix: _pass_labels(W, len(by_pass[prefix])) for prefix, W in pass_votes.items()}
+    raw_counts = {(prefix, i): int((labels == i).sum())
+                  for prefix, labels in raw.items() for i in range(len(by_pass[prefix]))}
+    seen = np.zeros(len(points), bool)
+    for W in pass_votes.values():
+        seen |= W.sum(axis=1) > 0
+    partners = skin_partners(points, seen)
+    paired = partners >= 0
+    print(f"  skins: {int(paired.sum())} of {int(seen.sum())} seen points paired with the other "
+          "skin of their leaf; each takes its partner's votes")
+    for prefix, W in pass_votes.items():
+        W[paired] += W[partners[paired]]
+    per_pass = {prefix: _pass_labels(W, len(by_pass[prefix])) for prefix, W in pass_votes.items()}
+    leaf_counts = {(prefix, i): int((labels == i).sum())
+                   for prefix, labels in per_pass.items() for i in range(len(by_pass[prefix]))}
+
     cannot_link = cannot_link_pairs(co_visible, covisible_frames)
+    faces = face_links(raw, partners, raw_counts, merge_overlap)
+    name = lambda key: by_pass[key[0]][key[1]].name
+    overruled = {pair for pair in cannot_link
+                 if any(pair == frozenset((a, b)) for _, _, a, b in faces)}
+    cannot_link -= overruled
+    for link_share, n, a, b in faces:
+        print(f"  {name(a)} and {name(b)} may be the two faces of one leaf: {n} points of one "
+              f"({link_share:.0%}) partner the other's skin"
+              + (" -- shown apart by SAM3, joined" if frozenset((a, b)) in overruled else ""))
     merge_stats: dict = {}
     merged = merge_across_passes(per_pass, leaf_counts, merge_overlap,
-                                 cannot_link=cannot_link, stats=merge_stats)
+                                 cannot_link=cannot_link, stats=merge_stats, extra_links=faces)
     if len(by_pass) > 1:
         n_groups = len(set(merged.values())) if merged else 0
         print(f"  {len(leaf_counts)} per-pass ids merged into {n_groups} leaves by 3D overlap "
@@ -700,7 +893,8 @@ def run(
                   f"on >= {covisible_frames} frames; {merge_stats['links_refused']} merge(s) "
                   "refused for joining such a pair")
 
-    assignment = _combine_passes(per_pass, merged, len(points))
+    assignment = _pool_passes(pass_votes, merged, len(points))
+    del pass_votes
 
     # A leaf that won only a handful of points is not a leaf in 3D whatever it
     # was in 2D; its points are more usefully skeleton than a spurious organ.
@@ -740,6 +934,10 @@ def run(
     # --- the skeleton, traced through tissue whose identity is already known ---
     voxel, voxel_origin = cloud_source.voxel_size(workdir, geometry_backend, points)
     architecture = _architecture(workdir, geometry_backend)
+    n_unassigned = no_stem_on_rosette(assignment, architecture)
+    if n_unassigned:
+        print(f"  a rosette has no stem: {n_unassigned} points P2's stem mask covered are leaf tissue of no "
+              f"known leaf (label {UNASSIGNED})")
     skeleton = trace(points, assignment, voxel, architecture=architecture)
     skeleton["architecture"] = architecture
     if skeleton.get("crown_moved_to_largest_component"):
@@ -770,7 +968,11 @@ def run(
                                    "per_pass_ids": len(leaf_counts),
                                    "groups": len(set(merged.values())) if merged else 0,
                                    "cannot_link_pairs": len(cannot_link),
-                                   "links_refused": merge_stats.get("links_refused", 0)},
+                                   "links_refused": merge_stats.get("links_refused", 0),
+                                   "skin_pairs": int(paired.sum()), "seen_points": int(seen.sum()),
+                                   "face_links": [[name(a), name(b), round(sh, 3)]
+                                                  for sh, _, a, b in faces],
+                                   "combine": "pooled votes"},
                             visibility={"occlusion_test": occlusion_test,
                                         "point_spacing": spacing, "depth_tolerance": tolerance,
                                         "hidden_pixels_dropped": (hidden[0] / hidden[1]
@@ -860,6 +1062,7 @@ def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
     rgb = np.zeros((len(points), 3), np.uint8)
     rgb[:] = (70, 70, 70)                                  # unseen
     rgb[assignment == SKELETON] = SKELETON_RGB
+    rgb[assignment == UNASSIGNED] = UNASSIGNED_RGB
     rgb[assignment == ROOT] = ROOT_RGB
     for index in surviving:
         rgb[assignment == index] = palette[index % len(palette)]
@@ -886,6 +1089,9 @@ def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
 
     n_leaf_points = dump(p5x / "leaves.ply", assignment >= 0, rgb, with_label=True)
     n_skeleton = dump(p5x / "skeleton.ply", assignment == SKELETON, rgb)
+    n_unassigned = int((assignment == UNASSIGNED).sum())
+    if not n_skeleton and (p5x / "skeleton.ply").exists():
+        (p5x / "skeleton.ply").unlink()              # a rosette's: no stem, and no stale one either
     dump(p5x / "segmented.ply", assignment != UNSEEN, rgb, with_label=True)
     np.save(p5x / "instances.npy", assignment)
 
@@ -909,10 +1115,11 @@ def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
                       + (f"; {dropped} fell below that and became skeleton" if dropped else ""),
         },
         "skeleton_is_not_empty": {
-            "pass": n_skeleton > 0,
-            "detail": f"{n_skeleton} points voted stem. An empty skeleton means p2/masks/stem "
-                      "was empty or never projected -- there is nothing to build a "
-                      "centreline along.",
+            "pass": n_skeleton + n_unassigned > 0,
+            "detail": (f"{n_skeleton} points voted stem" if n_skeleton else
+                       f"a rosette: no stem; {n_unassigned} points of leaf tissue no leaf claimed")
+                      + ". Neither means p2/masks/stem was empty or never projected -- there is "
+                      "nothing to build a centreline along.",
         },
         # A large unseen share is the honest signal that the 2D masks and the
         # cloud do not describe the same object -- a stale P2, or a solve whose
@@ -939,6 +1146,7 @@ def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
         "visibility": visibility or {},
         "points_per_leaf": per_leaf,
         "skeleton_points": n_skeleton,
+        "unassigned_leaf_points": n_unassigned,
         "root_points": int((assignment == ROOT).sum()),
         "unseen_points": unseen,
         "leaf_points": n_leaf_points,
@@ -949,6 +1157,26 @@ def _write_outputs(p5x: Path, points, assignment, surviving, leaf_dirs,
     with open(p5x / "instances.json", "w") as f:
         json.dump(report, f, indent=2)
     return report
+
+
+def _relabel_files(p5x: Path, cloud: Path, fields: dict, assignment: np.ndarray) -> None:
+    """--retrace on a rosette: segmented.ply's labels and colours, instances.npy and skeleton.ply
+    rewritten for no_stem_on_rosette, so the files say what the trace used."""
+    fields = dict(fields)
+    fields["label"] = assignment.astype(np.int32)
+    for c, v in zip(("red", "green", "blue"), UNASSIGNED_RGB):
+        col = np.asarray(fields[c]).copy()
+        col[assignment == UNASSIGNED] = v
+        fields[c] = col
+    write_ply_vertices(cloud, fields)
+    full = p5x / "instances.npy"
+    if full.exists():
+        a = np.load(full)
+        a[a == SKELETON] = UNASSIGNED
+        np.save(full, a)
+    stale = p5x / "skeleton.ply"
+    if stale.exists() and not (assignment == SKELETON).any():
+        stale.unlink()
 
 
 def retrace(workdir: Path, geometry_backend: str = cloud_source.BASELINE,
@@ -979,6 +1207,11 @@ def retrace(workdir: Path, geometry_backend: str = cloud_source.BASELINE,
 
     voxel, voxel_origin = cloud_source.voxel_size(workdir, geometry_backend, points)
     architecture = _architecture(workdir, geometry_backend)
+    n_unassigned = no_stem_on_rosette(assignment, architecture)
+    if n_unassigned:
+        _relabel_files(p5x, cloud, fields, assignment)
+        print(f"  a rosette has no stem: {n_unassigned} stem-voted points relabelled leaf tissue of no known "
+              f"leaf (label {UNASSIGNED}) in segmented.ply and instances.npy")
     print(f"  {plant_profiles.describe(*plant_profiles.profile_for(workdir))}")
     print(f"  re-tracing {len(points)} points from {cloud.name}; architecture {architecture}, "
           f"voxel {voxel:.5f} ({voxel_origin})")
