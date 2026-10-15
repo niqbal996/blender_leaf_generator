@@ -139,7 +139,9 @@ thistle_x (`debug/apex_tail_smoke/templates_curved/`): lift sd 0.1-0.6 mm, extre
 leaves' cupped margins. Bundle `_bundles/thistle_templates_curved_20261015_1953.tar.gz`
 (s2d_templates_flat vs s2d_templates_curved). Next if the user likes it: a step after `templates`.
 
-**Run on all five 06-10 plants** (started 2026-10-15 19:52, commit 7b718ed; `_campaign/templates_20261015/`,
+**Run on all five 06-10 plants** (a local run started 2026-10-15 19:52 was **stopped at 20:00** at the
+user's request, thistle_x and sugarbeet_x mid-P5x, unstamped -- they rerun it; the user queues it by Slurm:
+`scripts/slurm/submit_plants.sh <session> --force ...` on the login node; commit 7b718ed; `_campaign/templates_20261015/`,
 `run.sh` there is the command, `--jobs 2`, A100 so TORCH_CUDA_ARCH_LIST=8.0): scale, p5x, s2d, apex rerun
 by their stamps. vogelmeere's pipeline.conf now says `allow_mixed_capture = true` (its stamps were built
 with it; without it everything reran from P1).
