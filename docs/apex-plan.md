@@ -131,6 +131,19 @@ settings carry the flat-lay's digest (`apex_args`): a new or replaced leaf_pose 
 25 matched, 8 placed on unpaired P5x leaves (10 min). Tests 440 pass (the one known config failure).
 `--dry-run` on thistle_x: scale, p5x, s2d, apex rerun; P1-P4g kept.
 
+**Curvature on the placed flat-lay leaves, smoke run** (`scripts/template_curvature.py`, not yet a
+pipeline step): a template's mesh is already the curvature maps' size-free grid (u along, r across), so
+each vertex moves along the blade's normal by its P5x leaf's own cup + wave (scaled by the half-widths,
+mirrored when the across directions disagree), or by the plant's model for a leaf with no P5x twin.
+thistle_x (`debug/apex_tail_smoke/templates_curved/`): lift sd 0.1-0.6 mm, extremes to +5 mm at big
+leaves' cupped margins. Bundle `_bundles/thistle_templates_curved_20261015_1953.tar.gz`
+(s2d_templates_flat vs s2d_templates_curved). Next if the user likes it: a step after `templates`.
+
+**Run on all five 06-10 plants** (started 2026-10-15 19:52, commit 7b718ed; `_campaign/templates_20261015/`,
+`run.sh` there is the command, `--jobs 2`, A100 so TORCH_CUDA_ARCH_LIST=8.0): scale, p5x, s2d, apex rerun
+by their stamps. vogelmeere's pipeline.conf now says `allow_mixed_capture = true` (its stamps were built
+with it; without it everything reran from P1).
+
 **No stem on a rosette** (the user, 2026-10-15: "it's all leaves", fix it first). P5x rule
 `no_stem_on_rosette` (cli/leaf_instances.py): on a rosette the stem
 votes become UNASSIGNED (-4, "leaf tissue of no known leaf"), never SKELETON; the tracer stands the crown
